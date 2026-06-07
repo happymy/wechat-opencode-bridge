@@ -1,0 +1,6 @@
+{
+  "type": "module",
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.16.2"
+  }
+}
