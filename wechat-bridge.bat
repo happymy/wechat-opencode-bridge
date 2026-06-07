@@ -1,4 +1,4 @@
 @echo off
-cd /d C:\Users\GAME\Desktop\work
-pwsh -NoLogo -Command "npx -y wechat-acp@latest --agent 'node wechat-adapter.js' --cwd 'C:\Users\GAME\Desktop\work' --daemon"
+cd /d %~dp0
+pwsh -NoLogo -Command "npx -y wechat-acp@latest --agent 'node wechat-adapter.js' --cwd '%~dp0.' --daemon"
 exit /b 0

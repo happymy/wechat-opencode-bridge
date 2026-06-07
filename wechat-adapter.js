@@ -1,11 +1,12 @@
 import { createInterface } from 'node:readline';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 const SERVER = 'http://localhost:4096';
 const AUTH = 'Basic ' + Buffer.from('opencode:opencode').toString('base64');
-const WORK_DIR = join('C:', 'Users', 'GAME', 'Desktop', 'work');
+const WORK_DIR = dirname(fileURLToPath(import.meta.url));
 const SESSION_FILE = join(WORK_DIR, '.wechat-session.json');
 const WORKSPACES_FILE = join(WORK_DIR, '.wechat-workspaces.json');
 const SESSION_MAX_SHOW = 20;

@@ -1,5 +1,6 @@
 @echo off
-cd /d C:\Users\GAME\Desktop\work
+cd /d %~dp0
+set "SCRIPT_DIR=%CD%"
 
 echo ==========================================
 echo   Starting all services...
@@ -18,7 +19,7 @@ echo  [OK] OpenCode Web Server is ready.
 echo.
 
 echo [2/4] Starting pk-opencode-webui (Third-party Web UI) on port 2048...
-start "pk-opencode-webui" pwsh -NoLogo -Command "cd 'C:\Users\GAME\Desktop\work\pk-opencode-webui\app-prefixable'; $env:PORT='2048'; $env:API_AUTH_USERNAME='opencode'; $env:API_AUTH_PASSWORD='opencode'; bun run dev"
+start "pk-opencode-webui" pwsh -NoLogo -Command "cd '%SCRIPT_DIR%\pk-opencode-webui\app-prefixable'; $env:PORT='2048'; $env:API_AUTH_USERNAME='opencode'; $env:API_AUTH_PASSWORD='opencode'; bun run dev"
 
 echo  Waiting for port 2048...
 :wait_2048
@@ -30,7 +31,7 @@ echo.
 
 echo [3/4] Starting WeChat bridge...
 call npx wechat-acp@latest stop >nul 2>&1
-start "wechat-bridge" pwsh -NoLogo -Command "npx -y wechat-acp@latest --agent 'node wechat-adapter.js' --cwd 'C:\Users\GAME\Desktop\work' --daemon"
+start "wechat-bridge" pwsh -NoLogo -Command "npx -y wechat-acp@latest --agent 'node wechat-adapter.js' --cwd '%SCRIPT_DIR%' --daemon"
 
 echo  Waiting for WeChat login...
 :wait_wechat

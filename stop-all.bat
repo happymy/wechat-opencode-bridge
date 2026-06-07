@@ -1,5 +1,5 @@
 @echo off
-cd /d C:\Users\GAME\Desktop\work
+cd /d %~dp0
 
 echo ==========================================
 echo   Stopping all services...
