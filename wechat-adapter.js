@@ -86,6 +86,41 @@ async function handlePrompt(msg) {
     return;
   }
 
+  if (text === '/mute') {
+    const sub = getSubscriber(sid);
+    if (sub.muted) {
+      sub.muted = false; saveSubscribers();
+      sendReply(sid, '🔔 通知已开启');
+    } else {
+      sub.muted = true; saveSubscribers();
+      sendReply(sid, '🔕 通知已关闭');
+    }
+    sendResponse(msg.id, { stopReason: 'end_turn' });
+    return;
+  }
+
+  if (text === '/notify') {
+    const sub = getSubscriber(sid);
+    const info = [
+      '📡 通知设置',
+      `├ 状态: ${sub.muted ? '🔕 已静音' : '🔔 已开启'}`,
+      `├ 订阅用户: ${subscribers.length} 人`,
+      `├ 活跃会话: ${sessionStates.size} 个`,
+      sub.muted ? '└ 发 /mute 重新开启' : '└ 发 /mute 关闭通知',
+    ].join('\n');
+    sendReply(sid, info);
+    sendResponse(msg.id, { stopReason: 'end_turn' });
+    return;
+  }
+
+  // Auto-subscribe on first message
+  const sub = getSubscriber(sid);
+  if (sub.muted === undefined) {
+    sub.muted = false; sub.lastActive = Date.now();
+    saveSubscribers();
+  }
+  sub.lastActive = Date.now(); saveSubscribers();
+
   await forwardToAI(sid, text, msg.id);
 }
 
@@ -628,3 +663,256 @@ function sendNotification(method, params) {
   process.stdout.write(msg + '\n');
   log(`Notification method=${method}: ${msg.slice(0, 120)}`);
 }
+
+/* ═══════════════════════════════════════
+   Notification System — SSE Event Monitor
+   ═══════════════════════════════════════ */
+
+const SUBSCRIBERS_FILE = join(WORK_DIR, '.wechat-subscribers.json');
+let subscribers = [];
+let sessionStates = new Map();
+let sseReconnectTimer = null;
+
+function loadSubscribers() {
+  try { if (existsSync(SUBSCRIBERS_FILE)) subscribers = JSON.parse(readFileSync(SUBSCRIBERS_FILE, 'utf8')); }
+  catch { subscribers = []; }
+  if (!Array.isArray(subscribers)) subscribers = [];
+}
+function saveSubscribers() {
+  try { writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(subscribers, null, 2)); } catch {}
+}
+function getSubscriber(sid) {
+  let s = subscribers.find(x => x.sid === sid);
+  if (!s) { s = { sid, muted: undefined, lastActive: 0 }; subscribers.push(s); }
+  return s;
+}
+
+// Broadcast a notification to all non-muted subscribers
+function broadcastNotification(text) {
+  log(`[NOTIFY] ${text.slice(0, 80)}`);
+  for (const sub of subscribers) {
+    if (sub.muted) continue;
+    try { sendReply(sub.sid, text); } catch {}
+  }
+}
+
+// Track session state changes from SSE events
+function updateSessionState(id, updates) {
+  const existing = sessionStates.get(id) || {};
+  const next = { ...existing, ...updates };
+  sessionStates.set(id, next);
+  return next;
+}
+
+// Map OpenCode event to notification text (return null to skip)
+function eventToNotification(type, props) {
+  switch (type) {
+    // ── Errors ──
+    case 'session.error': {
+      const err = props.error;
+      if (!err) return '❌ 会话发生未知错误';
+      switch (err.name) {
+        case 'ProviderAuthError':
+          return `❌ 认证失败 - ${err.data.providerID}: ${err.data.message}`;
+        case 'APIError':
+          if (err.data.isRetryable) return null; // handled via retry detection
+          return `❌ API 错误 (${err.data.statusCode || '?'}): ${err.data.message}`;
+        case 'ContextOverflowError':
+          return `📦 上下文溢出，需新建会话: ${err.data.message}`;
+        case 'MessageAbortedError':
+          return `🛑 消息被终止: ${err.data.message}`;
+        case 'StructuredOutputError':
+          return `⚙️ 结构化输出失败（已重试 ${err.data.retries} 次）: ${err.data.message}`;
+        case 'MessageOutputLengthError':
+          return '📏 AI 输出超长，已被截断';
+        default:
+          return `❓ ${err.name}: ${err.data?.message || '未知错误'}`;
+      }
+    }
+    // ── User interaction needed ──
+    case 'question.asked': {
+      const q = props;
+      const opts = q.options ? q.options.map((o, i) => `${i + 1}. ${o.label}`).join('\n') : '';
+      return `💬 需要你回答\n${q.question}${opts ? '\n' + opts : ''}`;
+    }
+    case 'permission.asked': {
+      const p = props;
+      const type = p.permission || 'unknown';
+      const patterns = (p.patterns || []).filter(Boolean);
+      const meta = p.metadata || {};
+      const summary = patterns.length > 0
+        ? patterns.slice(0, 3).join('\n  ') + (patterns.length > 3 ? `\n  ...及另外 ${patterns.length - 3} 项` : '')
+        : meta.path || meta.file || meta.command || '未知';
+
+      const iconMap = {
+        read: '📖', write: '✏️', edit: '📝', bash: '⌨️',
+        browser: '🌐', glob: '🔍', list: '📂', delete: '🗑️',
+        create: '📄', move: '📦',
+      };
+      const icon = iconMap[type] || '🔑';
+      const typeLabel = { read: '读取文件', write: '写入文件', edit: '编辑文件',
+        bash: '执行命令', browser: '打开网页', glob: '搜索文件',
+        list: '列出目录', delete: '删除文件', create: '创建文件',
+        move: '移动文件',
+      }[type] || type;
+
+      let lines = [`${icon} 需要权限: ${typeLabel}`];
+      if (patterns.length > 0) lines.push(`├ 路径:\n  ${summary}`);
+      else if (meta.path || meta.file) lines.push(`├ 路径: ${summary}`);
+      else if (meta.command) lines.push(`├ 命令: ${summary}`);
+      else lines.push(`├ 详情: ${summary}`);
+      if (p.always?.length > 0) lines.push(`└ 可信任: ${p.always.slice(0, 2).join(', ')}${p.always.length > 2 ? '...' : ''}`);
+
+      return lines.join('\n');
+    }
+    // ── Status changes ──
+    case 'session.status': {
+      const st = props.status;
+      if (st.type === 'idle') return '✅ 会话已完成';
+      if (st.type === 'retry') {
+        const state = updateSessionState(props.sessionID, { retryCount: (sessionStates.get(props.sessionID)?.retryCount || 0) + 1 });
+        if (state.retryCount >= 3) return `🔄 AI 重试 ${state.retryCount} 次仍未恢复: ${st.message}`;
+        return null; // silent for first retries
+      }
+      if (st.type === 'busy') {
+        updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now() });
+        return null; // busy start is not notification-worthy
+      }
+      return null;
+    }
+    case 'session.idle':
+      return `💤 会话闲置 (${props.sessionID?.slice(0, 12)}...)`;
+    case 'session.created':
+      return '🆕 新会话已创建';
+    // ── Command / file events ──
+    case 'command.executed':
+      return `⌨️ 命令完成: ${props.name || '未知'} ${(props.arguments || '').slice(0, 60)}`;
+    case 'file.edited':
+      return `📝 文件已编辑: ${props.file || '未知'}`;
+    // ── Worktree ──
+    case 'worktree.ready':
+      return `🌳 工作树就绪: ${props.branch || props.name || '未知'}`;
+    case 'worktree.failed':
+      return `❌ 工作树失败: ${props.message || '未知'}`;
+    // ── Todo ──
+    case 'todo.updated': {
+      if (!props.todos) return null;
+      const total = props.todos.length;
+      const done = props.todos.filter(t => t.status === 'completed').length;
+      return `📋 任务进度: ${done}/${total}`;
+    }
+    // ── Message part delta (track activity for stuck detection) ──
+    case 'message.part.delta':
+    case 'message.part.updated':
+      if (props.sessionID) updateSessionState(props.sessionID, { lastActivity: Date.now() });
+      return null;
+    default:
+      return null;
+  }
+}
+
+// ── SSE connection ──
+async function connectSSE() {
+  let retryDelay = 1000;
+  const maxDelay = 30000;
+
+  while (true) {
+    try {
+      log('[SSE] Connecting to event stream...');
+      const response = await fetch(`${SERVER}/global/event`, {
+        headers: { Authorization: AUTH, 'x-opencode-directory': WORK_DIR },
+      });
+      if (!response.ok) throw new Error(`SSE ${response.status}`);
+      if (!response.body) throw new Error('SSE body is null');
+      retryDelay = 1000; // reset on success
+      log('[SSE] Connected');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let currentEvent = '';
+      let currentData = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() || ''; // keep incomplete line in buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed === '') {
+            // Empty line = event boundary
+            if (currentData) {
+              try {
+                const parsed = JSON.parse(currentData);
+                // GlobalEvent format: { directory, payload }
+                const payload = parsed.payload || parsed;
+                const eventType = payload.type || currentEvent;
+                const props = payload.properties || {};
+                const text = eventToNotification(eventType, props);
+                if (text) broadcastNotification(text);
+              } catch (e) {
+                log(`[SSE] Parse error: ${e.message}`);
+              }
+            }
+            currentEvent = '';
+            currentData = '';
+          } else if (trimmed.startsWith('event:')) {
+            currentEvent = trimmed.slice(6).trim();
+          } else if (trimmed.startsWith('data:')) {
+            currentData += trimmed.slice(5).trim();
+          }
+          // Ignore other SSE fields (id:, retry:, comments)
+        }
+      }
+      log('[SSE] Stream ended, reconnecting...');
+    } catch (err) {
+      log(`[SSE] Error: ${err.message}, reconnecting in ${retryDelay}ms`);
+    }
+
+    // Exponential backoff
+    await new Promise(r => { sseReconnectTimer = setTimeout(r, retryDelay); });
+    retryDelay = Math.min(retryDelay * 2, maxDelay);
+  }
+}
+
+// ── Watchdog: detect stuck sessions ──
+function startWatchdog() {
+  const STUCK_WARN_MS = 5 * 60 * 1000;   // 5 min
+  const STUCK_ALERT_MS = 10 * 60 * 1000;  // 10 min
+  const STUCK_RETRY_LIMIT = 3;
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, state] of sessionStates.entries()) {
+      // Busy but no activity for a while → possibly stuck
+      if (state.busySince && state.lastActivity) {
+        const busyDuration = now - state.busySince;
+        const idleSinceActivity = now - state.lastActivity;
+
+        if (busyDuration > STUCK_ALERT_MS && !state.stuckAlerted) {
+          state.stuckAlerted = true;
+          broadcastNotification(`🔴 会话疑似卡死\n已运行 ${Math.round(busyDuration / 60000)} 分钟无响应\nID: ${id.slice(0, 16)}...`);
+        } else if (busyDuration > STUCK_WARN_MS && idleSinceActivity > 60000 && !state.stuckWarned) {
+          state.stuckWarned = true;
+          broadcastNotification(`⏰ 会话可能卡住了\n已运行 ${Math.round(busyDuration / 60000)} 分钟，上次活动超过 1 分钟前`);
+        }
+      }
+
+      // Retry loop detection
+      if (state.retryCount >= STUCK_RETRY_LIMIT && !state.retryAlerted) {
+        state.retryAlerted = true;
+        broadcastNotification(`🔄 AI 陷入重试循环\n已连续重试 ${state.retryCount} 次，请检查连接`);
+      }
+    }
+  }, 30000); // check every 30s
+}
+
+// ── Startup ──
+loadSubscribers();
+connectSSE();
+startWatchdog();
+log('[Notify] Notification system started');
