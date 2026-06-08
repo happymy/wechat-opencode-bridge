@@ -1,1 +1,1 @@
-py3 del.py
+python del.py

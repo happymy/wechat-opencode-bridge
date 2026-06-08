@@ -20,6 +20,7 @@ let lineBuf = '';
 let subscribers = [];
 let sessionStates = new Map();
 let pendingNotifications = [];
+let pendingPermissions = new Map();
 let draining = false;
 
 /* ───────── Logging ───────── */
@@ -73,37 +74,37 @@ rl.on('line', (line) => {
 /* ───────── Message Handling ───────── */
 
 async function handlePrompt(msg) {
-  const params = msg.params || {};
-  const sid = params.sessionId || currentSessionId || 'sess_fallback';
-  const text = (params.prompt || []).map(b => b.text || '').join('').trim();
+  try {
+    const params = msg.params || {};
+    const sid = params.sessionId || currentSessionId || 'sess_fallback';
+    const text = (params.prompt || []).map(b => b.text || '').join('').trim();
 
-  if (!text) { sendResponse(msg.id, { stopReason: 'end_turn' }); return; }
+    if (!text) { sendResponse(msg.id, { stopReason: 'end_turn' }); return; }
 
-  // Cancel any pending proactive flush — we'll piggyback on this prompt cycle instead
-  if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
+    if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
 
-  // Drain pending notifications (they piggyback on this prompt cycle to reach WeChat)
-  await drainPendingNotifications();
+    await drainPendingNotifications();
 
-  // Auto-subscribe on first message
-  const sub = getOrCreateSubscriber(sid);
-  if (sub.muted === undefined) { sub.muted = false; saveSubscribers(); }
+    const sub = getOrCreateSubscriber(sid);
+    if (sub.muted === undefined) { sub.muted = false; saveSubscribers(); }
 
-  // Handle commands
-  if (text.startsWith('/')) {
-    await handleCommand(sid, text, msg.id);
-    return;
+    if (text.startsWith('/')) {
+      await handleCommand(sid, text, msg.id);
+      return;
+    }
+
+    const targetId = currentSessionId;
+    if (!targetId) {
+      reply(sid, '⚠️ 没有选中的会话。使用 /list 查看，/switch N 选择');
+      sendResponse(msg.id, { stopReason: 'end_turn' });
+      return;
+    }
+
+    await forwardToAI(sid, targetId, text, msg.id);
+  } catch (err) {
+    log(`[ERR] handlePrompt: ${err.message}`);
+    sendResponse(msg.id, { stopReason: 'error' });
   }
-
-  // Forward to current session
-  const targetId = currentSessionId;
-  if (!targetId) {
-    reply(sid, '⚠️ 没有选中的会话。使用 /list 查看，/switch N 选择');
-    sendResponse(msg.id, { stopReason: 'end_turn' });
-    return;
-  }
-
-  await forwardToAI(sid, targetId, text, msg.id);
 }
 
 async function handleCommand(sid, text, msgId) {
@@ -132,6 +133,12 @@ async function handleCommand(sid, text, msgId) {
       return newSession(sid, arg, msgId);
     case '/workspace': case '/ws':
       return handleWorkspace(sid, arg, msgId);
+    case '/allow': case '/a':
+      return handlePermission(sid, 'allow', msgId);
+    case '/deny': case '/d':
+      return handlePermission(sid, 'deny', msgId);
+    case '/trust': case '/t':
+      return handlePermission(sid, 'allow', msgId);
     case '/testnotify':
       return testNotify(sid, msgId);
     case '/help': case '/h':
@@ -293,6 +300,42 @@ async function switchAgent(sid, agent, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+async function replyPermission(requestID, sessionID, action) {
+  const body = JSON.stringify({ reply: action });
+  const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body };
+  try {
+    await apiFetch(`/permission/${requestID}/reply`, opts);
+    return true;
+  } catch {
+    try {
+      const sid = sessionID || currentSessionId;
+      await apiFetch(`/api/session/${sid}/permission/request/${requestID}/reply`, opts);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+async function handlePermission(sid, action, msgId) {
+  if (pendingPermissions.size === 0) {
+    reply(sid, '⚠️ 当前没有待处理的权限请求');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const entries = [...pendingPermissions.entries()];
+  const [rid, info] = entries[entries.length - 1];
+  const ok = await replyPermission(rid, info.sessionID, action);
+  pendingPermissions.delete(rid);
+  if (ok) {
+    const label = action === 'allow' ? '已允许' : '已拒绝';
+    reply(sid, `✅ ${label}: ${info.permission}\n${info.patterns.slice(0, 80)}`);
+  } else {
+    reply(sid, '⚠️ 操作失败（权限请求可能已过期）');
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
 async function handleWorkspace(sid, arg, msgId) {
   const list = loadWorkspaces();
 
@@ -357,6 +400,9 @@ function showHelp(sid, msgId) {
     '/workspace (/ws)          查看/切换工作区',
     '/status (/st)             查看任务运行状态',
     '/cancel (/c)              取消当前AI执行',
+    '/allow (/a)              允许访问文件/执行命令',
+    '/deny (/d)               拒绝',
+    '/trust (/t)              始终允许',
     '/mute (/m)                开关通知',
     '/notify (/n)              查看通知状态',
     '/help (/h)                显示此帮助',
@@ -650,13 +696,18 @@ function broadcastNotification(text) {
 async function drainPendingNotifications(forceFlush) {
   if (draining || pendingNotifications.length === 0) return;
   draining = true;
-  const batch = pendingNotifications.splice(0);
-  log(`[DRAIN] flushing ${batch.length} pending notification(s)`);
-  for (const n of batch) {
-    try { reply(n.sid, n.text); } catch {}
+  try {
+    const batch = pendingNotifications.splice(0);
+    log(`[DRAIN] flushing ${batch.length} pending notification(s)`);
+    for (const n of batch) {
+      try { reply(n.sid, n.text); } catch {}
+    }
+    if (forceFlush) flushToWeChat();
+  } catch (e) {
+    log(`[DRAIN] error: ${e.message}`);
+  } finally {
+    draining = false;
   }
-  if (forceFlush) flushToWeChat();
-  draining = false;
 }
 
 function flushToWeChat() {
@@ -702,7 +753,13 @@ async function eventToNotification(type, props) {
     case 'permission.asked': {
       const t = props.permission || '操作';
       const p = props.patterns?.[0] || props.metadata?.path || props.metadata?.file || props.metadata?.command || '';
-      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}`;
+      const rid = props.requestID;
+      const sid = props.sessionID;
+      if (rid) {
+        pendingPermissions.set(rid, { sessionID: sid, permission: t, patterns: p, ts: Date.now() });
+        setTimeout(() => pendingPermissions.delete(rid), 300_000);
+      }
+      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n/allow 允许  /deny 拒绝  /trust 始终允许`;
     }
     case 'session.idle': {
       const sid = props.sessionID;
@@ -795,6 +852,7 @@ async function connectSSE() {
                 const payload = parsed.payload || parsed;
                 const eventType = payload.type || currentEvent;
                 const props = payload.properties || {};
+                if (payload.id) props.requestID ??= payload.id;
                 log(`[SSE] event=${eventType} sessionID=${props.sessionID || '?'}`);
                 const text = await eventToNotification(eventType, props);
                 if (text) {
