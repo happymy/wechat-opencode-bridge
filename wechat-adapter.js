@@ -600,10 +600,26 @@ async function apiFetch(path, opts = {}) {
 
 let sessionNames = new Map();
 let idleNotified = new Set();
+let recentNotifications = new Map(); // text → timestamp, dedup within 30s
 
 let proactiveTimer = null;
 
 function broadcastNotification(text) {
+  // Text-level dedup: skip if same text was sent within last 30s
+  const now = Date.now();
+  const lastSent = recentNotifications.get(text);
+  if (lastSent && now - lastSent < 30000) {
+    log(`[NOTIFY] skipped (dedup within 30s): ${text.slice(0, 60)}`);
+    return;
+  }
+  recentNotifications.set(text, now);
+  // Clean old entries periodically
+  if (recentNotifications.size > 50) {
+    for (const [t, ts] of recentNotifications) {
+      if (now - ts > 60000) recentNotifications.delete(t);
+    }
+  }
+
   log(`[NOTIFY] ${text.slice(0, 100)}`);
   for (const sub of subscribers) {
     if (sub.muted) continue;
@@ -680,8 +696,8 @@ async function eventToNotification(type, props) {
       if (!sid || idleNotified.has(sid)) return null;
       idleNotified.add(sid);
       await fetchSessionName(sid);
-      const name = getSessionName(sid);
-      return `✅ 完成${name ? '\n「' + name + '」' : ''}`;
+      const name = sessionNames.get(sid) || sid;
+      return `✅ ${name} · 完成`;
     }
     case 'session.status': {
       const st = props.status;
@@ -691,8 +707,8 @@ async function eventToNotification(type, props) {
         if (!sid || idleNotified.has(sid)) return null;
         idleNotified.add(sid);
         await fetchSessionName(sid);
-        const name = getSessionName(sid);
-        return `✅ 完成${name ? '\n「' + name + '」' : ''}`;
+        const name = sessionNames.get(sid) || sid;
+        return `✅ ${name} · 完成`;
       }
       if (st.type === 'retry') {
         const sid = props.sessionID;
