@@ -13,6 +13,7 @@ node_modules/
 # WeChat bot state
 .wechat-session.json
 .wechat-workspaces.json
+.wechat-subscribers.json
 
 # OS files
 .DS_Store
