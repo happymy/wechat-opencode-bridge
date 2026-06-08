@@ -41,7 +41,7 @@ function uuid() { return randomUUID() || 'msg_' + Date.now() + '_' + Math.random
 /* ───────── ACP Protocol ───────── */
 
 rl.on('line', (line) => {
-  if (lineBuf.length > 65536) { lineBuf = ''; }
+  if (lineBuf.length > 65536) { log('[WARN] lineBuf overflow, clearing'); lineBuf = ''; }
   lineBuf += line;
   let msg;
   try { msg = JSON.parse(lineBuf); lineBuf = ''; } catch { return; }
@@ -86,7 +86,6 @@ async function handlePrompt(msg) {
     await drainPendingNotifications();
 
     const sub = getOrCreateSubscriber(sid);
-    if (sub.muted === undefined) { sub.muted = false; saveSubscribers(); }
 
     if (text.startsWith('/')) {
       await handleCommand(sid, text, msg.id);
@@ -134,11 +133,11 @@ async function handleCommand(sid, text, msgId) {
     case '/workspace': case '/ws':
       return handleWorkspace(sid, arg, msgId);
     case '/allow': case '/a':
-      return handlePermission(sid, 'allow', msgId);
+      return handlePermission(sid, 'once', msgId);
     case '/deny': case '/d':
-      return handlePermission(sid, 'deny', msgId);
+      return handlePermission(sid, 'reject', msgId);
     case '/trust': case '/t':
-      return handlePermission(sid, 'allow', msgId);
+      return handlePermission(sid, 'always', msgId);
     case '/testnotify':
       return testNotify(sid, msgId);
     case '/help': case '/h':
@@ -613,7 +612,7 @@ function saveSubscribers() {
 }
 function getOrCreateSubscriber(sid) {
   let s = subscribers.find(x => x.sid === sid);
-  if (!s) { s = { sid, muted: undefined, lastActive: Date.now() }; subscribers.push(s); }
+  if (!s) { s = { sid, muted: false, lastActive: Date.now() }; subscribers.push(s); }
   return s;
 }
 
@@ -680,10 +679,8 @@ function broadcastNotification(text) {
   }
 
   log(`[NOTIFY] ${text.slice(0, 100)}`);
-  for (const sub of subscribers) {
-    if (sub.muted) continue;
-    pendingNotifications.push({ sid: sub.sid, text });
-  }
+  const target = subscribers.find(s => !s.muted);
+  if (target) pendingNotifications.push({ sid: target.sid, text });
   // Schedule proactive flush if no user message arrives within 15s
   if (!proactiveTimer) {
     proactiveTimer = setTimeout(() => {
@@ -706,7 +703,7 @@ async function drainPendingNotifications(forceFlush) {
       grouped.set(n.sid, existing);
     }
     for (const [sid, texts] of grouped) {
-      try { reply(sid, texts.join('\n')); } catch {}
+      try { reply(sid, texts.join('\n')); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
     }
     if (forceFlush) flushToWeChat();
   } catch (e) {
@@ -740,6 +737,15 @@ function getSessionName(id) {
   return sessionNames.get(id) || id?.slice(0, 12) || '?';
 }
 
+async function idleNotification(props) {
+  const sid = props.sessionID;
+  if (!sid || idleNotified.has(sid)) return null;
+  idleNotified.add(sid);
+  await fetchSessionName(sid);
+  const name = sessionNames.get(sid) || sid;
+  return `✅ ${name} · 完成`;
+}
+
 // Map events to short, readable notifications. Return null to skip.
 async function eventToNotification(type, props) {
   switch (type) {
@@ -768,23 +774,13 @@ async function eventToNotification(type, props) {
       return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n/allow 允许  /deny 拒绝  /trust 始终允许`;
     }
     case 'session.idle': {
-      const sid = props.sessionID;
-      if (!sid || idleNotified.has(sid)) return null;
-      idleNotified.add(sid);
-      await fetchSessionName(sid);
-      const name = sessionNames.get(sid) || sid;
-      return `✅ ${name} · 完成`;
+      return idleNotification(props);
     }
     case 'session.status': {
       const st = props.status;
       if (!st) return null;
       if (st.type === 'idle') {
-        const sid = props.sessionID;
-        if (!sid || idleNotified.has(sid)) return null;
-        idleNotified.add(sid);
-        await fetchSessionName(sid);
-        const name = sessionNames.get(sid) || sid;
-        return `✅ ${name} · 完成`;
+        return idleNotification(props);
       }
       if (st.type === 'retry') {
         const sid = props.sessionID;
@@ -826,10 +822,13 @@ async function connectSSE() {
     try {
       log('[SSE] Connecting...');
       const eventUrl = `${SERVER}/global/event?directory=${encodeURIComponent(getWorkspaceDir())}`;
+      const abortControl = new AbortController();
+      const connTimer = setTimeout(() => abortControl.abort(), 15000);
       const response = await fetch(eventUrl, {
         headers: { Authorization: AUTH, 'x-opencode-directory': getWorkspaceDir() },
-        signal: AbortSignal.timeout(10000),
+        signal: abortControl.signal,
       });
+      clearTimeout(connTimer);
       if (!response.ok) throw new Error(`SSE ${response.status}`);
       if (!response.body) throw new Error('SSE body is null');
       retryDelay = 1000;
@@ -894,37 +893,40 @@ function startWatchdog() {
   const STUCK_WARN_MS = 5 * 60 * 1000;
   const STUCK_ALERT_MS = 10 * 60 * 1000;
 
-  setInterval(async () => {
-    const now = Date.now();
-    for (const [id, state] of sessionStates.entries()) {
-      if (state.busySince && state.lastActivity) {
-        const busyDuration = now - state.busySince;
-        const idleSinceActivity = now - state.lastActivity;
-        await fetchSessionName(id);
-        const name = getSessionName(id);
+  setInterval(() => {
+    try {
+      const now = Date.now();
+      for (const [id, state] of sessionStates.entries()) {
+        if (state.busySince && state.lastActivity) {
+          const busyDuration = now - state.busySince;
+          const idleSinceActivity = now - state.lastActivity;
+          fetchSessionName(id).catch(() => {});
+          const name = getSessionName(id);
 
-        if (busyDuration > STUCK_ALERT_MS && !state.stuckAlerted) {
-          state.stuckAlerted = true;
-          broadcastNotification(`🔴 卡死\n「${name}」已运行${Math.round(busyDuration / 60000)}分钟无响应`);
-        } else if (busyDuration > STUCK_WARN_MS && idleSinceActivity > 60000 && !state.stuckWarned) {
-          state.stuckWarned = true;
-          broadcastNotification(`⏰ 可能卡住\n「${name}」已${Math.round(busyDuration / 60000)}分钟无活动`);
+          if (busyDuration > STUCK_ALERT_MS && !state.stuckAlerted) {
+            state.stuckAlerted = true;
+            broadcastNotification(`🔴 卡死\n「${name}」已运行${Math.round(busyDuration / 60000)}分钟无响应`);
+          } else if (busyDuration > STUCK_WARN_MS && idleSinceActivity > 60000 && !state.stuckWarned) {
+            state.stuckWarned = true;
+            broadcastNotification(`⏰ 可能卡住\n「${name}」已${Math.round(busyDuration / 60000)}分钟无活动`);
+          }
+        }
+
+        if (state.retryCount >= 3 && !state.retryAlerted) {
+          state.retryAlerted = true;
+          broadcastNotification(`🔄 AI重试循环\n已连续重试${state.retryCount}次，请检查`);
         }
       }
-
-      if (state.retryCount >= 3 && !state.retryAlerted) {
-        state.retryAlerted = true;
-        broadcastNotification(`🔄 AI重试循环\n已连续重试${state.retryCount}次，请检查`);
+      const staleCutoff = now - 30 * 60 * 1000;
+      for (const [id, state] of sessionStates.entries()) {
+        if (!state.busySince && state.lastActivity && state.lastActivity < staleCutoff) {
+          sessionStates.delete(id);
+          sessionNames.delete(id);
+          idleNotified.delete(id);
+        }
       }
-    }
-    // Cleanup stale state (>30min idle, not busy)
-    const staleCutoff = now - 30 * 60 * 1000;
-    for (const [id, state] of sessionStates.entries()) {
-      if (!state.busySince && state.lastActivity && state.lastActivity < staleCutoff) {
-        sessionStates.delete(id);
-        sessionNames.delete(id);
-        idleNotified.delete(id);
-      }
+    } catch (e) {
+      log(`[WATCHDOG] error: ${e.message}`);
     }
   }, 30000);
 }
