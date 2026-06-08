@@ -132,12 +132,16 @@ async function handleCommand(sid, text, msgId) {
       return newSession(sid, arg, msgId);
     case '/workspace': case '/ws':
       return handleWorkspace(sid, arg, msgId);
+    case '/plist': case '/pending':
+      return listPermissions(sid, msgId);
     case '/allow': case '/a':
-      return handlePermission(sid, 'once', msgId);
+      return handlePermission(sid, 'once', arg, msgId);
     case '/deny': case '/d':
-      return handlePermission(sid, 'reject', msgId);
+      return handlePermission(sid, 'reject', arg, msgId);
     case '/trust': case '/t':
-      return handlePermission(sid, 'always', msgId);
+      return handlePermission(sid, 'always', arg, msgId);
+    case '/allowall':
+      return handlePermissionAll(sid, 'once', msgId);
     case '/testnotify':
       return testNotify(sid, msgId);
     case '/help': case '/h':
@@ -302,36 +306,94 @@ async function switchAgent(sid, agent, msgId) {
 async function replyPermission(requestID, sessionID, action) {
   const body = JSON.stringify({ reply: action });
   const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body };
+  const errs = [];
   try {
     await apiFetch(`/permission/${requestID}/reply`, opts);
     return true;
-  } catch {
-    try {
-      const sid = sessionID || currentSessionId;
-      await apiFetch(`/api/session/${sid}/permission/request/${requestID}/reply`, opts);
-      return true;
-    } catch {
-      return false;
-    }
+  } catch (e) {
+    errs.push(`new: ${e.message}`);
   }
+  try {
+    const sid = sessionID || currentSessionId;
+    await apiFetch(`/api/session/${sid}/permission/request/${requestID}/reply`, opts);
+    return true;
+  } catch (e) {
+    errs.push(`old: ${e.message}`);
+  }
+  log(`[PERM] replyPermission failed for ${requestID}: ${errs.join('; ')}`);
+  return false;
 }
 
-async function handlePermission(sid, action, msgId) {
+function formatPermissionInfo(info) {
+  return `${info.permission}${info.patterns ? '\n' + info.patterns.slice(0, 80) : ''}`;
+}
+
+async function listPermissions(sid, msgId) {
+  if (pendingPermissions.size === 0) {
+    reply(sid, '📋 当前没有待处理的权限请求');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const entries = [...pendingPermissions.entries()];
+  const lines = [`📋 待审批权限 (${entries.length}个)`, '─'.repeat(16)];
+  entries.forEach(([rid, info], i) => {
+    const ago = Math.round((Date.now() - info.ts) / 1000);
+    lines.push(`${i + 1}. ${info.permission}`);
+    if (info.patterns) lines.push(`   ${info.patterns.slice(0, 60)}`);
+    lines.push(`   ${ago}s前 | /allow ${i + 1} 允许`);
+  });
+  lines.push('─'.repeat(10));
+  lines.push('/allowall 全部允许  /deny <N> 拒绝  /trust <N> 始终允许');
+  reply(sid, lines.join('\n'));
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handlePermission(sid, action, arg, msgId) {
+  if (pendingPermissions.size === 0) {
+    reply(sid, '⚠️ 当前没有待处理的权限请求\n/plist 查看列表');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const entries = [...pendingPermissions.entries()];
+  let idx;
+  if (arg && /^\d+$/.test(arg)) {
+    idx = parseInt(arg, 10) - 1;
+    if (idx < 0 || idx >= entries.length) {
+      reply(sid, `⚠️ 编号 ${arg} 超出范围 (1-${entries.length})\n/plist 查看列表`);
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+  } else {
+    idx = entries.length - 1;
+  }
+  const [rid, info] = entries[idx];
+  const ok = await replyPermission(rid, info.sessionID, action);
+  pendingPermissions.delete(rid);
+  if (ok) {
+    const label = action === 'once' ? '已允许' : action === 'reject' ? '已拒绝' : '已设为始终允许';
+    reply(sid, `✅ ${label}: ${formatPermissionInfo(info)}`);
+  } else {
+    reply(sid, '⚠️ 操作失败（权限请求可能已过期）');
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handlePermissionAll(sid, action, msgId) {
   if (pendingPermissions.size === 0) {
     reply(sid, '⚠️ 当前没有待处理的权限请求');
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
   const entries = [...pendingPermissions.entries()];
-  const [rid, info] = entries[entries.length - 1];
-  const ok = await replyPermission(rid, info.sessionID, action);
-  pendingPermissions.delete(rid);
-  if (ok) {
-    const label = action === 'allow' ? '已允许' : '已拒绝';
-    reply(sid, `✅ ${label}: ${info.permission}\n${info.patterns.slice(0, 80)}`);
-  } else {
-    reply(sid, '⚠️ 操作失败（权限请求可能已过期）');
+  let okCount = 0;
+  let failCount = 0;
+  for (const [rid, info] of entries) {
+    const ok = await replyPermission(rid, info.sessionID, action);
+    pendingPermissions.delete(rid);
+    if (ok) okCount++; else failCount++;
   }
+  const label = action === 'once' ? '已允许' : '已拒绝';
+  reply(sid, `✅ 批量${label}: ${okCount}个成功${failCount > 0 ? `，${failCount}个失败` : ''}`);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
@@ -399,7 +461,8 @@ function showHelp(sid, msgId) {
     '/workspace (/ws)          查看/切换工作区',
     '/status (/st)             查看任务运行状态',
     '/cancel (/c)              取消当前AI执行',
-    '/allow (/a)              允许访问文件/执行命令',
+    '/plist (/pending)        查看权限审批记录',
+    '/allow (/a)              允许（ACP队列限制，可能不生效）',
     '/deny (/d)               拒绝',
     '/trust (/t)              始终允许',
     '/mute (/m)                开关通知',
@@ -770,8 +833,16 @@ async function eventToNotification(type, props) {
       if (rid) {
         pendingPermissions.set(rid, { sessionID: sid, permission: t, patterns: p, ts: Date.now() });
         setTimeout(() => pendingPermissions.delete(rid), 300_000);
+        replyPermission(rid, sid, 'once').then(ok => {
+          if (ok) {
+            log(`[PERM] auto-allowed: ${t} (${rid})`);
+            pendingPermissions.delete(rid);
+          }
+        });
       }
-      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n/allow 允许  /deny 拒绝  /trust 始终允许`;
+      const count = pendingPermissions.size;
+      const hint = count > 1 ? ` (共${count}个待审批)` : '';
+      return `🔑 已自动允许: ${t}${hint}\n${p.slice(0, 80)}`;
     }
     case 'session.idle': {
       return idleNotification(props);
