@@ -699,8 +699,14 @@ async function drainPendingNotifications(forceFlush) {
   try {
     const batch = pendingNotifications.splice(0);
     log(`[DRAIN] flushing ${batch.length} pending notification(s)`);
+    const grouped = new Map();
     for (const n of batch) {
-      try { reply(n.sid, n.text); } catch {}
+      const existing = grouped.get(n.sid) || [];
+      existing.push(n.text);
+      grouped.set(n.sid, existing);
+    }
+    for (const [sid, texts] of grouped) {
+      try { reply(sid, texts.join('\n')); } catch {}
     }
     if (forceFlush) flushToWeChat();
   } catch (e) {
