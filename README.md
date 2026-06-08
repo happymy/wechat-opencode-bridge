@@ -65,11 +65,16 @@ wechat-bridge.bat  # WeChat 机器人
 | `/list` | `/l` `/sessions` | 查看 OpenCode 会话列表 |
 | `/switch <编号\|ID>` | `/s` | 切换当前会话 |
 | `/new <会话名>` | `/create` | 新建会话（当前工作区）并自动切换 |
+| `/plan` | `/pl` | 切换当前会话为 plan 模式 |
+| `/build` | `/bu` | 切换当前会话为 build 模式（默认） |
 | `/workspace` | `/ws` | 查看/切换工作区 |
 | `/status` | `/st` | 查看任务运行状态 |
 | `/cancel` | `/c` | 取消当前 AI 执行 |
 | `/mute` | `/m` | 开关通知（默认开启） |
 | `/notify` | `/n` | 查看通知设置状态 |
+| `/allow` | `/a` | 允许当前权限请求 |
+| `/deny` | `/d` | 拒绝当前权限请求 |
+| `/trust` | `/t` | 始终允许当前权限请求 |
 | `/testnotify` | — | 发送测试通知（调试用） |
 | `/help` | `/h` | 显示帮助信息 |
 

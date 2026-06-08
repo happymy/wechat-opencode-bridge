@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -15,6 +15,7 @@ const WORKSPACE_CURRENT_FILE = join(WORK_DIR, '.wechat-workspace-current.json');
 const rl = createInterface({ input: process.stdin });
 let currentSessionId = loadSession();
 let currentWorkspace = loadDefaultWorkspace();
+let currentAgent = 'build';
 let lineBuf = '';
 let subscribers = [];
 let sessionStates = new Map();
@@ -28,18 +29,18 @@ function log(...args) {
   const line = `[wechat] ${args.join(' ')}`;
   process.stderr.write(line + '\n');
   try {
-    // Rotate if over 1MB
     if (existsSync(logFile) && readFileSync(logFile).length > 1_000_000) {
-      writeFileSync(logFile, '');
+      renameSync(logFile, logFile + '.old');
     }
     writeFileSync(logFile, line + '\n', { flag: 'a' });
   } catch {}
 }
-function uuid() { return randomUUID?.() || 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
+function uuid() { return randomUUID() || 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
 
 /* ───────── ACP Protocol ───────── */
 
 rl.on('line', (line) => {
+  if (lineBuf.length > 65536) { lineBuf = ''; }
   lineBuf += line;
   let msg;
   try { msg = JSON.parse(lineBuf); lineBuf = ''; } catch { return; }
@@ -57,15 +58,15 @@ rl.on('line', (line) => {
       agentInfo: { name: 'opencode-wechat-bot', version: '4.0.0' },
     });
   } else if (m === 'session/new') {
-    handleNewSession(msg);
+    handleNewSession(msg).catch(e => log(`[ERR] session/new: ${e.message}`));
   } else if (m === 'session/list') {
-    handleListSessions(msg);
+    handleListSessions(msg).catch(e => log(`[ERR] session/list: ${e.message}`));
   } else if (m === 'session/load') {
-    handleLoadSession(msg);
+    handleLoadSession(msg).catch(e => log(`[ERR] session/load: ${e.message}`));
   } else if (m === 'session/prompt') {
-    handlePrompt(msg);
+    handlePrompt(msg).catch(e => log(`[ERR] session/prompt: ${e.message}`));
   } else if (m === 'session/cancel') {
-    handleCancel(msg).catch(() => {});
+    handleCancel(msg).catch(e => log(`[ERR] session/cancel: ${e.message}`));
   }
 });
 
@@ -123,6 +124,10 @@ async function handleCommand(sid, text, msgId) {
       return cancelCurrent(sid, msgId);
     case '/status': case '/st':
       return showTaskStatus(sid, msgId);
+    case '/plan': case '/pl':
+      return switchAgent(sid, 'plan', msgId);
+    case '/build': case '/bu':
+      return switchAgent(sid, 'build', msgId);
     case '/new': case '/create':
       return newSession(sid, arg, msgId);
     case '/workspace': case '/ws':
@@ -154,7 +159,7 @@ async function listSessions(sid, msgId) {
 
     const statusMap = await apiFetch('/session/status').catch(() => ({}));
     const busyIds = new Set(
-      Object.entries(statusMap || {})
+      Object.entries(statusMap)
         .filter(([, s]) => s.type === 'busy')
         .map(([id]) => id)
     );
@@ -281,6 +286,13 @@ async function newSession(sid, title, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+async function switchAgent(sid, agent, msgId) {
+  currentAgent = agent;
+  const labels = { plan: '📋', build: '🔧' };
+  reply(sid, `${labels[agent] || '✅'} 已切换到 ${agent} 模式`);
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
 async function handleWorkspace(sid, arg, msgId) {
   const list = loadWorkspaces();
 
@@ -340,6 +352,8 @@ function showHelp(sid, msgId) {
     '/list (/l) 或 /sessions    查看会话列表',
     '/switch (/s) <编号|ID>    切换会话',
     '/new (/create) <会话名>   新建会话（当前工作区）并切换',
+    '/plan (/pl)              切换到 plan 模式',
+    '/build (/bu)             切换到 build 模式',
     '/workspace (/ws)          查看/切换工作区',
     '/status (/st)             查看任务运行状态',
     '/cancel (/c)              取消当前AI执行',
@@ -376,8 +390,7 @@ async function forwardToAI(sid, targetId, text, msgId) {
     const res = await fetch(`${SERVER}/session/${targetId}/message`, {
       method: 'POST',
       headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ parts: [{ type: 'text', text }] }),
-      signal: controller.signal,
+      body: JSON.stringify({ parts: [{ type: 'text', text }], agent: currentAgent }),
     });
     clearTimeout(timeout);
 
@@ -416,7 +429,7 @@ function formatReply(data) {
     else if (p.type === 'reasoning' && p.text) reasoningBuf += p.text;
     else if (p.type === 'tool' && (p.tool || p.name)) {
       const t = p.tool || p;
-      const status = t.state?.status === 'success' ? '✅' : t.state?.status === 'error' || t.state?.status === 'failed' ? '❌' : '🔄';
+      const status = t.state?.status === 'success' ? '✅' : (t.state?.status === 'error' || t.state?.status === 'failed') ? '❌' : '🔄';
       toolCalls.push({ name: t.tool || t.name || '未知', status });
     }
   }
@@ -570,7 +583,7 @@ function reply(sid, text) {
 function sendResponse(id, result) {
   const msg = JSON.stringify({ jsonrpc: '2.0', id, result });
   process.stdout.write(msg + '\n');
-  log(`→ response id=${id}: ${msg.slice(0, 120)}`);
+  log(`→ response id=${id} ok`);
 }
 
 function sendNotification(method, params) {
@@ -817,13 +830,13 @@ function startWatchdog() {
   const STUCK_WARN_MS = 5 * 60 * 1000;
   const STUCK_ALERT_MS = 10 * 60 * 1000;
 
-  setInterval(() => {
+  setInterval(async () => {
     const now = Date.now();
     for (const [id, state] of sessionStates.entries()) {
       if (state.busySince && state.lastActivity) {
         const busyDuration = now - state.busySince;
         const idleSinceActivity = now - state.lastActivity;
-        fetchSessionName(id);
+        await fetchSessionName(id);
         const name = getSessionName(id);
 
         if (busyDuration > STUCK_ALERT_MS && !state.stuckAlerted) {
@@ -838,6 +851,15 @@ function startWatchdog() {
       if (state.retryCount >= 3 && !state.retryAlerted) {
         state.retryAlerted = true;
         broadcastNotification(`🔄 AI重试循环\n已连续重试${state.retryCount}次，请检查`);
+      }
+    }
+    // Cleanup stale state (>30min idle, not busy)
+    const staleCutoff = now - 30 * 60 * 1000;
+    for (const [id, state] of sessionStates.entries()) {
+      if (!state.busySince && state.lastActivity && state.lastActivity < staleCutoff) {
+        sessionStates.delete(id);
+        sessionNames.delete(id);
+        idleNotified.delete(id);
       }
     }
   }, 30000);
