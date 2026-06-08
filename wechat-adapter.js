@@ -4,12 +4,13 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
-const SERVER = 'http://localhost:4096';
-const AUTH = 'Basic ' + Buffer.from('opencode:opencode').toString('base64');
+const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
+const AUTH = 'Basic ' + Buffer.from(process.env.OPENCODE_AUTH || 'opencode:opencode').toString('base64');
 const WORK_DIR = dirname(fileURLToPath(import.meta.url));
 const SESSION_FILE = join(WORK_DIR, '.wechat-session.json');
 const SUBSCRIBERS_FILE = join(WORK_DIR, '.wechat-subscribers.json');
 const WORKSPACES_FILE = join(WORK_DIR, '.wechat-workspaces.json');
+const WORKSPACE_CURRENT_FILE = join(WORK_DIR, '.wechat-workspace-current.json');
 
 const rl = createInterface({ input: process.stdin });
 let currentSessionId = loadSession();
@@ -26,7 +27,13 @@ const logFile = join(WORK_DIR, '.wechat-adapter.log');
 function log(...args) {
   const line = `[wechat] ${args.join(' ')}`;
   process.stderr.write(line + '\n');
-  try { writeFileSync(logFile, line + '\n', { flag: 'a' }); } catch {}
+  try {
+    // Rotate if over 1MB
+    if (existsSync(logFile) && readFileSync(logFile).length > 1_000_000) {
+      writeFileSync(logFile, '');
+    }
+    writeFileSync(logFile, line + '\n', { flag: 'a' });
+  } catch {}
 }
 function uuid() { return randomUUID?.() || 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
 
@@ -127,6 +134,7 @@ async function handleCommand(sid, text, msgId) {
     default:
       reply(sid, `⚠️ 未知命令: ${cmd}\n/help 查看可用命令`);
       sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
   }
 }
 
@@ -298,6 +306,7 @@ async function handleWorkspace(sid, arg, msgId) {
   }
 
   currentWorkspace = list[num - 1];
+  saveCurrentWorkspace();
   reply(sid, `✅ 已切换到工作区「${currentWorkspace.name}」\n${currentWorkspace.path}\n使用 /new <会话名> 在该工作区创建会话`);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -345,17 +354,14 @@ function showHelp(sid, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
-function testNotify(sid, msgId) {
+async function testNotify(sid, msgId) {
   log('[TEST] broadcasting test notification');
   broadcastNotification('🧪 这是一条测试通知\n如果看到这条消息，说明主动通知功能正常');
   // Force immediate flush (not waiting for 15s timer)
   clearTimeout(proactiveTimer);
   proactiveTimer = null;
-  drainPendingNotifications(true).then(() => {
-    log('[TEST] test notification sent');
-  }).catch(err => {
-    log(`[TEST] error: ${err.message}`);
-  });
+  await drainPendingNotifications(true);
+  log('[TEST] test notification sent');
   reply(sid, '✅ 已发送测试通知，请查看微信消息');
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -378,6 +384,7 @@ async function forwardToAI(sid, targetId, text, msgId) {
     if (!res.ok) {
       const errText = await res.text();
       reply(sid, `⚠️ 服务器错误 (${res.status}): ${errText.slice(0, 100)}`);
+      await drainPendingNotifications();
       sendResponse(msgId, { stopReason: 'error' });
       return;
     }
@@ -391,6 +398,7 @@ async function forwardToAI(sid, targetId, text, msgId) {
   } catch (err) {
     const isCancel = err.name === 'AbortError';
     reply(sid, isCancel ? '⏰ 请求超时，请重试' : `❌ ${err.message}`);
+    await drainPendingNotifications();
     sendResponse(msgId, { stopReason: isCancel ? 'max_tokens' : 'error' });
   }
 }
@@ -433,6 +441,10 @@ function formatReply(data) {
 /* ───────── ACP Handlers ───────── */
 
 async function handleNewSession(msg) {
+  if (currentSessionId) {
+    sendResponse(msg.id, { sessionId: currentSessionId, configOptions: [], modes: null, models: null });
+    return;
+  }
   try {
     const res = await fetch(`${SERVER}/session`, {
       method: 'POST',
@@ -498,7 +510,18 @@ function loadWorkspaces() {
 
 function loadDefaultWorkspace() {
   const list = loadWorkspaces();
+  try {
+    if (existsSync(WORKSPACE_CURRENT_FILE)) {
+      const saved = JSON.parse(readFileSync(WORKSPACE_CURRENT_FILE, 'utf8'));
+      const match = list.find(w => w.path === saved.path);
+      if (match) return match;
+    }
+  } catch {}
   return list[0];
+}
+
+function saveCurrentWorkspace() {
+  try { writeFileSync(WORKSPACE_CURRENT_FILE, JSON.stringify({ path: currentWorkspace.path })); } catch {}
 }
 
 function getWorkspaceDir() {
@@ -576,6 +599,7 @@ async function apiFetch(path, opts = {}) {
    ═══════════════════════════════════════ */
 
 let sessionNames = new Map();
+let idleNotified = new Set();
 
 let proactiveTimer = null;
 
@@ -583,7 +607,7 @@ function broadcastNotification(text) {
   log(`[NOTIFY] ${text.slice(0, 100)}`);
   for (const sub of subscribers) {
     if (sub.muted) continue;
-    pendingNotifications.push({ sid: sub.sid, text, ts: Date.now() });
+    pendingNotifications.push({ sid: sub.sid, text });
   }
   // Schedule proactive flush if no user message arrives within 15s
   if (!proactiveTimer) {
@@ -609,11 +633,12 @@ async function drainPendingNotifications(forceFlush) {
 function flushToWeChat() {
   // Send a tool_call notification to trigger WeChatAcpClient.maybeFlushMessage()
   sendNotification('session/update', {
-    sessionId: 'flush',
+    sessionId: '',
     update: {
       sessionUpdate: 'tool_call',
       title: 'notification',
       toolCallId: uuid(),
+      status: 'completed',
     },
   });
 }
@@ -630,7 +655,7 @@ function getSessionName(id) {
 }
 
 // Map events to short, readable notifications. Return null to skip.
-function eventToNotification(type, props) {
+async function eventToNotification(type, props) {
   switch (type) {
     case 'session.error': {
       const err = props.error;
@@ -651,14 +676,22 @@ function eventToNotification(type, props) {
       return `🔑 需要权限: ${t}\n${p.slice(0, 80)}`;
     }
     case 'session.idle': {
-      const name = getSessionName(props.sessionID);
+      const sid = props.sessionID;
+      if (!sid || idleNotified.has(sid)) return null;
+      idleNotified.add(sid);
+      await fetchSessionName(sid);
+      const name = getSessionName(sid);
       return `✅ 完成${name ? '\n「' + name + '」' : ''}`;
     }
     case 'session.status': {
       const st = props.status;
       if (!st) return null;
       if (st.type === 'idle') {
-        const name = getSessionName(props.sessionID);
+        const sid = props.sessionID;
+        if (!sid || idleNotified.has(sid)) return null;
+        idleNotified.add(sid);
+        await fetchSessionName(sid);
+        const name = getSessionName(sid);
         return `✅ 完成${name ? '\n「' + name + '」' : ''}`;
       }
       if (st.type === 'retry') {
@@ -668,6 +701,7 @@ function eventToNotification(type, props) {
         return null;
       }
       if (st.type === 'busy') {
+        idleNotified.delete(props.sessionID);
         updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now() });
         return null;
       }
@@ -702,6 +736,7 @@ async function connectSSE() {
       const eventUrl = `${SERVER}/global/event?directory=${encodeURIComponent(getWorkspaceDir())}`;
       const response = await fetch(eventUrl, {
         headers: { Authorization: AUTH, 'x-opencode-directory': getWorkspaceDir() },
+        signal: AbortSignal.timeout(10000),
       });
       if (!response.ok) throw new Error(`SSE ${response.status}`);
       if (!response.body) throw new Error('SSE body is null');
@@ -732,7 +767,7 @@ async function connectSSE() {
                 const eventType = payload.type || currentEvent;
                 const props = payload.properties || {};
                 log(`[SSE] event=${eventType} sessionID=${props.sessionID || '?'}`);
-                const text = eventToNotification(eventType, props);
+                const text = await eventToNotification(eventType, props);
                 if (text) {
                   log(`[SSE] notification generated: ${text.slice(0, 80)}`);
                   broadcastNotification(text);
@@ -772,6 +807,7 @@ function startWatchdog() {
       if (state.busySince && state.lastActivity) {
         const busyDuration = now - state.busySince;
         const idleSinceActivity = now - state.lastActivity;
+        fetchSessionName(id);
         const name = getSessionName(id);
 
         if (busyDuration > STUCK_ALERT_MS && !state.stuckAlerted) {
