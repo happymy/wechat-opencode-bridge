@@ -7,7 +7,7 @@ OpenCode + wechat-acp + WeChat 机器人集成工作区。
 ```
 work/
 ├── pk-opencode-webui/       # 第三方 OpenCode Web UI（独立 git 仓库）
-├── wechat-adapter.js        # WeChat 机器人适配器（ACP Agent，~830 行）
+├── wechat-adapter.js        # WeChat 机器人适配器（ACP Agent，~1000 行）
 ├── start-all.bat            # 一键启动所有服务
 ├── stop-all.bat             # 停止所有服务
 ├── web.bat                  # 启动 OpenCode Web UI
@@ -72,13 +72,13 @@ wechat-bridge.bat  # WeChat 机器人
 | `/cancel` | `/c` | 取消当前 AI 执行 |
 | `/mute` | `/m` | 开关通知（默认开启） |
 | `/notify` | `/n` | 查看通知设置状态 |
-| `/allow` | `/a` | 允许当前权限请求 |
-| `/deny` | `/d` | 拒绝当前权限请求 |
-| `/trust` | `/t` | 始终允许当前权限请求 |
+| `/plist` | `/pending` | 查看待审批权限列表 |
 | `/testnotify` | — | 发送测试通知（调试用） |
 | `/help` | `/h` | 显示帮助信息 |
 
 非命令消息将转发给当前选中的 OpenCode 会话，由 AI 处理。
+
+> 权限审批已移至 Web UI（http://localhost:4096），微信中不再支持 `/allow`、`/deny`、`/trust` 命令。`/plist` 仍可查看待审批列表。
 
 ## 主动通知
 
@@ -89,7 +89,7 @@ wechat-bridge.bat  # WeChat 机器人
 | 会话完成 | ✅ 完成 | 任务执行完毕 |
 | 会话出错 | ❌ 会话出错 | 执行中发生错误 |
 | 需要回答 | 💬 需要你回答 | AI 在等待用户输入 |
-| 需要权限 | 🔑 需要权限 | AI 请求文件/命令执行权限 |
+| 需要权限 | 🔑 需要权限 | AI 请求文件/命令执行权限（需 Web UI 审批） |
 | 卡死检测 | 🔴 卡死 / ⏰ 可能卡住 | 5 分钟无活动警告，10 分钟卡死 |
 | 重试循环 | 🔄 AI重试循环 | 连续 3 次重试未恢复 |
 
