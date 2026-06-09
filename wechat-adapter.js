@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -30,9 +30,6 @@ function log(...args) {
   const line = `[wechat] ${args.join(' ')}`;
   process.stderr.write(line + '\n');
   try {
-    if (existsSync(logFile) && readFileSync(logFile).length > 1_000_000) {
-      renameSync(logFile, logFile + '.old');
-    }
     writeFileSync(logFile, line + '\n', { flag: 'a' });
   } catch {}
 }
