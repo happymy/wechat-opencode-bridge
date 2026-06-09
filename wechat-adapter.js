@@ -82,8 +82,6 @@ async function handlePrompt(msg) {
 
     await drainPendingNotifications();
 
-    const sub = getOrCreateSubscriber(sid);
-
     if (text.startsWith('/')) {
       await handleCommand(sid, text, msg.id);
       return;
@@ -295,44 +293,6 @@ async function switchAgent(sid, agent, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
-async function replyPermission(requestID, sessionID, action) {
-  const body = JSON.stringify({ reply: action });
-  const headers = { Authorization: AUTH, 'Content-Type': 'application/json' };
-  const errs = [];
-  try {
-    const res = await fetch(`${SERVER}/permission/${requestID}/reply`, { method: 'POST', headers, body, signal: AbortSignal.timeout(10000) });
-    if (res.ok) {
-      const ok = await res.json();
-      if (ok) return true;
-      errs.push(`v1 returned false`);
-    } else {
-      errs.push(`v1 ${res.status}: ${(await res.text().catch(() => '')).slice(0, 80)}`);
-    }
-  } catch (e) {
-    errs.push(`v1: ${e.message}`);
-  }
-  try {
-    const sid = sessionID || currentSessionId;
-    const res = await fetch(`${SERVER}/api/session/${sid}/permission/request/${requestID}/reply`, { method: 'POST', headers, body, signal: AbortSignal.timeout(10000) });
-    if (res.ok) {
-      if (res.status === 204) return true;
-      const ok = await res.json();
-      if (ok) return true;
-      errs.push(`v2 returned false`);
-    } else {
-      errs.push(`v2 ${res.status}: ${(await res.text().catch(() => '')).slice(0, 80)}`);
-    }
-  } catch (e) {
-    errs.push(`v2: ${e.message}`);
-  }
-  log(`[PERM] replyPermission failed for ${requestID}: ${errs.join('; ')}`);
-  return false;
-}
-
-function formatPermissionInfo(info) {
-  return `${info.permission}${info.patterns ? '\n' + info.patterns.slice(0, 80) : ''}`;
-}
-
 async function listPermissions(sid, msgId) {
   if (pendingPermissions.size === 0) {
     reply(sid, '📋 当前没有待处理的权限请求');
@@ -350,55 +310,6 @@ async function listPermissions(sid, msgId) {
   lines.push('─'.repeat(10));
   lines.push('请使用 Web UI (localhost:4096) 审批');
   reply(sid, lines.join('\n'));
-  sendResponse(msgId, { stopReason: 'end_turn' });
-}
-
-async function handlePermission(sid, action, arg, msgId) {
-  if (pendingPermissions.size === 0) {
-    reply(sid, '⚠️ 当前没有待处理的权限请求\n/plist 查看列表');
-    sendResponse(msgId, { stopReason: 'end_turn' });
-    return;
-  }
-  const entries = [...pendingPermissions.entries()];
-  let idx;
-  if (arg && /^\d+$/.test(arg)) {
-    idx = parseInt(arg, 10) - 1;
-    if (idx < 0 || idx >= entries.length) {
-      reply(sid, `⚠️ 编号 ${arg} 超出范围 (1-${entries.length})\n/plist 查看列表`);
-      sendResponse(msgId, { stopReason: 'end_turn' });
-      return;
-    }
-  } else {
-    idx = entries.length - 1;
-  }
-  const [rid, info] = entries[idx];
-  const ok = await replyPermission(rid, info.sessionID, action);
-  pendingPermissions.delete(rid);
-  if (ok) {
-    const label = action === 'once' ? '已允许' : action === 'reject' ? '已拒绝' : '已设为始终允许';
-    reply(sid, `✅ ${label}: ${formatPermissionInfo(info)}`);
-  } else {
-    reply(sid, '⚠️ 操作失败（权限请求可能已过期）');
-  }
-  sendResponse(msgId, { stopReason: 'end_turn' });
-}
-
-async function handlePermissionAll(sid, action, msgId) {
-  if (pendingPermissions.size === 0) {
-    reply(sid, '⚠️ 当前没有待处理的权限请求');
-    sendResponse(msgId, { stopReason: 'end_turn' });
-    return;
-  }
-  const entries = [...pendingPermissions.entries()];
-  let okCount = 0;
-  let failCount = 0;
-  for (const [rid, info] of entries) {
-    const ok = await replyPermission(rid, info.sessionID, action);
-    pendingPermissions.delete(rid);
-    if (ok) okCount++; else failCount++;
-  }
-  const label = action === 'once' ? '已允许' : '已拒绝';
-  reply(sid, `✅ 批量${label}: ${okCount}个成功${failCount > 0 ? `，${failCount}个失败` : ''}`);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
@@ -744,8 +655,8 @@ function broadcastNotification(text) {
   }
 
   log(`[NOTIFY] ${text.slice(0, 100)}`);
-  const target = subscribers.find(s => !s.muted);
-  if (target) pendingNotifications.push({ sid: target.sid, text });
+  const targets = subscribers.filter(s => !s.muted);
+  for (const t of targets) pendingNotifications.push({ sid: t.sid, text });
   // Schedule proactive flush if no user message arrives within 15s
   if (!proactiveTimer) {
     proactiveTimer = setTimeout(() => {
