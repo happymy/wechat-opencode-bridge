@@ -307,20 +307,33 @@ async function switchAgent(sid, agent, msgId) {
 
 async function replyPermission(requestID, sessionID, action) {
   const body = JSON.stringify({ reply: action });
-  const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body };
+  const headers = { Authorization: AUTH, 'Content-Type': 'application/json' };
   const errs = [];
   try {
-    await apiFetch(`/permission/${requestID}/reply`, opts);
-    return true;
+    const res = await fetch(`${SERVER}/permission/${requestID}/reply`, { method: 'POST', headers, body, signal: AbortSignal.timeout(10000) });
+    if (res.ok) {
+      const ok = await res.json();
+      if (ok) return true;
+      errs.push(`v1 returned false`);
+    } else {
+      errs.push(`v1 ${res.status}: ${(await res.text().catch(() => '')).slice(0, 80)}`);
+    }
   } catch (e) {
-    errs.push(`new: ${e.message}`);
+    errs.push(`v1: ${e.message}`);
   }
   try {
     const sid = sessionID || currentSessionId;
-    await apiFetch(`/api/session/${sid}/permission/request/${requestID}/reply`, opts);
-    return true;
+    const res = await fetch(`${SERVER}/api/session/${sid}/permission/request/${requestID}/reply`, { method: 'POST', headers, body, signal: AbortSignal.timeout(10000) });
+    if (res.ok) {
+      if (res.status === 204) return true;
+      const ok = await res.json();
+      if (ok) return true;
+      errs.push(`v2 returned false`);
+    } else {
+      errs.push(`v2 ${res.status}: ${(await res.text().catch(() => '')).slice(0, 80)}`);
+    }
   } catch (e) {
-    errs.push(`old: ${e.message}`);
+    errs.push(`v2: ${e.message}`);
   }
   log(`[PERM] replyPermission failed for ${requestID}: ${errs.join('; ')}`);
   return false;
@@ -923,6 +936,7 @@ async function connectSSE() {
                 const eventType = payload.type || currentEvent;
                 const props = payload.properties || {};
                 if (payload.id) props.requestID ??= payload.id;
+                if (props.id) props.requestID ??= props.id;
                 log(`[SSE] event=${eventType} sessionID=${props.sessionID || '?'}`);
                 const text = await eventToNotification(eventType, props);
                 if (text) {
