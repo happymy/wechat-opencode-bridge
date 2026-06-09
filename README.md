@@ -12,6 +12,7 @@ work/
 ├── stop-all.bat             # 停止所有服务
 ├── web.bat                  # 启动 OpenCode Web UI
 ├── wechat-bridge.bat        # 启动 wechat-acp 守护进程
+├── setup.bat                # 环境安装与修复脚本
 ├── run.bat                  # 运行任务
 ├── del.py                   # 临时清理工具
 ├── dev.db                   # OpenCode 开发数据库
@@ -33,6 +34,16 @@ work/
 | OpenCode Web | 4096 | 官方 Web UI，需 Basic Auth |
 | pk-opencode-webui | 2048 | 第三方 Web UI |
 | WeChat bot | — | 微信机器人，共享会话 |
+
+## 环境安装
+
+首次使用或遇到依赖问题时，运行：
+
+```bash
+setup.bat
+```
+
+脚本会自动检查/安装：Node.js、Bun、opencode CLI、npm 依赖、pk-opencode-webui 依赖，并刷新 wechat-acp（清除 npx 缓存后重新下载）。
 
 ## 启动
 

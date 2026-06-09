@@ -348,10 +348,10 @@ async function listPermissions(sid, msgId) {
     const ago = Math.round((Date.now() - info.ts) / 1000);
     lines.push(`${i + 1}. ${info.permission}`);
     if (info.patterns) lines.push(`   ${info.patterns.slice(0, 60)}`);
-    lines.push(`   ${ago}s前 | /allow ${i + 1} 允许`);
+    lines.push(`   ${ago}s前`);
   });
   lines.push('─'.repeat(10));
-  lines.push('/allowall 全部允许  /deny <N> 拒绝  /trust <N> 始终允许');
+  lines.push('请使用 Web UI (localhost:4096) 审批');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -925,8 +925,8 @@ async function connectSSE() {
                 const payload = parsed.payload || parsed;
                 const eventType = payload.type || currentEvent;
                 const props = payload.properties || {};
-                if (payload.id) props.requestID ??= payload.id;
                 if (props.id) props.requestID ??= props.id;
+                if (payload.id && !props.requestID) props.requestID ??= payload.id;
                 log(`[SSE] event=${eventType} sessionID=${props.sessionID || '?'}`);
                 const text = await eventToNotification(eventType, props);
                 if (text) {
