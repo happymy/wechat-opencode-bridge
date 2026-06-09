@@ -1,4 +1,4 @@
-# work — OpenCode 开发工作区
+# 开箱即用 — OpenCode 开发工作区
 
 OpenCode + wechat-acp + WeChat 机器人集成工作区。
 
@@ -57,6 +57,32 @@ start-all.bat
 web.bat            # OpenCode Web UI + pk-opencode-webui
 wechat-bridge.bat  # WeChat 机器人
 ```
+
+## Web UI
+
+系统包含两个 Web 界面，共享同一份会话数据：
+
+### 官方 Web UI（端口 4096）
+
+- 地址：http://localhost:4096
+- 登录：用户名 `opencode`，密码 `opencode`
+- 功能：会话管理、AI 对话、**权限审批**、文件查看等
+
+### 第三方 Web UI（端口 2048）
+
+- 地址：http://localhost:2048
+- 免登录，自动连接 4096 后端
+- 提供不同的界面风格
+
+### 权限审批
+
+AI 请求文件操作或命令执行时，微信会收到通知，但需通过 Web UI 审批：
+
+1. 打开 http://localhost:4096
+2. 进入正在运行的会话
+3. 在权限弹窗中选择「允许一次」「始终允许」或「拒绝」
+
+微信中 `/plist` 可查看待审批列表（仅供查看，审批请走 Web UI）。
 
 ## 环境变量（可选）
 
@@ -117,4 +143,4 @@ wechat-bridge.bat  # WeChat 机器人
 | `.wechat-subscribers.json` | 微信用户订阅列表 |
 | `.wechat-workspaces.json` | 工作区预设（名称 + 路径） |
 | `.wechat-workspace-current.json` | 当前工作区路径 |
-| `.wechat-adapter.log` | 运行时日志，超出 1MB 自动清空 |
+| `.wechat-adapter.log` | 运行时日志 |
