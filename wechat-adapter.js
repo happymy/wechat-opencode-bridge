@@ -99,7 +99,9 @@ async function handlePrompt(msg) {
       return;
     }
 
-    await forwardToAI(sid, targetId, text, msg.id);
+    reply(sid, '⏳ 思考中...');
+    sendResponse(msg.id, { stopReason: 'end_turn' });
+    forwardToAIAsync(sid, targetId, text).catch(e => log(`[ERR] fwd: ${e.message}`));
   } catch (err) {
     log(`[ERR] handlePrompt: ${err.message}`);
     sendResponse(msg.id, { stopReason: 'error' });
@@ -132,14 +134,14 @@ async function handleCommand(sid, text, msgId) {
       return newSession(sid, arg, msgId);
     case '/workspace': case '/ws':
       return handleWorkspace(sid, arg, msgId);
-    case '/plist': case '/pending':
-      return listPermissions(sid, msgId);
     case '/allow': case '/a':
       return handlePermission(sid, 'once', arg, msgId);
     case '/deny': case '/d':
       return handlePermission(sid, 'reject', arg, msgId);
     case '/trust': case '/t':
       return handlePermission(sid, 'always', arg, msgId);
+    case '/plist': case '/pending':
+      return listPermissions(sid, msgId);
     case '/allowall':
       return handlePermissionAll(sid, 'once', msgId);
     case '/testnotify':
@@ -461,10 +463,10 @@ function showHelp(sid, msgId) {
     '/workspace (/ws)          查看/切换工作区',
     '/status (/st)             查看任务运行状态',
     '/cancel (/c)              取消当前AI执行',
-    '/plist (/pending)        查看权限审批记录',
-    '/allow (/a)              允许（ACP队列限制，可能不生效）',
+    '/allow (/a)              允许文件/命令访问',
     '/deny (/d)               拒绝',
     '/trust (/t)              始终允许',
+    '/plist (/pending)        查看待审批权限',
     '/mute (/m)                开关通知',
     '/notify (/n)              查看通知状态',
     '/help (/h)                显示此帮助',
@@ -490,8 +492,7 @@ async function testNotify(sid, msgId) {
 
 /* ───────── AI Prompt Forwarding ───────── */
 
-async function forwardToAI(sid, targetId, text, msgId) {
-  reply(sid, '⏳ 思考中...');
+async function forwardToAIAsync(sid, targetId, text) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 120000);
@@ -506,21 +507,22 @@ async function forwardToAI(sid, targetId, text, msgId) {
       const errText = await res.text();
       reply(sid, `⚠️ 服务器错误 (${res.status}): ${errText.slice(0, 100)}`);
       await drainPendingNotifications();
-      sendResponse(msgId, { stopReason: 'error' });
+      flushToWeChat();
       return;
     }
 
     const data = await res.json();
-    // Drain notifications that arrived during AI processing (e.g. ✅ 完成)
     await drainPendingNotifications();
     const formatted = formatReply(data);
-    if (formatted) reply(sid, formatted);
-    sendResponse(msgId, { stopReason: 'end_turn' });
+    if (formatted) {
+      reply(sid, formatted);
+      flushToWeChat();
+    }
   } catch (err) {
     const isCancel = err.name === 'AbortError';
     reply(sid, isCancel ? '⏰ 请求超时，请重试' : `❌ ${err.message}`);
     await drainPendingNotifications();
-    sendResponse(msgId, { stopReason: isCancel ? 'max_tokens' : 'error' });
+    flushToWeChat();
   }
 }
 
@@ -833,16 +835,8 @@ async function eventToNotification(type, props) {
       if (rid) {
         pendingPermissions.set(rid, { sessionID: sid, permission: t, patterns: p, ts: Date.now() });
         setTimeout(() => pendingPermissions.delete(rid), 300_000);
-        replyPermission(rid, sid, 'once').then(ok => {
-          if (ok) {
-            log(`[PERM] auto-allowed: ${t} (${rid})`);
-            pendingPermissions.delete(rid);
-          }
-        });
       }
-      const count = pendingPermissions.size;
-      const hint = count > 1 ? ` (共${count}个待审批)` : '';
-      return `🔑 已自动允许: ${t}${hint}\n${p.slice(0, 80)}`;
+      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n请回复 /allow 允许  /deny 拒绝`;
     }
     case 'session.idle': {
       return idleNotification(props);

@@ -31,7 +31,7 @@ echo.
 
 echo [3/4] Starting WeChat bridge...
 call npx wechat-acp@latest stop >nul 2>&1
-start "wechat-bridge" pwsh -NoLogo -Command "npx -y wechat-acp@latest --agent 'node wechat-adapter.js' --cwd '%SCRIPT_DIR%' --daemon"
+start "wechat-bridge" pwsh -NoLogo -Command "npx -y wechat-acp@latest --agent 'node wechat-adapter.js' --cwd '%SCRIPT_DIR%'"
 
 echo  Waiting for WeChat login...
 :wait_wechat
@@ -39,7 +39,7 @@ timeout /t 3 /nobreak >nul
 if exist "%USERPROFILE%\.wechat-acp\token.json" (
   echo  [OK] WeChat bridge is logged in.
 ) else (
-  echo  Scanning QR code in the WeChat window...
+  echo  Please scan the QR code in the new terminal window...
   goto wait_wechat
 )
 echo.
