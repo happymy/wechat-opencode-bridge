@@ -134,16 +134,9 @@ async function handleCommand(sid, text, msgId) {
       return newSession(sid, arg, msgId);
     case '/workspace': case '/ws':
       return handleWorkspace(sid, arg, msgId);
-    case '/allow': case '/a':
-      return handlePermission(sid, 'once', arg, msgId);
-    case '/deny': case '/d':
-      return handlePermission(sid, 'reject', arg, msgId);
-    case '/trust': case '/t':
-      return handlePermission(sid, 'always', arg, msgId);
     case '/plist': case '/pending':
       return listPermissions(sid, msgId);
-    case '/allowall':
-      return handlePermissionAll(sid, 'once', msgId);
+
     case '/testnotify':
       return testNotify(sid, msgId);
     case '/help': case '/h':
@@ -476,10 +469,7 @@ function showHelp(sid, msgId) {
     '/workspace (/ws)          查看/切换工作区',
     '/status (/st)             查看任务运行状态',
     '/cancel (/c)              取消当前AI执行',
-    '/allow (/a)              允许文件/命令访问',
-    '/deny (/d)               拒绝',
-    '/trust (/t)              始终允许',
-    '/plist (/pending)        查看待审批权限',
+    '权限审批请使用 Web UI (localhost:4096)',
     '/mute (/m)                开关通知',
     '/notify (/n)              查看通知状态',
     '/help (/h)                显示此帮助',
@@ -849,7 +839,7 @@ async function eventToNotification(type, props) {
         pendingPermissions.set(rid, { sessionID: sid, permission: t, patterns: p, ts: Date.now() });
         setTimeout(() => pendingPermissions.delete(rid), 300_000);
       }
-      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n请回复 /allow 允许  /deny 拒绝`;
+      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n请使用 Web UI (localhost:4096) 审批`;
     }
     case 'session.idle': {
       return idleNotification(props);
