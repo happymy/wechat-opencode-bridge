@@ -1074,7 +1074,7 @@ async function connectSSE() {
                   log(`[SSE] EVENT DEDUP skip: id=${eventId.slice(0,24)}`);
                   currentEvent = '';
                   currentData = '';
-                  break;
+                  continue;
                 }
                 if (eventId) {
                   recentEventIds.add(eventId);
