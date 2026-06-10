@@ -8,8 +8,26 @@ echo   Work workspace - Environment Setup
 echo ==========================================
 echo.
 
+:: --- 0. pwsh (PowerShell 7+) ---
+echo [1/7] Checking PowerShell 7+...
+where pwsh >nul 2>&1
+if errorlevel 1 (
+    echo  ! pwsh not found, installing via winget...
+    winget install Microsoft.PowerShell -e --accept-source-agreements --accept-package-agreements >nul 2>&1
+    if errorlevel 1 (
+        echo  [FAIL] pwsh install failed. Download from https://github.com/PowerShell/PowerShell/releases
+        pause
+        exit /b 1
+    ) else (
+        echo  [OK] PowerShell 7+ installed
+    )
+) else (
+    for /f "tokens=*" %%v in ('pwsh -NoLogo -Command "$PSVersionTable.PSVersion"') do echo  [OK] PowerShell %%v
+)
+echo.
+
 :: --- 1. Node.js ---
-echo [1/6] Checking Node.js...
+echo [2/7] Checking Node.js...
 where node >nul 2>&1
 if errorlevel 1 (
     echo  ! Node.js not found, installing via winget...
@@ -25,7 +43,7 @@ if errorlevel 1 (
 echo.
 
 :: --- 2. npm deps ---
-echo [2/6] Installing workspace npm dependencies...
+echo [3/7] Installing workspace npm dependencies...
 call npm install --ignore-scripts 2>&1
 if errorlevel 1 (
     echo  [FAIL] npm install failed
@@ -35,7 +53,7 @@ if errorlevel 1 (
 echo.
 
 :: --- 3. Bun ---
-echo [3/6] Checking Bun...
+echo [4/7] Checking Bun...
 where bun >nul 2>&1
 if errorlevel 1 (
     echo  ! Bun not found, installing...
@@ -51,23 +69,39 @@ if errorlevel 1 (
 echo.
 
 :: --- 4. pk-opencode-webui ---
-echo [4/6] Installing pk-opencode-webui dependencies...
-if exist "%SCRIPT_DIR%\pk-opencode-webui\app-prefixable\package.json" (
-    pushd "%SCRIPT_DIR%\pk-opencode-webui\app-prefixable"
-    call bun install 2>&1
+echo [5/7] Installing pk-opencode-webui dependencies...
+if not exist "%SCRIPT_DIR%\pk-opencode-webui\app-prefixable\package.json" (
+    echo  [!] pk-opencode-webui not found, cloning from GitHub...
+    where git >nul 2>&1
     if errorlevel 1 (
-        echo  [FAIL] bun install failed
-    ) else (
-        echo  [OK] pk-opencode-webui dependencies installed
+        echo  [FAIL] Git not found. Install Git or manually clone:
+        echo         git clone https://github.com/prokube/pk-opencode-webui.git "%SCRIPT_DIR%\pk-opencode-webui"
+        pause
+        exit /b 1
     )
-    popd
-) else (
-    echo  [!] pk-opencode-webui not found, skipped
+    git clone https://github.com/prokube/pk-opencode-webui.git "%SCRIPT_DIR%\pk-opencode-webui" 2>&1
+    if errorlevel 1 (
+        echo  [FAIL] git clone failed. Check network or clone manually.
+        pause
+        exit /b 1
+    )
+    echo  [OK] pk-opencode-webui cloned
 )
+pushd "%SCRIPT_DIR%\pk-opencode-webui\app-prefixable"
+call bun install 2>&1
+if errorlevel 1 (
+    echo  [FAIL] bun install failed
+    popd
+    pause
+    exit /b 1
+) else (
+    echo  [OK] pk-opencode-webui dependencies installed
+)
+popd
 echo.
 
 :: --- 5. opencode CLI ---
-echo [5/6] Checking opencode CLI...
+echo [6/7] Checking opencode CLI...
 where opencode >nul 2>&1
 if errorlevel 1 (
     echo  ! opencode not found, installing...
@@ -83,7 +117,7 @@ if errorlevel 1 (
 echo.
 
 :: --- 6. wechat-acp ---
-echo [6/6] Refreshing wechat-acp...
+echo [7/7] Refreshing wechat-acp...
 pwsh -NoLogo -Command "$c='$env:LOCALAPPDATA\npm-cache\_npx';if(Test-Path $c){Remove-Item -Recurse -Force \"$c\*\" -ErrorAction SilentlyContinue}"
 call npx -y wechat-acp@latest --version 2>&1
 if errorlevel 1 (

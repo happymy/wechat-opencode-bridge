@@ -11,10 +11,10 @@ call npx wechat-acp@latest stop 2>nul
 timeout /t 2 /nobreak >nul
 
 echo  Killing any remaining wechat-acp node processes...
-wmic process where "name='node.exe'" get ProcessId,CommandLine 2>nul | findstr /i "wechat-acp wechat-adapter" >nul 2>&1
+tasklist /fi "imagename eq node.exe" /fo csv /nh 2>nul | findstr /i "wechat-acp wechat-adapter" >nul 2>&1
 if not errorlevel 1 (
-  for /f "tokens=1" %%p in ('wmic process where "name='node.exe'" get ProcessId,CommandLine 2^>nul ^| findstr /i "wechat-acp wechat-adapter"') do (
-    taskkill /f /pid %%p >nul 2>&1
+  for /f "tokens=2 delims=," %%p in ('tasklist /fi "imagename eq node.exe" /fo csv /nh 2^>nul ^| findstr /i "wechat-acp wechat-adapter"') do (
+    for /f "tokens=*" %%q in ("%%p") do taskkill /f /pid %%q >nul 2>&1
   )
 )
 echo  [OK] WeChat bridge stopped.

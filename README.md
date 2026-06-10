@@ -43,7 +43,7 @@ work/
 setup.bat
 ```
 
-脚本会自动检查/安装：Node.js、Bun、opencode CLI、npm 依赖、pk-opencode-webui 依赖，并刷新 wechat-acp（清除 npx 缓存后重新下载）。
+脚本会自动检查/安装：Node.js、Bun、opencode CLI、npm 依赖，自动 clone 并安装 pk-opencode-webui，刷新 wechat-acp（清除 npx 缓存后重新下载）。
 
 ## 启动
 
