@@ -229,6 +229,8 @@ async function listSessions(sid, msgId) {
 }
 
 async function switchSession(sid, arg, msgId) {
+  stopStreaming();
+  disarmWorkingNotice();
   if (!arg) {
     reply(sid, '用法: /switch <编号|会话ID>\n先用 /list 查看会话列表');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -292,6 +294,7 @@ function showNotifyStatus(sid, msgId) {
 }
 
 async function cancelCurrent(sid, msgId) {
+  stopStreaming();
   const target = currentSessionId;
   if (!target) {
     reply(sid, '⚠️ 没有选中的会话');
@@ -310,6 +313,8 @@ async function cancelCurrent(sid, msgId) {
 }
 
 async function newSession(sid, title, msgId) {
+  stopStreaming();
+  disarmWorkingNotice();
   if (!title) {
     reply(sid, '用法: /new <会话名>\n示例: /new 修复登录bug');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -461,6 +466,8 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
+  stopStreaming();
+  disarmWorkingNotice();
   currentWorkspace = list[num - 1];
   saveCurrentWorkspace();
   reply(sid, `✅ 已切换到工作区「${currentWorkspace.name}」\n${currentWorkspace.path}\n使用 /new <会话名> 在该工作区创建会话`);
@@ -559,12 +566,18 @@ async function answerQuestion(sid, answer, msgId) {
     return;
   }
 
-  let answerText = answer;
+  let answerText = answer.trim();
   const qi = qData.questions?.[0];
 
+  if (!answerText) {
+    reply(sid, '⚠️ 答案不能为空。请回复内容或用编号选择选项');
+    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
   // Numeric option selection
-  if (qi?.options?.length > 0 && /^\d+$/.test(answer)) {
-    const idx = parseInt(answer, 10) - 1;
+  if (qi?.options?.length > 0 && /^\d+$/.test(answerText)) {
+    const idx = parseInt(answerText, 10) - 1;
     if (idx >= 0 && idx < qi.options.length) {
       answerText = qi.options[idx].label;
       log(`[ANSWER] selected option ${answer} -> "${answerText}"`);
@@ -573,6 +586,9 @@ async function answerQuestion(sid, answer, msgId) {
 
   pendingQuestions = null;
   log(`[ANSWER] sid=${sid.slice(0,12)} text="${answerText.slice(0,60)}"`);
+  // Start streaming for the AI's response to the answer
+  startStreaming(sid, targetId);
+  armWorkingNotice(sid);
   reply(sid, `⏳ 已提交回答`);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
   forwardToAIAsync(sid, targetId, answerText).catch(e => log(`[ERR] answer: ${e.message}`));
@@ -600,6 +616,10 @@ function pushStream(chunk) {
     const candidate = streamBuf + chunk;
     if (lastPromptText.startsWith(candidate) || candidate.startsWith(lastPromptText)) {
       streamBuf = candidate;
+      // Once we've accumulated past the prompt, advance lastFlush past the prompt prefix
+      if (streamBuf.length >= lastPromptText.length) {
+        streamLastFlush = lastPromptText;
+      }
       return;
     }
   }
@@ -684,6 +704,7 @@ async function forwardToAIAsync(sid, targetId, text) {
     clearTimeout(timeout);
 
     if (!res.ok) {
+      stopStreaming();
       const errText = await res.text();
       reply(sid, `⚠️ 服务器错误 (${res.status}): ${errText.slice(0, 100)}`);
       await drainPendingNotifications();
@@ -705,6 +726,7 @@ async function forwardToAIAsync(sid, targetId, text) {
       }
     }
   } catch (err) {
+    stopStreaming();
     const isCancel = err.name === 'AbortError';
     reply(sid, isCancel ? '⏰ 请求超时，请重试' : `❌ ${err.message}`);
     await drainPendingNotifications();
@@ -1159,7 +1181,12 @@ async function eventToNotification(type, props) {
     }
     case 'question.asked': {
       const questions = props.questions || [];
-      pendingQuestions = { sessionID: props.sessionID, questions, askTimestamp: Date.now() };
+      const ts = Date.now();
+      pendingQuestions = { sessionID: props.sessionID, questions, askTimestamp: ts };
+      // Auto-clear after 5 minutes to prevent stale questions
+      setTimeout(() => {
+        if (pendingQuestions?.askTimestamp === ts) pendingQuestions = null;
+      }, 300_000).unref?.();
       log(`[EVENT] question.asked: stored ${questions.length} questions`);
       const qi = questions[0];
       if (!qi) return '💬 AI 提出了一个问题（无详情）';
@@ -1219,6 +1246,10 @@ async function eventToNotification(type, props) {
     case 'session.idle': {
       if (props.sessionID && props.sessionID === streamSessionId) {
         finalizeStream();
+      }
+      // Clear stale pending questions when session goes idle
+      if (pendingQuestions && pendingQuestions.sessionID === props.sessionID) {
+        pendingQuestions = null;
       }
       return idleNotification(props);
     }
