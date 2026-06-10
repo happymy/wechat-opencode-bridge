@@ -323,9 +323,7 @@ async function listPermissions(sid, msgId) {
     lines.push(`#${i + 1} ${info.permission}${pathInfo} | ${rid.slice(0, 16)}... | ${ago}秒前`);
   });
   lines.push('');
-  lines.push('/allow (/a) <编号|requestID>  批准');
-  lines.push('/deny (/d) <编号|requestID>   拒绝');
-  lines.push('/trust (/t) <编号|requestID>  信任（不再询问）');
+  lines.push('/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号|requestID> 不输入编号，默认为#1');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -891,7 +889,16 @@ async function drainPendingNotifications(forceFlush) {
           log(`[DRAIN]   [${i}]: ${unique[i].slice(0,80).replace(/\n/g,'\\n')}`);
         }
       }
-      try { reply(sid, unique.join('\n')); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
+      const permLines = unique.filter(t => /^📋 #/.test(t));
+      if (permLines.length > 0) {
+        const others = unique.filter(t => !/^📋 #/.test(t));
+        let combined = permLines.join('\n');
+        combined += '\n/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号|requestID> 不输入编号，默认为#1';
+        if (others.length > 0) combined += '\n' + others.join('\n');
+        try { reply(sid, combined); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
+      } else {
+        try { reply(sid, unique.join('\n')); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
+      }
     }
     if (forceFlush) {
       log(`[DRAIN] force flush requested`);
@@ -988,9 +995,8 @@ async function eventToNotification(type, props) {
           }
         }
       }
-      let permMsg = `📋 ${p || t}`;
-      permMsg += `\n/allow (/a) 批准  /deny (/d) 拒绝  /trust (/t) 信任`;
-      return permMsg;
+      const sessionPerms = [...pendingPermissions.values()].filter(info => info.sessionID === sesId);
+      return `📋 #${sessionPerms.length} ${p || t}`;
     }
     case 'permission.replied': {
       const rid = props.requestID;
