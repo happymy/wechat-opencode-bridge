@@ -987,7 +987,10 @@ async function eventToNotification(type, props) {
           }
         }
       }
-      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n/allow (/a) 批准  /deny (/d) 拒绝  /trust (/t) 信任`;
+      let permMsg = `🔑 需要权限: ${t}`;
+      if (p) permMsg += `\n📁 ${p.slice(0, 80)}`;
+      permMsg += `\n/allow (/a) 批准  /deny (/d) 拒绝  /trust (/t) 信任`;
+      return permMsg;
     }
     case 'permission.replied': {
       const rid = props.requestID;
