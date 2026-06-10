@@ -146,7 +146,7 @@ async function handleCommand(sid, text, msgId) {
       return handlePermissionReply(sid, 'reject', arg, msgId);
     case '/trust': case '/t':
       return handlePermissionReply(sid, 'always', arg, msgId);
-    case '/autoclean':
+    case '/autoclean': case '/ac':
       return handleAutoClean(sid, arg, msgId);
     case '/testnotify':
       return testNotify(sid, msgId);
@@ -324,9 +324,9 @@ async function listPermissions(sid, msgId) {
     lines.push(`   请求ID: ${rid.slice(0, 16)}... | ${ago}秒前`);
   });
   lines.push('─'.repeat(20));
-  lines.push('/allow <编号|requestID>  批准');
-  lines.push('/deny  <编号|requestID>  拒绝');
-  lines.push('/trust <编号|requestID>  信任（不再询问）');
+  lines.push('/allow (/a) <编号|requestID>  批准');
+  lines.push('/deny (/d) <编号|requestID>   拒绝');
+  lines.push('/trust (/t) <编号|requestID>  信任（不再询问）');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -468,7 +468,7 @@ function showHelp(sid, msgId) {
     '🤖 微信远程编程助手',
     '─'.repeat(20),
     '── 会话管理 ──',
-    '/list (/l)               查看会话列表',
+    '/list (/l, /sessions)    查看会话列表',
     '/switch (/s) <编号|ID>   切换会话',
     '/new (/create) <会话名>  新建会话（当前工作区）并切换',
     '',
@@ -480,7 +480,7 @@ function showHelp(sid, msgId) {
     '/allow (/a) [编号|ID]    批准权限请求',
     '/deny (/d) [编号|ID]     拒绝权限请求',
     '/trust (/t) [编号|ID]    信任权限（不再询问）',
-    '/plist (/p)              查看待审批权限列表',
+    '/plist (/p, /pending)    查看待审批权限列表',
     '',
     '── 工作区与任务 ──',
     '/workspace (/ws)         查看/切换工作区',
@@ -490,7 +490,7 @@ function showHelp(sid, msgId) {
     '── 通知与系统 ──',
     '/mute (/m)               开关通知',
     '/notify (/n)             查看通知状态',
-    '/autoclean [天数]        查看/设置不活跃订阅清理阈值',
+    '/autoclean (/ac) [天数]  查看/设置不活跃订阅清理阈值',
     '/help (/h)               显示此帮助',
     '/testnotify              发送测试通知（调试用）',
     '',
@@ -975,7 +975,7 @@ async function eventToNotification(type, props) {
           pendingPermissions.delete(rid);
         }, 300_000);
       }
-      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n/allow 批准  /deny 拒绝  /trust 信任`;
+      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n/allow (/a) 批准  /deny (/d) 拒绝  /trust (/t) 信任`;
     }
     case 'permission.replied': {
       const rid = props.requestID;
