@@ -11,6 +11,7 @@ work/
 ├── start-all.bat            # 一键启动所有服务
 ├── stop-all.bat             # 停止所有服务
 ├── web.bat                  # 启动 OpenCode Web UI
+├── restart-wechat.bat       # 重启微信机器人（修改 wechat-adapter.js 后使用）
 ├── wechat-bridge.bat        # 启动 wechat-acp 守护进程
 ├── setup.bat                # 环境安装与修复脚本
 ├── run.bat                  # 运行任务
