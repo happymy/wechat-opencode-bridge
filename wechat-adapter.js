@@ -878,15 +878,20 @@ async function drainPendingNotifications(forceFlush) {
       grouped.set(n.sid, existing);
     }
     log(`[DRAIN] grouped into ${grouped.size} unique sid(s)`);
+    const sentTexts = new Set();
     for (const [sid, texts] of grouped) {
       const unique = [...new Set(texts)];
-      log(`[DRAIN] sid=${sid.slice(0,12)}: ${texts.length} texts -> ${unique.length} unique`);
-      if (unique.length > 1) {
-        for (let i = 0; i < unique.length; i++) {
-          log(`[DRAIN]   [${i}]: ${unique[i].slice(0,80).replace(/\n/g,'\\n')}`);
+      // Cross-subscriber dedup: skip texts already sent to another sid in this drain cycle
+      const unsent = unique.filter(t => !sentTexts.has(t));
+      if (unsent.length === 0) { log(`[DRAIN] sid=${sid.slice(0,12)}: all texts already sent to another user, skipping`); continue; }
+      for (const t of unsent) sentTexts.add(t);
+      log(`[DRAIN] sid=${sid.slice(0,12)}: ${texts.length} texts -> ${unique.length} unique -> ${unsent.length} unsent`);
+      if (unsent.length > 1) {
+        for (let i = 0; i < unsent.length; i++) {
+          log(`[DRAIN]   [${i}]: ${unsent[i].slice(0,80).replace(/\n/g,'\\n')}`);
         }
       }
-      try { reply(sid, unique.join('\n')); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
+      try { reply(sid, unsent.join('\n')); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
     }
     if (forceFlush) {
       log(`[DRAIN] force flush requested`);
