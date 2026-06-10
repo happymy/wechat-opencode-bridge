@@ -37,6 +37,7 @@ let lastPromptText = '';      // last prompt text (for mirror suppression)
 let streamFinalized = false;  // true after finalizeStream runs (prevents double-finalize race)
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
+let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 
 /* ───────── Logging ───────── */
 
@@ -103,8 +104,9 @@ async function handlePrompt(msg) {
 
     await drainPendingNotifications();
 
-    // If AI is waiting for an answer and session matches, route non-command text as answer
-    if (pendingQuestions && !text.startsWith('/') && pendingQuestions.sessionID === currentSessionId) {
+    // If AI is waiting for an answer, route non-command text as answer
+    // Session check: only enforce if sessionID is known (some SSE events omit it)
+    if (pendingQuestions && !text.startsWith('/') && (!pendingQuestions.sessionID || pendingQuestions.sessionID === currentSessionId)) {
       log(`[PROMPT] pending question, routing as answer`);
       await answerQuestion(sid, text, msg.id);
       return;
@@ -176,6 +178,10 @@ async function handleCommand(sid, text, msgId) {
       return handlePermissionReply(sid, 'always', arg, msgId);
     case '/answer': case '/ans':
       return answerQuestion(sid, arg, msgId);
+    case '/skip': case '/pass': case '/ps':
+      return skipQuestion(sid, arg, msgId);
+    case '/qlist': case '/ql': case '/questions':
+      return listQuestions(sid, msgId);
     case '/autoclean': case '/ac':
       return handleAutoClean(sid, arg, msgId);
     case '/testnotify':
@@ -351,14 +357,19 @@ async function listPermissions(sid, msgId) {
     return;
   }
   const entries = [...pendingPermissions.entries()];
+  // Fetch all session names first
+  const sesIds = [...new Set(entries.map(([,info]) => info.sessionID).filter(Boolean))];
+  await Promise.all(sesIds.map(fetchSessionName));
   const lines = [`📋 待审批权限 (${entries.length}个)`];
   entries.forEach(([rid, info], i) => {
     const ago = Math.round((Date.now() - info.ts) / 1000);
-    const pathInfo = info.patterns ? ` | ${info.patterns.slice(0, 60)}` : '';
-    lines.push(`#${i + 1} ${info.permission}${pathInfo} | ${rid.slice(0, 16)}... | ${ago}秒前`);
+    const sesLabel = info.sessionID ? `[${getSessionName(info.sessionID)}]` : '';
+    const pathInfo = info.patterns ? `\n${info.patterns.slice(0, 80)}` : '';
+    lines.push(`#${i+1}${sesLabel} ${info.permission}${pathInfo}`);
+    lines.push(`${rid.slice(0,16)}... ${ago}秒前`);
   });
   lines.push('');
-  lines.push('/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号|requestID> 不输入编号，默认为#1');
+  lines.push('/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号>');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -513,6 +524,8 @@ function showHelp(sid, msgId) {
     '',
     '── 问题回答 ──',
     '/answer (/ans) <内容|编号> 回答AI提问或选择选项',
+    '/skip (/pass, /ps) [编号]  跳过指定问题（默认当前）',
+    '/qlist (/ql, /questions)   查看所有待回答问题',
     '',
     '── 权限审批 ──',
     '/allow (/a) [编号|ID]    批准权限请求',
@@ -552,30 +565,117 @@ async function testNotify(sid, msgId) {
 
 /* ───────── Question/Answer Handling ───────── */
 
+function getAllQuestions() {
+  const all = [];
+  if (pendingQuestions) all.push(pendingQuestions);
+  for (const q of pendingQuestionQueue) all.push(q);
+  return all;
+}
+
+async function listQuestions(sid, msgId) {
+  const all = getAllQuestions();
+  if (all.length === 0) {
+    reply(sid, '📋 当前没有待回答问题');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  // Fetch session names for all questions
+  for (const q of all) {
+    if (q.sessionID) await fetchSessionName(q.sessionID);
+  }
+  const lines = [`📋 待回答问题（${all.length}个）`];
+  lines.push('─'.repeat(20));
+  all.forEach((q, idx) => {
+    const num = idx + 1;
+    const active = idx === 0 && pendingQuestions ? ' ◀当前' : '';
+    const sesName = q.sessionID ? getSessionName(q.sessionID) : '?';
+    const qi = q.questions?.[0];
+    const qBrief = qi?.question?.slice(0, 40) || '(无描述)';
+    lines.push(`${num}. [${sesName}]${active}`);
+    lines.push(`   ${qBrief}`);
+    if (qi?.options?.length) {
+      lines.push('   ' + qi.options.slice(0, 6).map((o, j) => `${j+1}.${o.label}`).join(' '));
+    }
+    if (q.questions?.length > 1) {
+      lines.push(`   （共${q.questions.length}小题）`);
+    }
+  });
+  lines.push('─'.repeat(20));
+  lines.push('/ans <内容|编号>  回答（默认当前第1题）');
+  lines.push('/ans <编号> <内容>  回答指定编号问题');
+  lines.push('/skip [编号]      跳过指定问题');
+  reply(sid, lines.join('\n'));
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
 async function answerQuestion(sid, answer, msgId) {
-  if (!pendingQuestions) {
+  const all = getAllQuestions();
+  if (all.length === 0) {
     reply(sid, '⚠️ 当前没有待回答的问题');
     if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
 
-  const qData = pendingQuestions;
-  const targetId = currentSessionId;
-  if (!targetId) {
-    reply(sid, '⚠️ 没有选中的会话，无法提交答案');
-    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
-    pendingQuestions = null;
-    return;
-  }
-  if (qData.sessionID !== targetId) {
-    reply(sid, '⚠️ 当前会话已切换，无法回答之前的问题');
-    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
-    pendingQuestions = null;
-    return;
+  // Parse "[N] <content>" — leading number means question index
+  let qIdx = 0;
+  let answerText = answer.trim();
+  const idxMatch = answerText.match(/^(\d+)\s+(.+)$/);
+  if (idxMatch) {
+    qIdx = parseInt(idxMatch[1], 10) - 1;
+    answerText = idxMatch[2].trim();
+    if (qIdx < 0 || qIdx >= all.length) {
+      reply(sid, `⚠️ 编号 ${idxMatch[1]} 超出范围 (1-${all.length})`);
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
   }
 
-  let answerText = answer.trim();
+  // Get the target question data and promote it to current if needed
+  let qData;
+  if (qIdx === 0 && pendingQuestions) {
+    qData = pendingQuestions;
+  } else {
+    // Remove from queue and put as current
+    const queuedIdx = qIdx - (pendingQuestions ? 1 : 0);
+    qData = pendingQuestionQueue.splice(queuedIdx, 1)[0];
+    if (!qData) {
+      reply(sid, '⚠️ 该问题不存在或已被回答');
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    // Move this question to current, push old current back to queue
+    if (pendingQuestions) {
+      pendingQuestionQueue.unshift(pendingQuestions);
+    }
+    pendingQuestions = qData;
+    // Reset auto-clear timer
+    const ts = Date.now();
+    qData.askTimestamp = ts;
+    setTimeout(() => {
+      if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
+    }, 300_000).unref?.();
+  }
+
+  const targetId = currentSessionId;
+
+  // If we have a requestID (question API), session check is optional — the API binds to the question's session
+  if (!qData.requestID) {
+    if (!targetId) {
+      reply(sid, '⚠️ 没有选中的会话，无法提交答案');
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      pendingQuestions = null;
+      return;
+    }
+    if (qData.sessionID && qData.sessionID !== targetId) {
+      reply(sid, '⚠️ 当前会话已切换，无法回答之前的问题');
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      pendingQuestions = null;
+      return;
+    }
+  }
+
   const qi = qData.questions?.[0];
+  const multi = qData.questions?.length > 1;
 
   if (!answerText) {
     reply(sid, '⚠️ 答案不能为空。请回复内容或用编号选择选项');
@@ -583,24 +683,158 @@ async function answerQuestion(sid, answer, msgId) {
     return;
   }
 
-  // Numeric option selection
-  if (qi?.options?.length > 0 && /^\d+$/.test(answerText)) {
-    const idx = parseInt(answerText, 10) - 1;
-    if (idx >= 0 && idx < qi.options.length) {
-      answerText = qi.options[idx].label;
-      log(`[ANSWER] selected option ${answer} -> "${answerText}"`);
+  // Collect answers for all questions
+  let answers = [];
+  if (multi) {
+    const parts = answerText.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+    for (let i = 0; i < qData.questions.length; i++) {
+      const q = qData.questions[i];
+      let a = parts[i] || '';
+      if (q?.options?.length > 0 && /^\d+$/.test(a)) {
+        const idx = parseInt(a, 10) - 1;
+        if (idx >= 0 && idx < q.options.length) a = q.options[idx].label;
+      }
+      answers.push(a);
     }
+  } else {
+    // Numeric option selection for single question
+    if (qi?.options?.length > 0 && /^\d+$/.test(answerText)) {
+      const idx = parseInt(answerText, 10) - 1;
+      if (idx >= 0 && idx < qi.options.length) {
+        answerText = qi.options[idx].label;
+        log(`[ANSWER] selected option ${answer} -> "${answerText}"`);
+      }
+    }
+    answers.push(answerText);
   }
 
   pendingQuestions = null;
-  log(`[ANSWER] sid=${sid.slice(0,12)} text="${answerText.slice(0,60)}"`);
-  // Start streaming for the AI's response to the answer
-  startStreaming(sid, targetId);
-  lastPromptText = answerText;
+  dequeueNextQuestion();
+  const combined = answers.join(', ');
+  log(`[ANSWER] sid=${sid.slice(0,12)} answers=[${combined}]`);
+  // Start streaming for the AI's response — use question's own sessionID for cross-session replies
+  startStreaming(sid, qData.sessionID || targetId);
+  lastPromptText = combined;
   armWorkingNotice(sid);
   reply(sid, `⏳ 已提交回答`);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
-  forwardToAIAsync(sid, targetId, answerText).catch(e => log(`[ERR] answer: ${e.message}`));
+  if (qData.requestID) {
+    answerViaQuestionApi(sid, targetId, answers, qData.requestID).catch(e => log(`[ERR] answerAPI: ${e.message}`));
+  } else {
+    forwardToAIAsync(sid, targetId, combined).catch(e => log(`[ERR] answer: ${e.message}`));
+  }
+}
+
+async function answerViaQuestionApi(sid, targetId, answers, requestID) {
+  try {
+    const res = await fetch(`${SERVER}/question/${requestID}/reply`, {
+      method: 'POST',
+      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: answers.map(a => [a]) }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      reply(sid, `⚠️ 回答提交失败 (${res.status}): ${errText.slice(0, 100)}`);
+      await drainPendingNotifications();
+      flushToWeChat();
+      return;
+    }
+    log(`[ANSWER] reply sent via question API, waiting for SSE response...`);
+  } catch (err) {
+    reply(sid, `❌ 回答提交失败: ${err.message}`);
+    await drainPendingNotifications();
+    flushToWeChat();
+  }
+}
+
+async function dequeueNextQuestion() {
+  while (pendingQuestionQueue.length > 0) {
+    const next = pendingQuestionQueue.shift();
+    pendingQuestions = next;
+    const autoClear = setTimeout(() => {
+      if (pendingQuestions?.askTimestamp === next.askTimestamp) { pendingQuestions = null; dequeueNextQuestion(); }
+    }, 300_000);
+    autoClear.unref?.();
+    // Generate notification for the next question
+    await fetchSessionName(next.sessionID);
+    const sesLabel = next.sessionID ? `[${getSessionName(next.sessionID)}] ` : '';
+    const qi = next.questions?.[0];
+    if (!qi) continue;
+    const multi = next.questions.length > 1;
+    let text = (multi ? `📌 下一题（共${next.questions.length}题）` : `📌 下一题`);
+    if (sesLabel) text = sesLabel + text;
+    if (multi) {
+      next.questions.forEach((qItem, idx) => {
+        const qText = qItem.question || '';
+        text += `\n\n${idx+1}. ${qText}`;
+        if (qItem.options?.length) {
+          text += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
+        }
+      });
+        text += '\n\n多个答案用逗号分隔，如：1, 2';
+        text += '\n/skip 跳过，/qlist 查看全部待答';
+    } else {
+      const q = qi.question || '';
+      const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
+      text += `\n${q}`;
+      if (opts) text += `\n${opts}`;
+      if (qi.isSecret) text += '\n🔒 答案将保密发送';
+      text += '\n回复内容，或 /ans <内容> 提交';
+      if (opts) text += '，或发送编号选择';
+      text += '\n/skip 跳过，/qlist 查看全部待答';
+    }
+    broadcastNotification(text);
+    return;
+  }
+}
+
+async function skipQuestion(sid, arg, msgId) {
+  const all = getAllQuestions();
+  if (all.length === 0) {
+    reply(sid, '⚠️ 当前没有待回答的问题');
+    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  let qIdx = 0;
+  if (arg) {
+    qIdx = parseInt(arg.trim(), 10) - 1;
+    if (isNaN(qIdx) || qIdx < 0 || qIdx >= all.length) {
+      reply(sid, `⚠️ 编号无效 (1-${all.length})`);
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+  }
+
+  // Get the target question
+  let qData;
+  if (qIdx === 0 && pendingQuestions) {
+    qData = pendingQuestions;
+    pendingQuestions = null;
+    dequeueNextQuestion();
+  } else {
+    const queuedIdx = qIdx - (pendingQuestions ? 1 : 0);
+    qData = pendingQuestionQueue.splice(queuedIdx, 1)[0];
+  }
+
+  const requestID = qData?.requestID;
+  if (requestID) {
+    try {
+      await fetch(`${SERVER}/question/${requestID}/reject`, {
+        method: 'POST',
+        headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+      });
+      log(`[SKIP] rejected question ${requestID.slice(0,16)}`);
+    } catch (err) {
+      log(`[SKIP] reject error: ${err.message}`);
+    }
+  }
+
+  const remaining = getAllQuestions().length;
+  const note = remaining > 0 ? `（还剩${remaining}题，/qlist 查看）` : '';
+  fetchSessionName(qData?.sessionID).catch(() => {});
+  const sesLabel = qData?.sessionID ? ` [${getSessionName(qData.sessionID)}]` : '';
+  reply(sid, `⏭️ 已跳过${sesLabel}，${note}`);
+  if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
 /* ───────── Streaming Output ───────── */
@@ -1197,21 +1431,43 @@ async function eventToNotification(type, props) {
     case 'question.asked': {
       const questions = props.questions || [];
       const ts = Date.now();
-      pendingQuestions = { sessionID: props.sessionID, questions, askTimestamp: ts };
-      // Auto-clear after 5 minutes to prevent stale questions
+      const qData = { sessionID: props.sessionID, requestID: props.requestID, questions, askTimestamp: ts };
+      if (pendingQuestions) {
+        pendingQuestionQueue.push(qData);
+        log(`[EVENT] question.asked: queued (${pendingQuestionQueue.length} in queue)`);
+        return null; // notification will be generated by dequeueNextQuestion
+      }
+      pendingQuestions = qData;
       setTimeout(() => {
-        if (pendingQuestions?.askTimestamp === ts) pendingQuestions = null;
+        if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
       }, 300_000).unref?.();
       log(`[EVENT] question.asked: stored ${questions.length} questions`);
+      await fetchSessionName(props.sessionID);
+      const sesLabel = props.sessionID ? `[${getSessionName(props.sessionID)}] ` : '';
       const qi = questions[0];
       if (!qi) return '💬 AI 提出了一个问题（无详情）';
-      const q = qi.question || '';
-      const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
-      let msg = `💬 需要你回答\n${q}`;
-      if (opts) msg += `\n${opts}`;
-      if (qi.isSecret) msg += '\n🔒 答案将保密发送';
-      msg += '\n直接回复内容，或 /ans <内容> 提交';
-      if (opts) msg += '，或发送编号选择';
+      const multi = questions.length > 1;
+      let msg = multi ? `💬 待回答（共${questions.length}题）` : `💬 需要你回答`;
+      if (sesLabel) msg = sesLabel + msg;
+      if (multi) {
+        questions.forEach((qItem, idx) => {
+          const qText = qItem.question || '';
+          msg += `\n\n${idx+1}. ${qText}`;
+          if (qItem.options?.length) {
+            msg += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
+          }
+        });
+        msg += '\n\n多个答案用逗号分隔，如：1, 2';
+      } else {
+        const q = qi.question || '';
+        const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
+        msg += `\n${q}`;
+        if (opts) msg += `\n${opts}`;
+        if (qi.isSecret) msg += '\n🔒 答案将保密发送';
+        msg += '\n回复内容，或 /ans <内容> 提交';
+        if (opts) msg += '，或发送编号选择';
+        msg += '\n/skip 跳过，/qlist 查看全部待答';
+      }
       return msg;
     }
     case 'permission.asked': {
@@ -1246,8 +1502,12 @@ async function eventToNotification(type, props) {
           }
         }
       }
-      const sessionPerms = [...pendingPermissions.values()].filter(info => info.sessionID === sesId);
-      return `📋 #${sessionPerms.length} ${p || t}`;
+      await fetchSessionName(sesId);
+      const sesLabel = sesId ? `[${getSessionName(sesId)}] ` : '';
+      // WeChat eats leading spaces, so no indentation — path line starts directly after newline
+      const pathLine = p ? `\n${p}` : '';
+      const idx = pendingPermissions.size;
+      return `#${idx} ${sesLabel}${t}${pathLine}`;
     }
     case 'permission.replied': {
       const rid = props.requestID;
