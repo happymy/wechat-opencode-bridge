@@ -11,11 +11,12 @@ echo [1/3] Stopping WeChat bridge (graceful)...
 call npx wechat-acp@latest stop 2>nul
 timeout /t 2 /nobreak >nul
 
-echo  Killing any remaining wechat-acp node processes (by command line)...
-powershell -NoLogo -Command "
-$procs = Get-CimInstance Win32_Process -Filter 'Name = ''node.exe''' | Where-Object { $_.CommandLine -match 'wechat-acp|wechat-adapter' }
-if ($procs) { $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output (''Killed PID '' + $_.ProcessId) } } else { Write-Output 'No matching processes found' }
-"
+echo  Killing any remaining wechat-acp node processes...
+for /f "skip=1 tokens=*" %%p in ('wmic process where "name='node.exe' and (commandline like '%%wechat-acp%%' or commandline like '%%wechat-adapter%%')" get processid 2^>nul') do (
+  for /f "tokens=*" %%q in ("%%p") do (
+    if not "%%q"=="" taskkill /f /pid %%q >nul 2>&1
+  )
+)
 echo  [OK] Stopped.
 echo.
 

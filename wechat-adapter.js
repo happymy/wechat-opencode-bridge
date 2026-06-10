@@ -310,7 +310,6 @@ async function switchAgent(sid, agent, msgId) {
 }
 
 async function listPermissions(sid, msgId) {
-  await syncPermissionsFromServer();
   if (pendingPermissions.size === 0) {
     reply(sid, '📋 当前没有待处理的权限请求');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -333,9 +332,7 @@ async function listPermissions(sid, msgId) {
 }
 
 async function handlePermissionReply(sid, action, arg, msgId) {
-  log(`[PERM] handlePermissionReply action=${action} arg=${arg || '(auto)'} sid=${sid.slice(0,12)}`);
-  await syncPermissionsFromServer();
-  log(`[PERM] after sync: pendingPermissions.size=${pendingPermissions.size}`);
+  log(`[PERM] handlePermissionReply action=${action} arg=${arg || '(auto)'} sid=${sid.slice(0,12)} pending=${pendingPermissions.size}`);
   if (pendingPermissions.size === 0) {
     log(`[PERM] no pending permissions, aborting`);
     reply(sid, '📋 当前没有待处理的权限请求');
@@ -803,6 +800,7 @@ let idleNotified = new Set();
 let recentNotifications = new Map(); // text → timestamp, dedup within 60s
 let perUserRecent = new Map(); // sid → { text → timestamp }
 let proactiveTimer = null;
+let recentEventIds = new Set(); // event ID → timestamp, dedup within 10s
 
 const DEDUP_WINDOW = 60000;
 const PER_USER_DEDUP_WINDOW = 60000;
@@ -1068,12 +1066,29 @@ async function connectSSE() {
                 const parsed = JSON.parse(currentData);
                 const payload = parsed.payload || parsed;
                 const eventType = payload.type || currentEvent;
+                const eventId = payload.id;
                 const props = payload.properties || {};
+
+                // Event-level dedup: skip if same event ID seen within 10s
+                if (eventId && recentEventIds.has(eventId)) {
+                  log(`[SSE] EVENT DEDUP skip: id=${eventId.slice(0,24)}`);
+                  currentEvent = '';
+                  currentData = '';
+                  break;
+                }
+                if (eventId) {
+                  recentEventIds.add(eventId);
+                  setTimeout(() => recentEventIds.delete(eventId), 10000);
+                }
+
                 if (props.id) props.requestID ??= props.id;
                 if (payload.id && !props.requestID) props.requestID ??= payload.id;
                 log(`[SSE] parsed: event=${eventType} sessionID=${props.sessionID || '?'} id=${props.id || payload.id || '-'}`);
                 if (eventType.startsWith('permission') || eventType.startsWith('question') || eventType === 'session.idle' || eventType === 'session.error' || eventType === 'session.status') {
                   log(`[SSE] ** ${eventType} props keys=[${Object.keys(props).join(',')}]`);
+                }
+                if (eventType === 'permission.asked' || eventType === 'permission.replied') {
+                  log(`[SSE]    requestID=${props.requestID || '?'} permission=${props.permission || props.action || '?'}`);
                 }
                 const text = await eventToNotification(eventType, props);
                 if (text) {
