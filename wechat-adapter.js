@@ -974,6 +974,18 @@ async function eventToNotification(type, props) {
           log(`[TIMER] auto-clean rid=${rid.slice(0,16)}...`);
           pendingPermissions.delete(rid);
         }, 300_000);
+        // Same-session dedup: only suppress if this has NO path and session already has pending
+        // (approving one typically auto-approves related requests, but path info is critical)
+        if (!p) {
+          let sessionHasPending = false;
+          for (const [existingRid, info] of pendingPermissions) {
+            if (existingRid !== rid && info.sessionID === sesId) { sessionHasPending = true; break; }
+          }
+          if (sessionHasPending) {
+            log(`[EVENT] permission.asked: session ${sesId?.slice(0,12)} already has pending, no path to show, suppressing`);
+            return null;
+          }
+        }
       }
       return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n/allow (/a) 批准  /deny (/d) 拒绝  /trust (/t) 信任`;
     }
