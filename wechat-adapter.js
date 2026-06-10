@@ -827,29 +827,35 @@ function broadcastNotification(text) {
   }
 
   const targets = subscribers.filter(s => !s.muted);
-  log(`[BROADCAST] pushing to ${targets.length} subscriber(s)`);
-  for (const t of targets) {
-    // Per-user dedup
-    let userRecent = perUserRecent.get(t.sid);
-    if (userRecent && userRecent.has(text) && now - userRecent.get(text) < PER_USER_DEDUP_WINDOW) {
-      log(`[BROADCAST] per-user dedup skip: sid=${t.sid.slice(0,12)} ${textBrief}`);
-      continue;
-    }
-    if (!userRecent) {
-      userRecent = new Map();
-      perUserRecent.set(t.sid, userRecent);
-    }
-    userRecent.set(text, now);
-    if (userRecent.size > 30) {
-      const cutoff = now - PER_USER_DEDUP_WINDOW * 2;
-      for (const [txt, ts] of userRecent) {
-        if (ts < cutoff) userRecent.delete(txt);
-      }
-    }
-
-    pendingNotifications.push({ sid: t.sid, text });
-    log(`[BROADCAST] queued for sid=${t.sid.slice(0,12)} pendingTotal=${pendingNotifications.length}`);
+  if (targets.length === 0) { log(`[BROADCAST] no active subscribers`); return; }
+  // Pick the most recently active subscriber; prefer current session if exists
+  targets.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
+  let best = targets[0];
+  if (currentSessionId) {
+    const cur = targets.find(t => t.sid === currentSessionId);
+    if (cur) best = cur;
   }
+  log(`[BROADCAST] pushing to best subscriber: sid=${best.sid.slice(0,12)} (lastActive=${best.lastActive ? new Date(best.lastActive).toISOString() : 'never'})`);
+  const t = best;
+  let userRecent = perUserRecent.get(t.sid);
+  if (userRecent && userRecent.has(text) && now - userRecent.get(text) < PER_USER_DEDUP_WINDOW) {
+    log(`[BROADCAST] per-user dedup skip: sid=${t.sid.slice(0,12)} ${textBrief}`);
+    return;
+  }
+  if (!userRecent) {
+    userRecent = new Map();
+    perUserRecent.set(t.sid, userRecent);
+  }
+  userRecent.set(text, now);
+  if (userRecent.size > 30) {
+    const cutoff = now - PER_USER_DEDUP_WINDOW * 2;
+    for (const [txt, ts] of userRecent) {
+      if (ts < cutoff) userRecent.delete(txt);
+    }
+  }
+
+  pendingNotifications.push({ sid: t.sid, text });
+  log(`[BROADCAST] queued for sid=${t.sid.slice(0,12)} pendingTotal=${pendingNotifications.length}`);
   // Schedule proactive flush if no user message arrives within 15s
   if (!proactiveTimer) {
     proactiveTimer = setTimeout(() => {
@@ -878,20 +884,15 @@ async function drainPendingNotifications(forceFlush) {
       grouped.set(n.sid, existing);
     }
     log(`[DRAIN] grouped into ${grouped.size} unique sid(s)`);
-    const sentTexts = new Set();
     for (const [sid, texts] of grouped) {
       const unique = [...new Set(texts)];
-      // Cross-subscriber dedup: skip texts already sent to another sid in this drain cycle
-      const unsent = unique.filter(t => !sentTexts.has(t));
-      if (unsent.length === 0) { log(`[DRAIN] sid=${sid.slice(0,12)}: all texts already sent to another user, skipping`); continue; }
-      for (const t of unsent) sentTexts.add(t);
-      log(`[DRAIN] sid=${sid.slice(0,12)}: ${texts.length} texts -> ${unique.length} unique -> ${unsent.length} unsent`);
-      if (unsent.length > 1) {
-        for (let i = 0; i < unsent.length; i++) {
-          log(`[DRAIN]   [${i}]: ${unsent[i].slice(0,80).replace(/\n/g,'\\n')}`);
+      log(`[DRAIN] sid=${sid.slice(0,12)}: ${texts.length} texts -> ${unique.length} unique`);
+      if (unique.length > 1) {
+        for (let i = 0; i < unique.length; i++) {
+          log(`[DRAIN]   [${i}]: ${unique[i].slice(0,80).replace(/\n/g,'\\n')}`);
         }
       }
-      try { reply(sid, unsent.join('\n')); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
+      try { reply(sid, unique.join('\n')); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
     }
     if (forceFlush) {
       log(`[DRAIN] force flush requested`);
