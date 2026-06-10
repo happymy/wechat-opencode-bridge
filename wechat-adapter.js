@@ -11,6 +11,7 @@ const SESSION_FILE = join(WORK_DIR, '.wechat-session.json');
 const SUBSCRIBERS_FILE = join(WORK_DIR, '.wechat-subscribers.json');
 const WORKSPACES_FILE = join(WORK_DIR, '.wechat-workspaces.json');
 const WORKSPACE_CURRENT_FILE = join(WORK_DIR, '.wechat-workspace-current.json');
+const SETTINGS_FILE = join(WORK_DIR, '.wechat-settings.json');
 
 const rl = createInterface({ input: process.stdin });
 let currentSessionId = loadSession();
@@ -65,6 +66,8 @@ rl.on('line', (line) => {
     handlePrompt(msg).catch(e => log(`[ERR] session/prompt: ${e.message}`));
   } else if (m === 'session/cancel') {
     handleCancel(msg).catch(e => log(`[ERR] session/cancel: ${e.message}`));
+  } else if (msg.id != null) {
+    sendResponse(msg.id, { _meta: { error: `unknown method: ${m}` } });
   }
 });
 
@@ -76,13 +79,18 @@ async function handlePrompt(msg) {
     const sid = params.sessionId || currentSessionId || 'sess_fallback';
     const text = (params.prompt || []).map(b => b.text || '').join('').trim();
 
-    if (!text) { sendResponse(msg.id, { stopReason: 'end_turn' }); return; }
+    log(`[PROMPT] sid=${sid.slice(0,12)} text="${text.slice(0,60)}" msgId=${msg.id}`);
 
-    if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
+    if (!text) { log(`[PROMPT] empty text`); sendResponse(msg.id, { stopReason: 'end_turn' }); return; }
+
+    getOrCreateSubscriber(sid);
+
+    if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; log(`[PROMPT] cleared proactive timer`); }
 
     await drainPendingNotifications();
 
     if (text.startsWith('/')) {
+      log(`[PROMPT] routing to handleCommand`);
       await handleCommand(sid, text, msg.id);
       return;
     }
@@ -107,6 +115,7 @@ async function handleCommand(sid, text, msgId) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   const arg = parts.slice(1).join(' ');
+  log(`[CMD] cmd=${cmd} arg="${arg.slice(0,40)}"`);
 
   switch (cmd) {
     case '/list': case '/l': case '/sessions':
@@ -129,9 +138,16 @@ async function handleCommand(sid, text, msgId) {
       return newSession(sid, arg, msgId);
     case '/workspace': case '/ws':
       return handleWorkspace(sid, arg, msgId);
-    case '/plist': case '/pending':
+    case '/plist': case '/pending': case '/p':
       return listPermissions(sid, msgId);
-
+    case '/allow': case '/a':
+      return handlePermissionReply(sid, 'once', arg, msgId);
+    case '/deny': case '/d':
+      return handlePermissionReply(sid, 'reject', arg, msgId);
+    case '/trust': case '/t':
+      return handlePermissionReply(sid, 'always', arg, msgId);
+    case '/autoclean': case '/ac':
+      return handleAutoClean(sid, arg, msgId);
     case '/testnotify':
       return testNotify(sid, msgId);
     case '/help': case '/h':
@@ -153,7 +169,7 @@ async function listSessions(sid, msgId) {
       sendResponse(msgId, { stopReason: 'end_turn' });
       return;
     }
-    const sorted = sessions.sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
+    const sorted = [...sessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
     const maxShow = 20;
     const show = sorted.slice(0, maxShow);
 
@@ -195,7 +211,7 @@ async function switchSession(sid, arg, msgId) {
     try {
       const sessions = await apiFetch('/session');
       if (!Array.isArray(sessions)) throw new Error('获取会话列表失败');
-      const sorted = sessions.sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
+      const sorted = [...sessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
       const idx = parseInt(arg, 10) - 1;
       if (idx < 0 || idx >= sorted.length) {
         reply(sid, `⚠️ 编号 ${arg} 超出范围 (1-${sorted.length})`);
@@ -275,7 +291,7 @@ async function newSession(sid, title, msgId) {
     const data = await apiFetch(`/session?directory=${encodeURIComponent(dir)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: title.trim(), directory: dir }),
+      body: JSON.stringify({ title: title.trim() }),
     });
     currentSessionId = data.id;
     saveSession(data.id);
@@ -300,17 +316,96 @@ async function listPermissions(sid, msgId) {
     return;
   }
   const entries = [...pendingPermissions.entries()];
-  const lines = [`📋 待审批权限 (${entries.length}个)`, '─'.repeat(16)];
+  const lines = [`📋 待审批权限 (${entries.length}个)`];
   entries.forEach(([rid, info], i) => {
     const ago = Math.round((Date.now() - info.ts) / 1000);
-    lines.push(`${i + 1}. ${info.permission}`);
-    if (info.patterns) lines.push(`   ${info.patterns.slice(0, 60)}`);
-    lines.push(`   ${ago}s前`);
+    const pathInfo = info.patterns ? ` | ${info.patterns.slice(0, 60)}` : '';
+    lines.push(`#${i + 1} ${info.permission}${pathInfo} | ${rid.slice(0, 16)}... | ${ago}秒前`);
   });
-  lines.push('─'.repeat(10));
-  lines.push('请使用 Web UI (localhost:4096) 审批');
+  lines.push('');
+  lines.push('/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号|requestID> 不输入编号，默认为#1');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handlePermissionReply(sid, action, arg, msgId) {
+  log(`[PERM] handlePermissionReply action=${action} arg=${arg || '(auto)'} sid=${sid.slice(0,12)} pending=${pendingPermissions.size}`);
+  if (pendingPermissions.size === 0) {
+    log(`[PERM] no pending permissions, aborting`);
+    reply(sid, '📋 当前没有待处理的权限请求');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  let targetRid;
+  if (!arg) {
+    const entries = [...pendingPermissions.entries()];
+    entries.sort((a, b) => b[1].ts - a[1].ts);
+    targetRid = entries[0][0];
+    log(`[PERM] auto-select rid=${targetRid.slice(0,16)}... (latest of ${entries.length})`);
+  } else if (/^\d+$/.test(arg)) {
+    const entries = [...pendingPermissions.entries()];
+    const idx = parseInt(arg, 10) - 1;
+    log(`[PERM] index-select idx=${idx} total=${entries.length}`);
+    if (idx < 0 || idx >= entries.length) {
+      reply(sid, `⚠️ 编号 ${arg} 超出范围 (1-${entries.length})`);
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    targetRid = entries[idx][0];
+  } else {
+    targetRid = arg;
+    log(`[PERM] direct rid=${targetRid.slice(0,16)}...`);
+  }
+
+  log(`[PERM] targetRid=${targetRid.slice(0,16)}... has=${pendingPermissions.has(targetRid)}`);
+  if (!pendingPermissions.has(targetRid)) {
+    log(`[PERM] targetRid not in pendingPermissions`);
+    reply(sid, '⚠️ 未找到该权限请求，可能已过期或已通过其他端处理');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  try {
+    log(`[PERM] sending reply: action=${action} rid=${targetRid.slice(0,16)}...`);
+    await apiFetch(`/permission/${encodeURIComponent(targetRid)}/reply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reply: action, message: 'via wechat-adapter' }),
+    });
+    const info = pendingPermissions.get(targetRid);
+    const labels = { once: '✅ 已批准', always: '✅ 已信任', reject: '❌ 已拒绝' };
+    const msg = `${labels[action]}: ${info?.permission || '权限请求'}`;
+    log(`[PERM] reply success: ${msg}`);
+    reply(sid, msg);
+    pendingPermissions.delete(targetRid);
+    log(`[PERM] deleted from pendingPermissions, remaining=${pendingPermissions.size}`);
+  } catch (err) {
+    log(`[PERM] reply FAILED: ${err.message}`);
+    reply(sid, `⚠️ 操作失败: ${err.message}`);
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function syncPermissionsFromServer() {
+  log(`[SYNC] start pendingPermissions.size=${pendingPermissions.size}`);
+  try {
+    const list = await apiFetch(`/permission?directory=${encodeURIComponent(getWorkspaceDir())}`);
+    log(`[SYNC] server returned ${Array.isArray(list) ? list.length + ' items' : typeof list}`);
+    if (!Array.isArray(list)) { log(`[SYNC] not an array, skipping`); return; }
+    const serverIds = new Set(list.map(r => r.id));
+    log(`[SYNC] server IDs: [${[...serverIds].map(i=>i.slice(0,12)).join(', ')}]`);
+    const before = pendingPermissions.size;
+    for (const [rid] of pendingPermissions) {
+      if (!serverIds.has(rid)) {
+        log(`[SYNC] removing local rid=${rid.slice(0,16)}... (not on server)`);
+        pendingPermissions.delete(rid);
+      }
+    }
+    log(`[SYNC] done: ${before} -> ${pendingPermissions.size}`);
+  } catch (e) {
+    log(`[SYNC] fetch failed: ${e.message}`);
+  }
 }
 
 async function handleWorkspace(sid, arg, msgId) {
@@ -368,20 +463,33 @@ async function showTaskStatus(sid, msgId) {
 function showHelp(sid, msgId) {
   const lines = [
     '🤖 微信远程编程助手',
-    '─'.repeat(14),
-    '/list (/l) 或 /sessions    查看会话列表',
-    '/switch (/s) <编号|ID>    切换会话',
-    '/new (/create) <会话名>   新建会话（当前工作区）并切换',
+    '─'.repeat(20),
+    '── 会话管理 ──',
+    '/list (/l, /sessions)    查看会话列表',
+    '/switch (/s) <编号|ID>   切换会话',
+    '/new (/create) <会话名>  新建会话（当前工作区）并切换',
+    '',
+    '── 模式切换 ──',
     '/plan (/pl)              切换到 plan 模式',
     '/build (/bu)             切换到 build 模式',
-    '/workspace (/ws)          查看/切换工作区',
-    '/status (/st)             查看任务运行状态',
-    '/cancel (/c)              取消当前AI执行',
-    '权限审批请使用 Web UI (localhost:4096)',
-    '/mute (/m)                开关通知',
-    '/notify (/n)              查看通知状态',
-    '/help (/h)                显示此帮助',
-    '/testnotify               发送测试通知（调试用）',
+    '',
+    '── 权限审批 ──',
+    '/allow (/a) [编号|ID]    批准权限请求',
+    '/deny (/d) [编号|ID]     拒绝权限请求',
+    '/trust (/t) [编号|ID]    信任权限（不再询问）',
+    '/plist (/p, /pending)    查看待审批权限列表',
+    '',
+    '── 工作区与任务 ──',
+    '/workspace (/ws)         查看/切换工作区',
+    '/status (/st)            查看任务运行状态',
+    '/cancel (/c)             取消当前AI执行',
+    '',
+    '── 通知与系统 ──',
+    '/mute (/m)               开关通知',
+    '/notify (/n)             查看通知状态',
+    '/autoclean (/ac) [天数]  查看/设置不活跃订阅清理阈值',
+    '/help (/h)               显示此帮助',
+    '/testnotify              发送测试通知（调试用）',
     '',
     '发送其他文字将转发给当前选中的AI会话',
   ];
@@ -411,6 +519,7 @@ async function forwardToAIAsync(sid, targetId, text) {
       method: 'POST',
       headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
       body: JSON.stringify({ parts: [{ type: 'text', text }], agent: currentAgent }),
+      signal: controller.signal,
     });
     clearTimeout(timeout);
 
@@ -448,10 +557,13 @@ function formatReply(data) {
   for (const p of parts) {
     if (p.type === 'text' && p.text) textParts.push(p.text);
     else if (p.type === 'reasoning' && p.text) reasoningBuf += p.text;
-    else if (p.type === 'tool' && (p.tool || p.name)) {
-      const t = p.tool || p;
-      const status = t.state?.status === 'success' ? '✅' : (t.state?.status === 'error' || t.state?.status === 'failed') ? '❌' : '🔄';
-      toolCalls.push({ name: t.tool || t.name || '未知', status });
+    else if (p.type === 'tool' && p.tool) {
+      const toolName = p.tool || '未知';
+      const s = p.state;
+      const success = s?.status === 'completed' || s?.status === 'success';
+      const error = s?.status === 'error' || s?.status === 'failed';
+      const statusIcon = success ? '✅' : error ? '❌' : '🔄';
+      toolCalls.push({ name: toolName, status: statusIcon });
     }
   }
 
@@ -490,8 +602,9 @@ async function handleNewSession(msg) {
     saveSession(currentSessionId);
     sendResponse(msg.id, { sessionId: currentSessionId, configOptions: [], modes: null, models: null });
   } catch {
-    const sid = 'sess_' + Date.now();
-    sendResponse(msg.id, { sessionId: sid, configOptions: [], modes: null, models: null });
+    currentSessionId = 'sess_' + Date.now();
+    saveSession(currentSessionId);
+    sendResponse(msg.id, { sessionId: currentSessionId, configOptions: [], modes: null, models: null });
   }
 }
 
@@ -528,6 +641,7 @@ async function handleCancel(msg) {
   if (sid) {
     try { await fetch(`${SERVER}/session/${sid}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
   }
+  sendResponse(msg.id, {});
 }
 
 /* ───────── Workspace ───────── */
@@ -589,12 +703,48 @@ function saveSubscribers() {
 function getOrCreateSubscriber(sid) {
   let s = subscribers.find(x => x.sid === sid);
   if (!s) { s = { sid, muted: false, lastActive: Date.now() }; subscribers.push(s); }
+  s.lastActive = Date.now();
   return s;
+}
+
+/* ───────── Settings ───────── */
+
+let settings = { cleanupDays: 7 };
+
+function loadSettings() {
+  try {
+    if (existsSync(SETTINGS_FILE)) {
+      const data = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'));
+      if (data && typeof data.cleanupDays === 'number') settings.cleanupDays = data.cleanupDays;
+    }
+  } catch {}
+}
+function saveSettings() {
+  try { writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2)); } catch {}
+}
+
+async function handleAutoClean(sid, arg, msgId) {
+  if (!arg) {
+    reply(sid, `🔧 自动清理设置\n不活跃阈值: ${settings.cleanupDays} 天\n/autoclean <天数> 修改`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const days = parseInt(arg, 10);
+  if (isNaN(days) || days < 1) {
+    reply(sid, '⚠️ 请输入有效天数（至少 1 天）');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  settings.cleanupDays = days;
+  saveSettings();
+  reply(sid, `✅ 自动清理阈值已设为 ${days} 天`);
+  sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
 /* ───────── I/O Helpers ───────── */
 
 function reply(sid, text) {
+  log(`[REPLY] to=${sid.slice(0,12)} len=${text.length} text=${text.slice(0,80).replace(/\n/g,'\\n')}`);
   sendNotification('session/update', {
     sessionId: sid,
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: uuid() },
@@ -604,28 +754,38 @@ function reply(sid, text) {
 function sendResponse(id, result) {
   const msg = JSON.stringify({ jsonrpc: '2.0', id, result });
   process.stdout.write(msg + '\n');
-  log(`→ response id=${id} ok`);
+  log(`→ response id=${id} ok${result._meta?.error ? ' ERR=' + result._meta.error : ''}`);
 }
 
 function sendNotification(method, params) {
   const msg = JSON.stringify({ jsonrpc: '2.0', method, params });
   process.stdout.write(msg + '\n');
+  log(`→ notify ${method} ${params.sessionId ? 'sid='+params.sessionId.slice(0,12) : ''} ${params.update?.sessionUpdate || ''} ${params.update?.content?.type || ''}`);
 }
 
 async function apiFetch(path, opts = {}) {
+  const method = opts.method || 'GET';
+  log(`[API] ${method} ${path}`);
   const { headers: extraHeaders, ...rest } = opts;
   const res = await fetch(`${SERVER}${path}`, {
     headers: { Authorization: AUTH, ...extraHeaders },
     signal: AbortSignal.timeout(10000),
     ...rest,
   });
+  log(`[API] => ${res.status} ${method} ${path}`);
   if (!res.ok) {
     let errText;
     try { errText = await res.text(); } catch { errText = res.statusText; }
+    log(`[API] => ERR ${res.status}: ${errText.slice(0, 150)}`);
     throw new Error(`${res.status}: ${errText.slice(0, 200)}`);
   }
-  if (opts.method === 'DELETE') return {};
-  return res.json();
+  if (opts.method === 'DELETE' || res.status === 204) {
+    log(`[API] => ${res.status} no body`);
+    return {};
+  }
+  const text = await res.text();
+  log(`[API] => body=${text.slice(0, 200)}`);
+  try { return JSON.parse(text); } catch { log(`[API] => non-JSON body, returning {}`); return {}; }
 }
 
 /* ═══════════════════════════════════════
@@ -634,58 +794,121 @@ async function apiFetch(path, opts = {}) {
 
 let sessionNames = new Map();
 let idleNotified = new Set();
-let recentNotifications = new Map(); // text → timestamp, dedup within 30s
-
+let recentNotifications = new Map(); // text → timestamp, dedup within 60s
+let perUserRecent = new Map(); // sid → { text → timestamp }
 let proactiveTimer = null;
+let recentEventIds = new Set(); // event ID → timestamp, dedup within 10s
+
+const DEDUP_WINDOW = 60000;
+const PER_USER_DEDUP_WINDOW = 60000;
 
 function broadcastNotification(text) {
-  // Text-level dedup: skip if same text was sent within last 30s
   const now = Date.now();
+  const textBrief = text.slice(0, 60).replace(/\n/g, '\\n');
+
+  // Global text-level dedup: skip if same text was sent within 60s
   const lastSent = recentNotifications.get(text);
-  if (lastSent && now - lastSent < 30000) {
-    log(`[NOTIFY] skipped (dedup within 30s): ${text.slice(0, 60)}`);
+  if (lastSent && now - lastSent < DEDUP_WINDOW) {
+    log(`[BROADCAST] GLOBAL DEDUP skip: ${textBrief} (age=${now-lastSent}ms)`);
     return;
   }
   recentNotifications.set(text, now);
-  // Clean old entries periodically
+  log(`[BROADCAST] new: ${textBrief}`);
+  // Clean old global entries
   if (recentNotifications.size > 50) {
+    let removed = 0;
     for (const [t, ts] of recentNotifications) {
-      if (now - ts > 60000) recentNotifications.delete(t);
+      if (now - ts > DEDUP_WINDOW * 2) { recentNotifications.delete(t); removed++; }
+    }
+    log(`[BROADCAST] cleaned ${removed} old dedup entries`);
+  }
+
+  const targets = subscribers.filter(s => !s.muted);
+  if (targets.length === 0) { log(`[BROADCAST] no active subscribers`); return; }
+  // Pick the most recently active subscriber; prefer current session if exists
+  targets.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
+  let best = targets[0];
+  if (currentSessionId) {
+    const cur = targets.find(t => t.sid === currentSessionId);
+    if (cur) best = cur;
+  }
+  log(`[BROADCAST] pushing to best subscriber: sid=${best.sid.slice(0,12)} (lastActive=${best.lastActive ? new Date(best.lastActive).toISOString() : 'never'})`);
+  const t = best;
+  let userRecent = perUserRecent.get(t.sid);
+  if (userRecent && userRecent.has(text) && now - userRecent.get(text) < PER_USER_DEDUP_WINDOW) {
+    log(`[BROADCAST] per-user dedup skip: sid=${t.sid.slice(0,12)} ${textBrief}`);
+    return;
+  }
+  if (!userRecent) {
+    userRecent = new Map();
+    perUserRecent.set(t.sid, userRecent);
+  }
+  userRecent.set(text, now);
+  if (userRecent.size > 30) {
+    const cutoff = now - PER_USER_DEDUP_WINDOW * 2;
+    for (const [txt, ts] of userRecent) {
+      if (ts < cutoff) userRecent.delete(txt);
     }
   }
 
-  log(`[NOTIFY] ${text.slice(0, 100)}`);
-  const targets = subscribers.filter(s => !s.muted);
-  for (const t of targets) pendingNotifications.push({ sid: t.sid, text });
+  pendingNotifications.push({ sid: t.sid, text });
+  log(`[BROADCAST] queued for sid=${t.sid.slice(0,12)} pendingTotal=${pendingNotifications.length}`);
   // Schedule proactive flush if no user message arrives within 15s
   if (!proactiveTimer) {
     proactiveTimer = setTimeout(() => {
+      log(`[TIMER] proactive drain firing`);
       proactiveTimer = null;
-      drainPendingNotifications(true).catch(() => {});
+      drainPendingNotifications(true).catch(e => log(`[TIMER] drain error: ${e.message}`));
     }, 15000);
+    log(`[BROADCAST] proactive timer set for 15s`);
   }
 }
 
 async function drainPendingNotifications(forceFlush) {
-  if (draining || pendingNotifications.length === 0) return;
+  if (draining || pendingNotifications.length === 0) {
+    log(`[DRAIN] skip: draining=${draining} pending=${pendingNotifications.length}`);
+    return;
+  }
   draining = true;
+  const batchSize = pendingNotifications.length;
+  log(`[DRAIN] start: ${batchSize} pending, forceFlush=${forceFlush}`);
   try {
     const batch = pendingNotifications.splice(0);
-    log(`[DRAIN] flushing ${batch.length} pending notification(s)`);
     const grouped = new Map();
     for (const n of batch) {
       const existing = grouped.get(n.sid) || [];
       existing.push(n.text);
       grouped.set(n.sid, existing);
     }
+    log(`[DRAIN] grouped into ${grouped.size} unique sid(s)`);
     for (const [sid, texts] of grouped) {
-      try { reply(sid, texts.join('\n')); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
+      const unique = [...new Set(texts)];
+      log(`[DRAIN] sid=${sid.slice(0,12)}: ${texts.length} texts -> ${unique.length} unique`);
+      if (unique.length > 1) {
+        for (let i = 0; i < unique.length; i++) {
+          log(`[DRAIN]   [${i}]: ${unique[i].slice(0,80).replace(/\n/g,'\\n')}`);
+        }
+      }
+      const permLines = unique.filter(t => /^📋 #/.test(t));
+      if (permLines.length > 0) {
+        const others = unique.filter(t => !/^📋 #/.test(t));
+        let combined = permLines.join('\n');
+        combined += '\n/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号|requestID> 不输入编号，默认为#1';
+        if (others.length > 0) combined += '\n' + others.join('\n');
+        try { reply(sid, combined); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
+      } else {
+        try { reply(sid, unique.join('\n')); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
+      }
     }
-    if (forceFlush) flushToWeChat();
+    if (forceFlush) {
+      log(`[DRAIN] force flush requested`);
+      flushToWeChat();
+    }
   } catch (e) {
     log(`[DRAIN] error: ${e.message}`);
   } finally {
     draining = false;
+    log(`[DRAIN] end`);
   }
 }
 
@@ -732,22 +955,57 @@ async function eventToNotification(type, props) {
       return `❌ ${err.name}\n${brief.slice(0, 100)}`;
     }
     case 'question.asked': {
-      const q = props.question || '';
-      const opts = props.options?.slice(0, 4).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
+      const qi = props.questions?.[0];
+      const q = qi?.question || '';
+      const opts = qi?.options?.slice(0, 4).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
       let msg = `💬 需要你回答\n${q}`;
       if (opts) msg += `\n${opts}`;
+      msg += `\n请直接回复你的答案`;
       return msg;
     }
     case 'permission.asked': {
-      const t = props.permission || '操作';
-      const p = props.patterns?.[0] || props.metadata?.path || props.metadata?.file || props.metadata?.command || '';
-      const rid = props.requestID;
-      const sid = props.sessionID;
+      const t = props.permission || props.action || '操作';
+      const rid = props.requestID || props.id;
+      const sesId = props.sessionID;
+      log(`[EVENT] permission.asked rid=${(rid||'?').slice(0,16)} perm=${t} sesId=${(sesId||'?').slice(0,12)}`);
+      log(`[EVENT]   props keys=[${Object.keys(props).join(',')}] patterns=${JSON.stringify(props.patterns)} resources=${JSON.stringify(props.resources)} metadata=${JSON.stringify(props.metadata)}`);
+      const p = props.patterns?.[0] || props.resources?.[0] || props.metadata?.path || props.metadata?.file || props.metadata?.command || '';
+      log(`[EVENT]   p="${p?.slice(0,100)||'(empty)'}"`);
       if (rid) {
-        pendingPermissions.set(rid, { sessionID: sid, permission: t, patterns: p, ts: Date.now() });
-        setTimeout(() => pendingPermissions.delete(rid), 300_000);
+        if (pendingPermissions.has(rid)) {
+          log(`[EVENT] permission.asked: duplicate rid, suppressing notification`);
+          return null;
+        }
+        log(`[EVENT] permission.asked: storing rid in pendingPermissions`);
+        pendingPermissions.set(rid, { sessionID: sesId, permission: t, patterns: p, ts: Date.now() });
+        setTimeout(() => {
+          log(`[TIMER] auto-clean rid=${rid.slice(0,16)}...`);
+          pendingPermissions.delete(rid);
+        }, 300_000);
+        // Same-session dedup: only suppress if this has NO path and session already has pending
+        // (approving one typically auto-approves related requests, but path info is critical)
+        if (!p) {
+          let sessionHasPending = false;
+          for (const [existingRid, info] of pendingPermissions) {
+            if (existingRid !== rid && info.sessionID === sesId) { sessionHasPending = true; break; }
+          }
+          if (sessionHasPending) {
+            log(`[EVENT] permission.asked: session ${sesId?.slice(0,12)} already has pending, no path to show, suppressing`);
+            return null;
+          }
+        }
       }
-      return `🔑 需要权限: ${t}\n${p.slice(0, 80)}\n请使用 Web UI (localhost:4096) 审批`;
+      const sessionPerms = [...pendingPermissions.values()].filter(info => info.sessionID === sesId);
+      return `📋 #${sessionPerms.length} ${p || t}`;
+    }
+    case 'permission.replied': {
+      const rid = props.requestID;
+      log(`[EVENT] permission.replied rid=${(rid||'?').slice(0,16)}`);
+      if (rid && pendingPermissions.has(rid)) {
+        pendingPermissions.delete(rid);
+        log(`[EVENT] permission.replied: removed rid from pendingPermissions`);
+      }
+      return null;
     }
     case 'session.idle': {
       return idleNotification(props);
@@ -796,8 +1054,9 @@ async function connectSSE() {
 
   while (true) {
     try {
-      log('[SSE] Connecting...');
+      log(`[SSE] Connecting... (retryDelay=${retryDelay}ms)`);
       const eventUrl = `${SERVER}/global/event?directory=${encodeURIComponent(getWorkspaceDir())}`;
+      log(`[SSE] URL: ${eventUrl}`);
       const abortControl = new AbortController();
       const connTimer = setTimeout(() => abortControl.abort(), 15000);
       const response = await fetch(eventUrl, {
@@ -808,7 +1067,7 @@ async function connectSSE() {
       if (!response.ok) throw new Error(`SSE ${response.status}`);
       if (!response.body) throw new Error('SSE body is null');
       retryDelay = 1000;
-      log('[SSE] Connected');
+      log('[SSE] Connected successfully');
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -828,18 +1087,42 @@ async function connectSSE() {
           const trimmed = line.trim();
           if (trimmed === '') {
             if (currentData) {
+              const rawBrief = currentData.slice(0, 120);
+              log(`[SSE] raw data: ${rawBrief}`);
               try {
                 const parsed = JSON.parse(currentData);
                 const payload = parsed.payload || parsed;
                 const eventType = payload.type || currentEvent;
+                const eventId = payload.id;
                 const props = payload.properties || {};
+
+                // Event-level dedup: skip if same event ID seen within 10s
+                if (eventId && recentEventIds.has(eventId)) {
+                  log(`[SSE] EVENT DEDUP skip: id=${eventId.slice(0,24)}`);
+                  currentEvent = '';
+                  currentData = '';
+                  continue;
+                }
+                if (eventId) {
+                  recentEventIds.add(eventId);
+                  setTimeout(() => recentEventIds.delete(eventId), 10000);
+                }
+
                 if (props.id) props.requestID ??= props.id;
                 if (payload.id && !props.requestID) props.requestID ??= payload.id;
-                log(`[SSE] event=${eventType} sessionID=${props.sessionID || '?'}`);
+                log(`[SSE] parsed: event=${eventType} sessionID=${props.sessionID || '?'} id=${props.id || payload.id || '-'}`);
+                if (eventType.startsWith('permission') || eventType.startsWith('question') || eventType === 'session.idle' || eventType === 'session.error' || eventType === 'session.status') {
+                  log(`[SSE] ** ${eventType} props keys=[${Object.keys(props).join(',')}]`);
+                }
+                if (eventType === 'permission.asked' || eventType === 'permission.replied') {
+                  log(`[SSE]    requestID=${props.requestID || '?'} permission=${props.permission || props.action || '?'}`);
+                }
                 const text = await eventToNotification(eventType, props);
                 if (text) {
-                  log(`[SSE] notification generated: ${text.slice(0, 80)}`);
+                  log(`[SSE] notification generated: ${text.slice(0, 80).replace(/\n/g,'\\n')}`);
                   broadcastNotification(text);
+                } else {
+                  log(`[SSE] eventToNotification returned null (suppressed)`);
                 }
               } catch (e) {
                 log(`[SSE] Parse error: ${e.message}`);
@@ -864,11 +1147,13 @@ async function connectSSE() {
   }
 }
 
-// ── Watchdog: detect stuck sessions ──
+// ── Watchdog: detect stuck sessions & clean stale subscribers ──
 
 function startWatchdog() {
   const STUCK_WARN_MS = 5 * 60 * 1000;
   const STUCK_ALERT_MS = 10 * 60 * 1000;
+  let lastCleanupCheck = 0;
+  const CLEANUP_INTERVAL = 30 * 60 * 1000;
 
   setInterval(() => {
     try {
@@ -902,6 +1187,36 @@ function startWatchdog() {
           idleNotified.delete(id);
         }
       }
+
+      // Periodic subscriber cleanup (run every 30 min)
+      if (now - lastCleanupCheck > CLEANUP_INTERVAL) {
+        lastCleanupCheck = now;
+        const inactiveCutoff = now - settings.cleanupDays * 24 * 60 * 60 * 1000;
+        const before = subscribers.length;
+        subscribers = subscribers.filter(s => {
+          if ((s.lastActive || 0) < inactiveCutoff) {
+            log(`[CLEANUP] removing inactive subscriber ${s.sid.slice(0, 16)} (lastActive: ${new Date(s.lastActive).toISOString()})`);
+            return false;
+          }
+          return true;
+        });
+        if (subscribers.length < before) {
+          saveSubscribers();
+          log(`[CLEANUP] removed ${before - subscribers.length} inactive subscriber(s), remaining: ${subscribers.length}`);
+        }
+        // Clean per-user dedup cache for removed subscribers
+        const activeSids = new Set(subscribers.map(s => s.sid));
+        for (const [sid] of perUserRecent) {
+          if (!activeSids.has(sid)) perUserRecent.delete(sid);
+        }
+        // Also clean old entries in all remaining per-user maps
+        const dedupCutoff = now - PER_USER_DEDUP_WINDOW * 2;
+        for (const [, userMap] of perUserRecent) {
+          for (const [txt, ts] of userMap) {
+            if (ts < dedupCutoff) userMap.delete(txt);
+          }
+        }
+      }
     } catch (e) {
       log(`[WATCHDOG] error: ${e.message}`);
     }
@@ -911,6 +1226,7 @@ function startWatchdog() {
 // ── Startup ──
 
 loadSubscribers();
+loadSettings();
 connectSSE();
 startWatchdog();
 log('Bot started');
