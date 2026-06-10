@@ -752,8 +752,9 @@ async function apiFetch(path, opts = {}) {
     try { errText = await res.text(); } catch { errText = res.statusText; }
     throw new Error(`${res.status}: ${errText.slice(0, 200)}`);
   }
-  if (opts.method === 'DELETE') return {};
-  return res.json();
+  if (opts.method === 'DELETE' || res.status === 204) return {};
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return {}; }
 }
 
 /* ═══════════════════════════════════════
@@ -899,6 +900,7 @@ async function eventToNotification(type, props) {
       const rid = props.requestID || props.id;
       const sesId = props.sessionID;
       if (rid) {
+        if (pendingPermissions.has(rid)) return null;
         pendingPermissions.set(rid, { sessionID: sesId, permission: t, patterns: p, ts: Date.now() });
         setTimeout(() => pendingPermissions.delete(rid), 300_000);
       }
