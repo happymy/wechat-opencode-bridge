@@ -182,6 +182,10 @@ async function handleCommand(sid, text, msgId) {
       return skipQuestion(sid, arg, msgId);
     case '/qlist': case '/ql': case '/questions':
       return listQuestions(sid, msgId);
+    case '/qshow': case '/qc': case '/qcurrent':
+      return listCurrentQuestion(sid, msgId);
+    case '/qs': case '/qsel': case '/qselect':
+      return selectQuestion(sid, arg, msgId);
     case '/autoclean': case '/ac':
       return handleAutoClean(sid, arg, msgId);
     case '/testnotify':
@@ -526,6 +530,8 @@ function showHelp(sid, msgId) {
     '/answer (/ans) <内容|编号> 回答AI提问或选择选项',
     '/skip (/pass, /ps) [编号]  跳过指定问题（默认当前）',
     '/qlist (/ql, /questions)   查看所有待回答问题',
+    '/qshow (/qc, /qcurrent)    显示当前问题的完整内容',
+    '/qselect (/qs, /qsel) <编号>  选中指定问题为当前活跃',
     '',
     '── 权限审批 ──',
     '/allow (/a) [编号|ID]    批准权限请求',
@@ -606,6 +612,86 @@ async function listQuestions(sid, msgId) {
   lines.push('/skip [编号]      跳过指定问题');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function listCurrentQuestion(sid, msgId) {
+  if (!pendingQuestions) {
+    const queued = pendingQuestionQueue.length;
+    if (queued > 0) {
+      reply(sid, `📌 当前无活跃问题，排队中 ${queued} 题，/qlist 查看`);
+    } else {
+      reply(sid, '📋 当前没有待回答问题');
+    }
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const qData = pendingQuestions;
+  const questions = qData.questions || [];
+  const qi = questions[0];
+  if (!qi) { reply(sid, '💬 问题无详情'); sendResponse(msgId, { stopReason: 'end_turn' }); return; }
+  await fetchSessionName(qData.sessionID);
+  const sesLabel = qData.sessionID ? `[${getSessionName(qData.sessionID)}] ` : '';
+  const multi = questions.length > 1;
+  let msg = multi ? `💬 待回答（共${questions.length}题）` : `💬 需要你回答`;
+  if (sesLabel) msg = sesLabel + msg;
+  if (multi) {
+    questions.forEach((qItem, idx) => {
+      const qText = qItem.question || '';
+      msg += `\n\n${idx+1}. ${qText}`;
+      if (qItem.options?.length) {
+        msg += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
+      }
+    });
+    msg += '\n\n多个答案用逗号分隔，如：1, 2';
+  } else {
+    const q = qi.question || '';
+    const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
+    msg += `\n${q}`;
+    if (opts) msg += `\n${opts}`;
+    if (qi.isSecret) msg += '\n🔒 答案将保密发送';
+    msg += '\n回复内容，或 /ans <内容> 提交';
+    if (opts) msg += '，或发送编号选择';
+  }
+  msg += '\n/skip 跳过，/qlist 查看全部待答';
+  reply(sid, msg);
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function selectQuestion(sid, arg, msgId) {
+  const all = getAllQuestions();
+  if (all.length === 0) {
+    reply(sid, '📋 当前没有待回答问题');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const idx = parseInt(arg?.trim(), 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= all.length) {
+    reply(sid, `⚠️ 编号无效 (1-${all.length})`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  // Already current
+  if (idx === 0 && pendingQuestions) {
+    return listCurrentQuestion(sid, msgId);
+  }
+  const target = pendingQuestionQueue.splice(idx - (pendingQuestions ? 1 : 0), 1)[0];
+  if (!target) {
+    reply(sid, '⚠️ 该问题不存在');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  // Push current back to queue head
+  if (pendingQuestions) {
+    pendingQuestionQueue.unshift(pendingQuestions);
+  }
+  pendingQuestions = target;
+  // Reset auto-clear
+  const ts = Date.now();
+  target.askTimestamp = ts;
+  setTimeout(() => {
+    if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
+  }, 300_000).unref?.();
+  return listCurrentQuestion(sid, msgId);
 }
 
 async function answerQuestion(sid, answer, msgId) {
