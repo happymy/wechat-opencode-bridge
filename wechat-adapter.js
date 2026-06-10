@@ -34,6 +34,7 @@ let streamLastFlush = '';     // last flushed text (for dedup)
 let lastPromptSid = null;     // last wechat user who sent a prompt
 let lastPromptSessionId = null; // last session prompted
 let lastPromptText = '';      // last prompt text (for mirror suppression)
+let streamFinalized = false;  // true after finalizeStream runs (prevents double-finalize race)
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
 
@@ -102,8 +103,8 @@ async function handlePrompt(msg) {
 
     await drainPendingNotifications();
 
-    // If AI is waiting for an answer, route non-command text as answer
-    if (pendingQuestions && !text.startsWith('/')) {
+    // If AI is waiting for an answer and session matches, route non-command text as answer
+    if (pendingQuestions && !text.startsWith('/') && pendingQuestions.sessionID === currentSessionId) {
       log(`[PROMPT] pending question, routing as answer`);
       await answerQuestion(sid, text, msg.id);
       return;
@@ -125,8 +126,8 @@ async function handlePrompt(msg) {
     // Record prompt source for streaming output routing
     lastPromptSid = sid;
     lastPromptSessionId = targetId;
-    lastPromptText = text;
     startStreaming(sid, targetId);
+    lastPromptText = text;
     armWorkingNotice(sid);
 
     reply(sid, '⏳ 思考中...');
@@ -470,6 +471,7 @@ async function handleWorkspace(sid, arg, msgId) {
   disarmWorkingNotice();
   currentWorkspace = list[num - 1];
   saveCurrentWorkspace();
+  restartSSE();
   reply(sid, `✅ 已切换到工作区「${currentWorkspace.name}」\n${currentWorkspace.path}\n使用 /new <会话名> 在该工作区创建会话`);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -565,6 +567,12 @@ async function answerQuestion(sid, answer, msgId) {
     pendingQuestions = null;
     return;
   }
+  if (qData.sessionID !== targetId) {
+    reply(sid, '⚠️ 当前会话已切换，无法回答之前的问题');
+    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+    pendingQuestions = null;
+    return;
+  }
 
   let answerText = answer.trim();
   const qi = qData.questions?.[0];
@@ -588,6 +596,7 @@ async function answerQuestion(sid, answer, msgId) {
   log(`[ANSWER] sid=${sid.slice(0,12)} text="${answerText.slice(0,60)}"`);
   // Start streaming for the AI's response to the answer
   startStreaming(sid, targetId);
+  lastPromptText = answerText;
   armWorkingNotice(sid);
   reply(sid, `⏳ 已提交回答`);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
@@ -604,6 +613,7 @@ function startStreaming(sid, sessionId) {
   streamSid = sid;
   streamSessionId = sessionId;
   streamLastFlush = '';
+  streamFinalized = false;
   log(`[STREAM] started sid=${sid.slice(0,12)} session=${sessionId.slice(0,12)}`);
   streamTimer = setInterval(() => flushStream(), STREAM_FLUSH_MS);
   streamTimer.unref?.();
@@ -644,8 +654,9 @@ function flushStream() {
 }
 
 function finalizeStream() {
-  if (!streamSid) return;
+  if (!streamSid || streamFinalized) return;
   flushStream();
+  streamFinalized = true;
   log(`[STREAM] finalized for ${streamSid.slice(0,12)}`);
   disarmWorkingNotice();
   stopStreaming();
@@ -714,11 +725,14 @@ async function forwardToAIAsync(sid, targetId, text) {
 
     const data = await res.json();
     await drainPendingNotifications();
-    // If streaming output was already sent, skip the final reply to avoid duplicates
-    if (streamSid === sid && streamLastFlush) {
+    // If streaming output was already finalized/progressed, skip final reply to avoid duplicates
+    if (streamFinalized) {
+      log(`[FWD] streaming already finalized for ${sid.slice(0,12)}, skipping final reply`);
+    } else if (streamSid === sid && streamLastFlush) {
       log(`[FWD] streaming already sent output for ${sid.slice(0,12)}, skipping final reply`);
       finalizeStream();
     } else {
+      streamFinalized = true;
       const formatted = formatReply(data);
       if (formatted) {
         reply(sid, formatted);
@@ -986,6 +1000,7 @@ let recentNotifications = new Map(); // text → timestamp, dedup within 60s
 let perUserRecent = new Map(); // sid → { text → timestamp }
 let proactiveTimer = null;
 let recentEventIds = new Set(); // event ID → timestamp, dedup within 10s
+let sseReader = null;          // current SSE reader (for restart on workspace change)
 
 const DEDUP_WINDOW = 60000;
 const PER_USER_DEDUP_WINDOW = 60000;
@@ -1013,11 +1028,11 @@ function broadcastNotification(text) {
 
   const targets = subscribers.filter(s => !s.muted);
   if (targets.length === 0) { log(`[BROADCAST] no active subscribers`); return; }
-  // Pick the most recently active subscriber; prefer current session if exists
+  // Pick the most recently active subscriber; prefer last prompt source if exists
   targets.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
   let best = targets[0];
-  if (currentSessionId) {
-    const cur = targets.find(t => t.sid === currentSessionId);
+  if (lastPromptSid) {
+    const cur = targets.find(t => t.sid === lastPromptSid);
     if (cur) best = cur;
   }
   log(`[BROADCAST] pushing to best subscriber: sid=${best.sid.slice(0,12)} (lastActive=${best.lastActive ? new Date(best.lastActive).toISOString() : 'never'})`);
@@ -1143,7 +1158,7 @@ async function handleSseSideEffect(type, props) {
       const oldId = currentSessionId;
       currentSessionId = sid;
       saveSession(sid);
-      fetchSessionName(sid);
+      await fetchSessionName(sid);
       if (oldId) {
         broadcastNotification(`🔄 已跟随到会话「${getSessionName(sid)}」`);
       }
@@ -1158,7 +1173,7 @@ async function handleSseSideEffect(type, props) {
       if (dir && normalizeDir(dir) === normalizeDir(getWorkspaceDir())) {
         currentSessionId = sid;
         saveSession(sid);
-        fetchSessionName(sid);
+        await fetchSessionName(sid);
         broadcastNotification(`🆕 新会话已创建，已自动跟随`);
       }
       return;
@@ -1257,6 +1272,7 @@ async function eventToNotification(type, props) {
       const st = props.status;
       if (!st) return null;
       if (st.type === 'idle') {
+        updateSessionState(props.sessionID, { retryCount: 0 });
         return idleNotification(props);
       }
       if (st.type === 'retry') {
@@ -1267,7 +1283,7 @@ async function eventToNotification(type, props) {
       }
       if (st.type === 'busy') {
         idleNotified.delete(props.sessionID);
-        updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now() });
+        updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now(), retryCount: 0 });
         return null;
       }
       return null;
@@ -1296,6 +1312,14 @@ async function fetchSessionName(id) {
   } catch {}
 }
 
+function restartSSE() {
+  log('[SSE] Restart requested');
+  if (sseReader) {
+    try { sseReader.cancel(); } catch (e) { log(`[SSE] cancel error: ${e.message}`); }
+    sseReader = null;
+  }
+}
+
 // ── SSE connection ──
 
 async function connectSSE() {
@@ -1316,10 +1340,12 @@ async function connectSSE() {
       clearTimeout(connTimer);
       if (!response.ok) throw new Error(`SSE ${response.status}`);
       if (!response.body) throw new Error('SSE body is null');
+      sseReader = null;
       retryDelay = 1000;
       log('[SSE] Connected successfully');
 
       const reader = response.body.getReader();
+      sseReader = reader;
       const decoder = new TextDecoder();
       let buf = '';
       let currentEvent = '';
@@ -1368,7 +1394,7 @@ async function connectSSE() {
                   log(`[SSE]    requestID=${props.requestID || '?'} permission=${props.permission || props.action || '?'}`);
                 }
                 // Handle session tracking side-effects before notification
-                handleSseSideEffect(eventType, props).catch(e => log(`[SSE] side-effect error: ${e.message}`));
+                await handleSseSideEffect(eventType, props).catch(e => log(`[SSE] side-effect error: ${e.message}`));
 
                 const text = await eventToNotification(eventType, props);
                 if (text) {
@@ -1386,13 +1412,15 @@ async function connectSSE() {
           } else if (trimmed.startsWith('event:')) {
             currentEvent = trimmed.slice(6).trim();
           } else if (trimmed.startsWith('data:')) {
-            currentData += trimmed.slice(5).trim();
+            currentData += trimmed.slice(5).trim() + '\n';
           }
         }
       }
       log('[SSE] Stream ended, reconnecting...');
     } catch (err) {
       log(`[SSE] Error: ${err.message}, retry in ${retryDelay}ms`);
+    } finally {
+      sseReader = null;
     }
 
     await new Promise(r => setTimeout(r, retryDelay));
