@@ -22,7 +22,20 @@ let subscribers = [];
 let sessionStates = new Map();
 let pendingNotifications = [];
 let pendingPermissions = new Map();
+let pendingQuestions = null; // { sessionID, questions: [...], askTimestamp }
 let draining = false;
+
+// Streaming output state
+let streamBuf = '';           // accumulated stream text
+let streamSid = null;         // wechat subscriber sid to send streamed output to
+let streamSessionId = null;   // session being streamed
+let streamTimer = null;       // periodic flush timer
+let streamLastFlush = '';     // last flushed text (for dedup)
+let lastPromptSid = null;     // last wechat user who sent a prompt
+let lastPromptSessionId = null; // last session prompted
+let lastPromptText = '';      // last prompt text (for mirror suppression)
+let workingTimer = null;      // "still working" notice timer
+const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
 
 /* ───────── Logging ───────── */
 
@@ -89,6 +102,13 @@ async function handlePrompt(msg) {
 
     await drainPendingNotifications();
 
+    // If AI is waiting for an answer, route non-command text as answer
+    if (pendingQuestions && !text.startsWith('/')) {
+      log(`[PROMPT] pending question, routing as answer`);
+      await answerQuestion(sid, text, msg.id);
+      return;
+    }
+
     if (text.startsWith('/')) {
       log(`[PROMPT] routing to handleCommand`);
       await handleCommand(sid, text, msg.id);
@@ -101,6 +121,13 @@ async function handlePrompt(msg) {
       sendResponse(msg.id, { stopReason: 'end_turn' });
       return;
     }
+
+    // Record prompt source for streaming output routing
+    lastPromptSid = sid;
+    lastPromptSessionId = targetId;
+    lastPromptText = text;
+    startStreaming(sid, targetId);
+    armWorkingNotice(sid);
 
     reply(sid, '⏳ 思考中...');
     sendResponse(msg.id, { stopReason: 'end_turn' });
@@ -146,6 +173,8 @@ async function handleCommand(sid, text, msgId) {
       return handlePermissionReply(sid, 'reject', arg, msgId);
     case '/trust': case '/t':
       return handlePermissionReply(sid, 'always', arg, msgId);
+    case '/answer': case '/ans':
+      return answerQuestion(sid, arg, msgId);
     case '/autoclean': case '/ac':
       return handleAutoClean(sid, arg, msgId);
     case '/testnotify':
@@ -473,6 +502,9 @@ function showHelp(sid, msgId) {
     '/plan (/pl)              切换到 plan 模式',
     '/build (/bu)             切换到 build 模式',
     '',
+    '── 问题回答 ──',
+    '/answer (/ans) <内容|编号> 回答AI提问或选择选项',
+    '',
     '── 权限审批 ──',
     '/allow (/a) [编号|ID]    批准权限请求',
     '/deny (/d) [编号|ID]     拒绝权限请求',
@@ -509,6 +541,134 @@ async function testNotify(sid, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+/* ───────── Question/Answer Handling ───────── */
+
+async function answerQuestion(sid, answer, msgId) {
+  if (!pendingQuestions) {
+    reply(sid, '⚠️ 当前没有待回答的问题');
+    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  const qData = pendingQuestions;
+  const targetId = currentSessionId;
+  if (!targetId) {
+    reply(sid, '⚠️ 没有选中的会话，无法提交答案');
+    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+    pendingQuestions = null;
+    return;
+  }
+
+  let answerText = answer;
+  const qi = qData.questions?.[0];
+
+  // Numeric option selection
+  if (qi?.options?.length > 0 && /^\d+$/.test(answer)) {
+    const idx = parseInt(answer, 10) - 1;
+    if (idx >= 0 && idx < qi.options.length) {
+      answerText = qi.options[idx].label;
+      log(`[ANSWER] selected option ${answer} -> "${answerText}"`);
+    }
+  }
+
+  pendingQuestions = null;
+  log(`[ANSWER] sid=${sid.slice(0,12)} text="${answerText.slice(0,60)}"`);
+  reply(sid, `⏳ 已提交回答`);
+  if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+  forwardToAIAsync(sid, targetId, answerText).catch(e => log(`[ERR] answer: ${e.message}`));
+}
+
+/* ───────── Streaming Output ───────── */
+
+const STREAM_FLUSH_MS = 2000;
+
+function startStreaming(sid, sessionId) {
+  stopStreaming();
+  streamBuf = '';
+  streamSid = sid;
+  streamSessionId = sessionId;
+  streamLastFlush = '';
+  log(`[STREAM] started sid=${sid.slice(0,12)} session=${sessionId.slice(0,12)}`);
+  streamTimer = setInterval(() => flushStream(), STREAM_FLUSH_MS);
+  streamTimer.unref?.();
+}
+
+function pushStream(chunk) {
+  if (!streamSid || !chunk) return;
+  // Mirror suppression: skip text that matches the user's own prompt
+  if (lastPromptText && streamBuf.length < lastPromptText.length) {
+    const candidate = streamBuf + chunk;
+    if (lastPromptText.startsWith(candidate) || candidate.startsWith(lastPromptText)) {
+      streamBuf = candidate;
+      return;
+    }
+  }
+  streamBuf += chunk;
+}
+
+function flushStream() {
+  if (!streamSid || !streamBuf) return;
+  const newText = streamBuf.slice(streamLastFlush.length);
+  if (!newText) return;
+  // Only flush if we have meaningful new content
+  const trimmed = newText.trim();
+  if (!trimmed || trimmed.length < 3) return;
+  streamLastFlush = streamBuf;
+  log(`[STREAM] flush ${trimmed.length} chars to ${streamSid.slice(0,12)}`);
+  try {
+    reply(streamSid, trimmed);
+    flushToWeChat();
+  } catch (e) {
+    log(`[STREAM] flush error: ${e.message}`);
+  }
+}
+
+function finalizeStream() {
+  if (!streamSid) return;
+  flushStream();
+  log(`[STREAM] finalized for ${streamSid.slice(0,12)}`);
+  disarmWorkingNotice();
+  stopStreaming();
+}
+
+/* ─── Working Notice ─── */
+
+function armWorkingNotice(sid) {
+  disarmWorkingNotice();
+  workingTimer = setTimeout(() => {
+    workingTimer = null;
+    if (!streamSid) return;
+    log(`[WORKING] sending working notice to ${sid.slice(0,12)}`);
+    try {
+      reply(sid, `⏳ 仍在处理中...\n「${lastPromptText.slice(0, 60)}」`);
+      flushToWeChat();
+    } catch (e) {
+      log(`[WORKING] error: ${e.message}`);
+    }
+  }, WORKING_NOTICE_DELAY);
+  workingTimer.unref?.();
+}
+
+function disarmWorkingNotice() {
+  if (workingTimer) {
+    clearTimeout(workingTimer);
+    workingTimer = null;
+  }
+}
+
+function stopStreaming() {
+  disarmWorkingNotice();
+  if (streamTimer) {
+    clearInterval(streamTimer);
+    streamTimer = null;
+  }
+  streamBuf = '';
+  streamSid = null;
+  streamSessionId = null;
+  streamLastFlush = '';
+  lastPromptText = '';
+}
+
 /* ───────── AI Prompt Forwarding ───────── */
 
 async function forwardToAIAsync(sid, targetId, text) {
@@ -533,10 +693,16 @@ async function forwardToAIAsync(sid, targetId, text) {
 
     const data = await res.json();
     await drainPendingNotifications();
-    const formatted = formatReply(data);
-    if (formatted) {
-      reply(sid, formatted);
-      flushToWeChat();
+    // If streaming output was already sent, skip the final reply to avoid duplicates
+    if (streamSid === sid && streamLastFlush) {
+      log(`[FWD] streaming already sent output for ${sid.slice(0,12)}, skipping final reply`);
+      finalizeStream();
+    } else {
+      const formatted = formatReply(data);
+      if (formatted) {
+        reply(sid, formatted);
+        flushToWeChat();
+      }
     }
   } catch (err) {
     const isCancel = err.name === 'AbortError';
@@ -945,6 +1111,43 @@ async function idleNotification(props) {
   return `✅ ${name} · 完成`;
 }
 
+// Handle side-effects for SSE events (session tracking, etc.)
+async function handleSseSideEffect(type, props) {
+  switch (type) {
+    case 'tui.session.select': {
+      const sid = props.sessionID || props.id;
+      if (!sid || sid === currentSessionId) return;
+      log(`[SSE] tui.session.select: local switched to ${sid.slice(0,12)}`);
+      const oldId = currentSessionId;
+      currentSessionId = sid;
+      saveSession(sid);
+      fetchSessionName(sid);
+      if (oldId) {
+        broadcastNotification(`🔄 已跟随到会话「${getSessionName(sid)}」`);
+      }
+      return;
+    }
+    case 'session.created': {
+      const sid = props.sessionID || props.id;
+      if (!sid) return;
+      log(`[SSE] session.created: ${sid.slice(0,12)}`);
+      // Optionally auto-follow new sessions (if they match current directory)
+      const dir = props.directory;
+      if (dir && normalizeDir(dir) === normalizeDir(getWorkspaceDir())) {
+        currentSessionId = sid;
+        saveSession(sid);
+        fetchSessionName(sid);
+        broadcastNotification(`🆕 新会话已创建，已自动跟随`);
+      }
+      return;
+    }
+  }
+}
+
+function normalizeDir(p) {
+  return p.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+}
+
 // Map events to short, readable notifications. Return null to skip.
 async function eventToNotification(type, props) {
   switch (type) {
@@ -955,12 +1158,18 @@ async function eventToNotification(type, props) {
       return `❌ ${err.name}\n${brief.slice(0, 100)}`;
     }
     case 'question.asked': {
-      const qi = props.questions?.[0];
-      const q = qi?.question || '';
-      const opts = qi?.options?.slice(0, 4).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
+      const questions = props.questions || [];
+      pendingQuestions = { sessionID: props.sessionID, questions, askTimestamp: Date.now() };
+      log(`[EVENT] question.asked: stored ${questions.length} questions`);
+      const qi = questions[0];
+      if (!qi) return '💬 AI 提出了一个问题（无详情）';
+      const q = qi.question || '';
+      const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
       let msg = `💬 需要你回答\n${q}`;
       if (opts) msg += `\n${opts}`;
-      msg += `\n请直接回复你的答案`;
+      if (qi.isSecret) msg += '\n🔒 答案将保密发送';
+      msg += '\n直接回复内容，或 /ans <内容> 提交';
+      if (opts) msg += '，或发送编号选择';
       return msg;
     }
     case 'permission.asked': {
@@ -1008,6 +1217,9 @@ async function eventToNotification(type, props) {
       return null;
     }
     case 'session.idle': {
+      if (props.sessionID && props.sessionID === streamSessionId) {
+        finalizeStream();
+      }
       return idleNotification(props);
     }
     case 'session.status': {
@@ -1030,9 +1242,16 @@ async function eventToNotification(type, props) {
       return null;
     }
     case 'message.part.delta':
-    case 'message.part.updated':
-      if (props.sessionID) updateSessionState(props.sessionID, { lastActivity: Date.now() });
+    case 'message.part.updated': {
+      const psid = props.sessionID;
+      if (psid) updateSessionState(psid, { lastActivity: Date.now() });
+      // Route streaming text to the active wechat prompt source
+      if (psid && psid === streamSessionId) {
+        const delta = props.delta || props.part?.text || '';
+        if (delta) pushStream(delta);
+      }
       return null;
+    }
     default:
       return null;
   }
@@ -1117,6 +1336,9 @@ async function connectSSE() {
                 if (eventType === 'permission.asked' || eventType === 'permission.replied') {
                   log(`[SSE]    requestID=${props.requestID || '?'} permission=${props.permission || props.action || '?'}`);
                 }
+                // Handle session tracking side-effects before notification
+                handleSseSideEffect(eventType, props).catch(e => log(`[SSE] side-effect error: ${e.message}`));
+
                 const text = await eventToNotification(eventType, props);
                 if (text) {
                   log(`[SSE] notification generated: ${text.slice(0, 80).replace(/\n/g,'\\n')}`);
