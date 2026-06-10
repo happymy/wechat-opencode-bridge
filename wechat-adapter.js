@@ -959,10 +959,12 @@ async function eventToNotification(type, props) {
     }
     case 'permission.asked': {
       const t = props.permission || props.action || '操作';
-      const p = props.patterns?.[0] || props.resources?.[0] || props.metadata?.path || props.metadata?.file || props.metadata?.command || '';
       const rid = props.requestID || props.id;
       const sesId = props.sessionID;
       log(`[EVENT] permission.asked rid=${(rid||'?').slice(0,16)} perm=${t} sesId=${(sesId||'?').slice(0,12)}`);
+      log(`[EVENT]   props keys=[${Object.keys(props).join(',')}] patterns=${JSON.stringify(props.patterns)} resources=${JSON.stringify(props.resources)} metadata=${JSON.stringify(props.metadata)}`);
+      const p = props.patterns?.[0] || props.resources?.[0] || props.metadata?.path || props.metadata?.file || props.metadata?.command || '';
+      log(`[EVENT]   p="${p?.slice(0,100)||'(empty)'}"`);
       if (rid) {
         if (pendingPermissions.has(rid)) {
           log(`[EVENT] permission.asked: duplicate rid, suppressing notification`);
