@@ -316,14 +316,13 @@ async function listPermissions(sid, msgId) {
     return;
   }
   const entries = [...pendingPermissions.entries()];
-  const lines = [`📋 待审批权限 (${entries.length}个)`, '─'.repeat(20)];
+  const lines = [`📋 待审批权限 (${entries.length}个)`];
   entries.forEach(([rid, info], i) => {
     const ago = Math.round((Date.now() - info.ts) / 1000);
-    lines.push(`${i + 1}. ${info.permission}`);
-    if (info.patterns) lines.push(`   路径: ${info.patterns.slice(0, 60)}`);
-    lines.push(`   请求ID: ${rid.slice(0, 16)}... | ${ago}秒前`);
+    const pathInfo = info.patterns ? ` | ${info.patterns.slice(0, 60)}` : '';
+    lines.push(`#${i + 1} ${info.permission}${pathInfo} | ${rid.slice(0, 16)}... | ${ago}秒前`);
   });
-  lines.push('─'.repeat(20));
+  lines.push('');
   lines.push('/allow (/a) <编号|requestID>  批准');
   lines.push('/deny (/d) <编号|requestID>   拒绝');
   lines.push('/trust (/t) <编号|requestID>  信任（不再询问）');
@@ -989,8 +988,7 @@ async function eventToNotification(type, props) {
           }
         }
       }
-      let permMsg = `🔑 需要权限: ${t}`;
-      if (p) permMsg += `\n📁 ${p.slice(0, 80)}`;
+      let permMsg = `📋 ${p || t}`;
       permMsg += `\n/allow (/a) 批准  /deny (/d) 拒绝  /trust (/t) 信任`;
       return permMsg;
     }
