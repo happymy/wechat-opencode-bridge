@@ -607,11 +607,11 @@ async function listQuestions(sid, msgId) {
     }
   });
   lines.push('─'.repeat(20));
-  lines.push('/ans <内容|编号>  回答（默认当前第1题）');
-  lines.push('/ans <编号> <内容>  回答指定编号问题');
-  lines.push('/qshow              查看当前问题详情');
-  lines.push('/qselect <编号>     选中指定问题为当前活跃');
-  lines.push('/skip [编号]        跳过指定问题');
+  lines.push('/ans (/answer) <内容|编号>  回答（默认当前第1题）');
+  lines.push('/ans (/answer) <编号> <内容>  回答指定编号问题');
+  lines.push('/qshow (/qc, /qcurrent)      查看当前问题详情');
+  lines.push('/qselect (/qs, /qsel) <编号>  选中指定问题为当前活跃');
+  lines.push('/skip (/pass, /ps) [编号]     跳过指定问题');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -620,7 +620,7 @@ async function listCurrentQuestion(sid, msgId) {
   if (!pendingQuestions) {
     const queued = pendingQuestionQueue.length;
     if (queued > 0) {
-      reply(sid, `📌 当前无活跃问题，排队中 ${queued} 题，/qlist 查看`);
+      reply(sid, `📌 当前无活跃问题，排队中 ${queued} 题，/qlist (/ql, /questions) 查看，/qselect (/qs, /qsel) <编号> 切换`);
     } else {
       reply(sid, '📋 当前没有待回答问题');
     }
@@ -645,16 +645,17 @@ async function listCurrentQuestion(sid, msgId) {
       }
     });
     msg += '\n\n多个答案用逗号分隔，如：1, 2';
+    msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
   } else {
     const q = qi.question || '';
     const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
     msg += `\n${q}`;
     if (opts) msg += `\n${opts}`;
     if (qi.isSecret) msg += '\n🔒 答案将保密发送';
-    msg += '\n回复内容，或 /ans <内容> 提交';
+    msg += '\n回复内容，或 /ans (/answer) <内容> 提交';
     if (opts) msg += '，或发送编号选择';
+    msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
   }
-  msg += '\n/skip 跳过，/qlist 查看全部，/qselect <编号> 切换问题';
   reply(sid, msg);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -865,16 +866,16 @@ async function dequeueNextQuestion() {
         }
       });
         text += '\n\n多个答案用逗号分隔，如：1, 2';
-        text += '\n/skip 跳过，/qlist 查看全部，/qshow 查看详情，/qselect <编号> 切换';
+        text += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
     } else {
       const q = qi.question || '';
       const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
       text += `\n${q}`;
       if (opts) text += `\n${opts}`;
       if (qi.isSecret) text += '\n🔒 答案将保密发送';
-      text += '\n回复内容，或 /ans <内容> 提交';
+      text += '\n回复内容，或 /ans (/answer) <内容> 提交';
       if (opts) text += '，或发送编号选择';
-      text += '\n/skip 跳过，/qlist 查看全部，/qshow 查看详情，/qselect <编号> 切换';
+      text += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
     }
     broadcastNotification(text);
     return;
@@ -923,7 +924,7 @@ async function skipQuestion(sid, arg, msgId) {
   }
 
   const remaining = getAllQuestions().length;
-  const note = remaining > 0 ? `（还剩${remaining}题，/qlist 查看）` : '';
+  const note = remaining > 0 ? `（还剩${remaining}题，/qlist (/ql, /questions) 查看，/qselect (/qs, /qsel) <编号> 切换）` : '';
   fetchSessionName(qData?.sessionID).catch(() => {});
   const sesLabel = qData?.sessionID ? ` [${getSessionName(qData.sessionID)}]` : '';
   reply(sid, `⏭️ 已跳过${sesLabel}，${note}`);
@@ -1562,16 +1563,16 @@ async function eventToNotification(type, props) {
           }
         });
         msg += '\n\n多个答案用逗号分隔，如：1, 2';
-        msg += '\n/skip 跳过，/qlist 查看全部，/qshow 查看详情，/qselect <编号> 切换';
+        msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
       } else {
         const q = qi.question || '';
         const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
         msg += `\n${q}`;
         if (opts) msg += `\n${opts}`;
         if (qi.isSecret) msg += '\n🔒 答案将保密发送';
-        msg += '\n回复内容，或 /ans <内容> 提交';
+        msg += '\n回复内容，或 /ans (/answer) <内容> 提交';
         if (opts) msg += '，或发送编号选择';
-        msg += '\n/skip 跳过，/qlist 查看全部，/qshow 查看详情，/qselect <编号> 切换';
+        msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
       }
       return msg;
     }
