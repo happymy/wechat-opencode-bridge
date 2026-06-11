@@ -468,19 +468,59 @@ async function handleWorkspace(sid, arg, msgId) {
     const lines = ['📂 工作区', '─'.repeat(16)];
     list.forEach((w, i) => {
       const mark = w.path === currentWorkspace?.path ? ' ◀' : '';
+      const shortPath = w.path.length > 50 ? '...' + w.path.slice(-47) : w.path;
       lines.push(`${i + 1}. ${w.name}${mark}`);
+      lines.push(`   ${shortPath}`);
     });
     lines.push('─'.repeat(16));
     lines.push(`当前: ${currentWorkspace?.name}`);
     lines.push('/workspace <编号> 切换');
+    lines.push('/workspace add <路径> [名称] 添加工作区');
+    lines.push('/workspace del <编号> 删除工作区');
     reply(sid, lines.join('\n'));
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  const addMatch = arg.match(/^add\s+(.+?)(?:\s+(.+))?$/i);
+  if (addMatch) {
+    const dirPath = addMatch[1].trim();
+    let name = addMatch[2]?.trim() || basename(dirPath);
+    const existingPaths = new Set(list.map(w => w.path));
+    if (existingPaths.has(dirPath)) {
+      reply(sid, `⚠️ 工作区已存在: ${name} (${dirPath})`);
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    list.push({ name, path: dirPath });
+    saveWorkspaces(list);
+    reply(sid, `✅ 已添加工作区「${name}」\n${dirPath}`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  const delMatch = arg.match(/^del(?:ete)?\s+(\d+)$/i);
+  if (delMatch) {
+    const idx = parseInt(delMatch[1], 10) - 1;
+    if (idx < 0 || idx >= list.length) {
+      reply(sid, `⚠️ 编号 ${delMatch[1]} 超出范围 (1-${list.length})`);
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    const removed = list.splice(idx, 1)[0];
+    saveWorkspaces(list);
+    if (currentWorkspace?.path === removed.path) {
+      currentWorkspace = list[0] || { name: '主项目', path: WORK_DIR };
+      saveCurrentWorkspace();
+    }
+    reply(sid, `🗑️ 已删除工作区「${removed.name}」`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
 
   const num = parseInt(arg, 10);
   if (isNaN(num) || num < 1 || num > list.length) {
-    reply(sid, `⚠️ 请输入 1-${list.length} 之间的编号`);
+    reply(sid, `⚠️ 请输入 1-${list.length} 之间的编号，或使用 /ws add / /ws del`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
@@ -496,37 +536,64 @@ async function handleWorkspace(sid, arg, msgId) {
 
 async function handleSyncDir(sid, msgId) {
   try {
-    const sessions = await apiFetch('/session');
-    if (!Array.isArray(sessions) || sessions.length === 0) {
-      reply(sid, '⚠️ OpenCode 暂无会话，无法同步工作区');
-      sendResponse(msgId, { stopReason: 'end_turn' });
-      return;
-    }
-    const dirs = [...new Set(sessions.map(s => s.directory).filter(Boolean))];
-    if (dirs.length === 0) {
-      reply(sid, '⚠️ 所有会话均无目录信息，无法同步');
-      sendResponse(msgId, { stopReason: 'end_turn' });
-      return;
-    }
     const existing = loadWorkspaces();
-    const existingNames = new Set(existing.map(w => w.name));
     const existingPaths = new Set(existing.map(w => w.path));
     const added = [];
     const skipped = [];
-    for (const dir of dirs) {
-      const name = basename(dir);
-      if (existingNames.has(name) || existingPaths.has(dir)) {
-        skipped.push({ name, path: dir });
-      } else {
-        existing.push({ name, path: dir });
-        added.push({ name, path: dir });
+
+    // Try project API first
+    const projects = await apiFetch('/project').catch(() => null);
+    if (Array.isArray(projects) && projects.length > 0) {
+      for (const p of projects) {
+        try {
+          const dirs = await apiFetch(`/project/${encodeURIComponent(p.id)}/directories`);
+          if (!Array.isArray(dirs)) continue;
+          for (const d of dirs) {
+            const dirPath = d.directory;
+            if (!dirPath) continue;
+            if (existingPaths.has(dirPath)) {
+              skipped.push({ name: basename(dirPath), path: dirPath });
+              continue;
+            }
+            const name = makeWsName(dirPath, existing);
+            existing.push({ name, path: dirPath });
+            added.push({ name, path: dirPath });
+            existingPaths.add(dirPath);
+          }
+        } catch {
+          log(`[SD] skip project ${p.id?.slice(0, 16)}: directories endpoint failed`);
+        }
       }
+    }
+
+    // Fallback: try session API (older OpenCode versions)
+    if (added.length === 0) {
+      log('[SD] project API yielded no directories, trying session fallback...');
+      const sessions = await apiFetch('/session').catch(() => null);
+      if (Array.isArray(sessions)) {
+        const dirs = [...new Set(sessions.map(s => s.directory).filter(Boolean))];
+        for (const dirPath of dirs) {
+          if (existingPaths.has(dirPath)) {
+            skipped.push({ name: basename(dirPath), path: dirPath });
+            continue;
+          }
+          const name = makeWsName(dirPath, existing);
+          existing.push({ name, path: dirPath });
+          added.push({ name, path: dirPath });
+          existingPaths.add(dirPath);
+        }
+      }
+    }
+
+    if (added.length === 0 && skipped.length === 0) {
+      reply(sid, '⚠️ 未能获取到工作区信息，请先确认 OpenCode 已打开项目');
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
     }
     saveWorkspaces(existing);
     const lines = ['📂 工作区同步完成'];
-    lines.push(`├ 会话数: ${sessions.length}`);
-    lines.push(`├ 目录数: ${dirs.length}`);
-    if (added.length > 0) lines.push(`├ 新增: ${added.map(a => a.name).join('、')}`);
+    lines.push(`├ 新增: ${added.length} 个`);
+    if (added.length > 0) lines.push(`├ ${added.map(a => a.name).join('、')}`);
     if (skipped.length > 0) lines.push(`├ 跳过: ${skipped.map(s => s.name).join('、')}`);
     lines.push(`└ 总计: ${existing.length} 个工作区`);
     reply(sid, lines.join('\n'));
@@ -535,6 +602,15 @@ async function handleSyncDir(sid, msgId) {
   } finally {
     sendResponse(msgId, { stopReason: 'end_turn' });
   }
+}
+
+function makeWsName(dirPath, existing) {
+  let name = basename(dirPath);
+  if (existing.some(w => w.name === name)) {
+    const parts = dirPath.replace(/[\\/]+/g, '/').replace(/\/$/, '').split('/');
+    name = parts.length >= 2 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : name;
+  }
+  return name;
 }
 
 async function showTaskStatus(sid, msgId) {
@@ -586,8 +662,8 @@ function showHelp(sid, msgId) {
     '/plist (/p, /pending)    查看待审批权限列表',
     '',
     '── 工作区与任务 ──',
-    '/workspace (/ws)         查看/切换工作区',
-    '/sd                      从 OpenCode 会话同步工作区列表',
+    '/workspace (/ws)         查看/切换/添加/删除工作区',
+    '/sd                      从 OpenCode 项目同步所有工作区',
     '/status (/st)            查看任务运行状态',
     '/cancel (/c)             取消当前AI执行',
     '',
