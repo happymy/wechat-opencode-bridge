@@ -1302,17 +1302,22 @@ function formatReply(data) {
 
   const blocks = [];
   if (reasoningBuf) {
-    const short = reasoningBuf.length > 150 ? reasoningBuf.slice(0, 150) + '...' : reasoningBuf;
-    blocks.push(`🤔 ${short}`);
+    blocks.push('┅'.repeat(16));
+    blocks.push('🤔 思考过程');
+    blocks.push('┅'.repeat(16));
+    blocks.push(reasoningBuf);
   }
   if (toolCalls.length) {
     const tools = toolCalls.slice(-6).map(t => `${t.status} ${t.name}`).join('\n');
-    blocks.push(`🔧\n${tools}`);
+    blocks.push(`\n🔧\n${tools}`);
   }
   const mainText = textParts.join('\n').trim();
   if (mainText) {
-    if (blocks.length) blocks.push('');
-    blocks.push(mainText.length > 1500 ? mainText.slice(0, 1500) + '\n\n...（输出过长，已截断）' : mainText);
+    if (reasoningBuf) {
+      blocks.push('');
+      blocks.push('━'.repeat(16) + ' 回答 ' + '━'.repeat(16));
+    }
+    blocks.push(mainText);
   }
   return blocks.join('\n');
 }
