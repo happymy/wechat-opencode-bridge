@@ -1,8 +1,9 @@
 import { createInterface } from 'node:readline';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { execSync } from 'node:child_process';
 
 const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
 const AUTH = 'Basic ' + Buffer.from(process.env.OPENCODE_AUTH || 'opencode:opencode').toString('base64');
@@ -37,6 +38,7 @@ let lastPromptText = '';      // last prompt text (for mirror suppression)
 let streamFinalized = false;  // true after finalizeStream runs (prevents double-finalize race)
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
+const QUESTION_AUTO_CLEAR_MS = 300000; // 5min before unanswered question auto-expires
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 
 /* ───────── Logging ───────── */
@@ -188,6 +190,8 @@ async function handleCommand(sid, text, msgId) {
       return selectQuestion(sid, arg, msgId);
     case '/autoclean': case '/ac':
       return handleAutoClean(sid, arg, msgId);
+    case '/sd':
+      return handleSyncDir(sid, msgId);
     case '/testnotify':
       return testNotify(sid, msgId);
     case '/help': case '/h':
@@ -273,7 +277,7 @@ async function switchSession(sid, arg, msgId) {
 
   // Try as session ID directly
   try {
-    const data = await apiFetch(`/session/${arg}`);
+    const data = await apiFetch(`/session/${encodeURIComponent(arg)}`);
     currentSessionId = data.id || arg;
     saveSession(currentSessionId);
     reply(sid, `✅ 已切换到「${data.title || '(未命名)'}」`);
@@ -284,23 +288,33 @@ async function switchSession(sid, arg, msgId) {
 }
 
 function toggleMute(sid, msgId) {
-  const sub = getOrCreateSubscriber(sid);
-  sub.muted = !sub.muted;
-  saveSubscribers();
-  reply(sid, sub.muted ? '🔕 通知已关闭' : '🔔 通知已开启');
+  try {
+    const sub = getOrCreateSubscriber(sid);
+    sub.muted = !sub.muted;
+    saveSubscribers();
+    reply(sid, sub.muted ? '🔕 通知已关闭' : '🔔 通知已开启');
+  } catch (e) {
+    log(`[MUTE] error: ${e.message}`);
+    reply(sid, '⚠️ 操作失败');
+  }
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
 function showNotifyStatus(sid, msgId) {
-  const sub = getOrCreateSubscriber(sid);
-  const lines = [
-    '📡 通知设置',
-    `├ 状态: ${sub.muted ? '🔕 已静音' : '🔔 已开启'}`,
-    `├ 订阅用户: ${subscribers.length} 人`,
-    `├ 当前会话: ${currentSessionId ? currentSessionId.slice(0, 16) + '...' : '未选择'}`,
-    `└ 活跃监控: ${sessionStates.size} 个`,
-  ];
-  reply(sid, lines.join('\n'));
+  try {
+    const sub = getOrCreateSubscriber(sid);
+    const lines = [
+      '📡 通知设置',
+      `├ 状态: ${sub.muted ? '🔕 已静音' : '🔔 已开启'}`,
+      `├ 订阅用户: ${subscribers.length} 人`,
+      `├ 当前会话: ${currentSessionId ? currentSessionId.slice(0, 16) + '...' : '未选择'}`,
+      `└ 活跃监控: ${sessionStates.size} 个`,
+    ];
+    reply(sid, lines.join('\n'));
+  } catch (e) {
+    log(`[NOTIFY] error: ${e.message}`);
+    reply(sid, '⚠️ 获取通知状态失败');
+  }
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
@@ -313,7 +327,7 @@ async function cancelCurrent(sid, msgId) {
     return;
   }
   try {
-    await fetch(`${SERVER}/session/${target}/abort`, {
+    await fetch(`${SERVER}/session/${encodeURIComponent(target)}/abort`, {
       method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000),
     });
     reply(sid, '⏹️ 已发送取消请求');
@@ -355,6 +369,7 @@ async function switchAgent(sid, agent, msgId) {
 }
 
 async function listPermissions(sid, msgId) {
+  await syncPermissionsFromServer();
   if (pendingPermissions.size === 0) {
     reply(sid, '📋 当前没有待处理的权限请求');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -421,7 +436,7 @@ async function handlePermissionReply(sid, action, arg, msgId) {
     await apiFetch(`/permission/${encodeURIComponent(targetRid)}/reply`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reply: action, message: 'via wechat-adapter' }),
+      body: JSON.stringify({ reply: action, message: `via wechat-adapter (sid=${sid.slice(0,12)})` }),
     });
     const info = pendingPermissions.get(targetRid);
     const labels = { once: '✅ 已批准', always: '✅ 已信任', reject: '❌ 已拒绝' };
@@ -464,20 +479,65 @@ async function handleWorkspace(sid, arg, msgId) {
   if (!arg) {
     const lines = ['📂 工作区', '─'.repeat(16)];
     list.forEach((w, i) => {
-      const mark = w.path === currentWorkspace?.path ? ' ◀' : '';
+      const mark = wsPathEqual(w.path, currentWorkspace?.path) ? ' ◀' : '';
+      const shortPath = w.path.length > 50 ? '...' + w.path.slice(-47) : w.path;
       lines.push(`${i + 1}. ${w.name}${mark}`);
+      lines.push(`   ${shortPath}`);
     });
     lines.push('─'.repeat(16));
     lines.push(`当前: ${currentWorkspace?.name}`);
     lines.push('/workspace <编号> 切换');
+    lines.push('/workspace add <路径> [名称] 添加工作区');
+    lines.push('/workspace del <编号> 删除工作区');
     reply(sid, lines.join('\n'));
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  const addMatch = arg.match(/^add\s+(.+?)(?:\s+(\S+))?$/i);
+  if (addMatch) {
+    let dirPath = addMatch[1].trim();
+    let name = addMatch[2]?.trim() || basename(dirPath);
+    if (!dirPath || /[\x00-\x1f]/.test(dirPath)) {
+      reply(sid, '⚠️ 路径无效（包含非法字符）');
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    try { dirPath = resolve(dirPath); } catch { /* keep original if resolution fails */ }
+    if (list.some(w => wsPathEqual(w.path, dirPath))) {
+      reply(sid, `⚠️ 工作区已存在: ${name} (${dirPath})`);
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    list.push({ name, path: dirPath });
+    saveWorkspaces(list);
+    reply(sid, `✅ 已添加工作区「${name}」\n${dirPath}`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  const delMatch = arg.match(/^del(?:ete)?\s+(\d+)$/i);
+  if (delMatch) {
+    const idx = parseInt(delMatch[1], 10) - 1;
+    if (idx < 0 || idx >= list.length) {
+      reply(sid, `⚠️ 编号 ${delMatch[1]} 超出范围 (1-${list.length})`);
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    const removed = list.splice(idx, 1)[0];
+    saveWorkspaces(list);
+    if (wsPathEqual(currentWorkspace?.path, removed.path)) {
+      currentWorkspace = list[0] || { name: '主项目', path: WORK_DIR };
+      saveCurrentWorkspace();
+    }
+    reply(sid, `🗑️ 已删除工作区「${removed.name}」`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
 
   const num = parseInt(arg, 10);
   if (isNaN(num) || num < 1 || num > list.length) {
-    reply(sid, `⚠️ 请输入 1-${list.length} 之间的编号`);
+    reply(sid, `⚠️ 请输入 1-${list.length} 之间的编号，或使用 /ws add / /ws del`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
@@ -491,6 +551,131 @@ async function handleWorkspace(sid, arg, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+function discoverWorkspacesViaDb() {
+  try {
+    const out = execSync(
+      'opencode db "SELECT id, worktree, sandboxes FROM project WHERE id != \'global\'" --format json',
+      { encoding: 'utf8', timeout: 15000 }
+    );
+    const projects = JSON.parse(out.trim());
+    if (!Array.isArray(projects)) return [];
+    const dirs = new Set();
+    for (const p of projects) {
+      if (p.worktree && p.worktree !== '/') {
+        dirs.add(p.worktree.replace(/\//g, '\\'));
+      }
+      if (p.sandboxes) {
+        try {
+          const boxes = JSON.parse(p.sandboxes);
+          if (Array.isArray(boxes)) {
+            for (const s of boxes) {
+              if (s) dirs.add(s.replace(/\//g, '\\'));
+            }
+          }
+        } catch (e) { log(`[SD] parse sandboxes JSON failed: ${e.message}`); }
+      }
+    }
+    return [...dirs];
+  } catch (err) {
+    log(`[SD] db query failed: ${err.message}`);
+    return [];
+  }
+}
+
+async function handleSyncDir(sid, msgId) {
+  try {
+    const existing = loadWorkspaces();
+    const existingPaths = new Set(existing.map(w => w.path.toLowerCase()));
+    const added = [];
+    const skipped = [];
+
+    function isExisting(p) { return existingPaths.has(p.toLowerCase()); }
+    function markExisting(p) { existingPaths.add(p.toLowerCase()); }
+
+    const dbDirs = discoverWorkspacesViaDb();
+    if (dbDirs.length > 0) {
+      for (const dirPath of dbDirs) {
+        if (isExisting(dirPath)) {
+          skipped.push({ name: makeWsName(dirPath, existing), path: dirPath });
+          continue;
+        }
+        const name = makeWsName(dirPath, existing);
+        existing.push({ name, path: dirPath });
+        added.push({ name, path: dirPath });
+        markExisting(dirPath);
+      }
+    } else {
+      log('[SD] db returned no directories, trying HTTP API fallback...');
+      const projects = await apiFetch('/project').catch(() => null);
+      if (Array.isArray(projects) && projects.length > 0) {
+        for (const p of projects) {
+          try {
+            const dirs = await apiFetch(`/project/${encodeURIComponent(p.id)}/directories`);
+            if (!Array.isArray(dirs)) continue;
+            for (const d of dirs) {
+              const dirPath = d.directory;
+              if (!dirPath) continue;
+              if (isExisting(dirPath)) {
+                skipped.push({ name: basename(dirPath), path: dirPath });
+                continue;
+              }
+              const name = makeWsName(dirPath, existing);
+              existing.push({ name, path: dirPath });
+              added.push({ name, path: dirPath });
+              markExisting(dirPath);
+            }
+          } catch {
+            log(`[SD] skip project ${p.id?.slice(0, 16)}: directories endpoint failed`);
+          }
+        }
+      }
+
+      if (added.length === 0) {
+        log('[SD] project API yielded no directories, trying session fallback...');
+        const sessions = await apiFetch('/session').catch(() => null);
+        if (Array.isArray(sessions)) {
+          const dirs = [...new Set(sessions.map(s => s.directory).filter(Boolean))];
+          for (const dirPath of dirs) {
+            if (isExisting(dirPath)) {
+              skipped.push({ name: basename(dirPath), path: dirPath });
+              continue;
+            }
+            const name = makeWsName(dirPath, existing);
+            existing.push({ name, path: dirPath });
+            added.push({ name, path: dirPath });
+            markExisting(dirPath);
+          }
+        }
+      }
+    }
+
+    if (added.length === 0 && skipped.length === 0) {
+      reply(sid, '⚠️ 未能获取到工作区信息，请先确认 OpenCode 已打开项目');
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    saveWorkspaces(existing);
+    const lines = ['📂 工作区同步完成'];
+    lines.push(`├ 新增: ${added.length} 个`);
+    if (added.length > 0) lines.push(`├ ${added.map(a => a.name).join('、')}`);
+    if (skipped.length > 0) lines.push(`├ 跳过: ${skipped.map(s => s.name).join('、')}`);
+    lines.push(`└ 总计: ${existing.length} 个工作区`);
+    reply(sid, lines.join('\n'));
+    } catch (err) {
+    reply(sid, `⚠️ 同步失败: ${err.message}`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+  }
+}
+
+function makeWsName(dirPath, existing) {
+  let name = basename(dirPath);
+  if (existing.some(w => w.name === name)) {
+    const parts = dirPath.replace(/[\\/]+/g, '/').replace(/\/$/, '').split('/');
+    name = parts.length >= 2 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : name;
+  }
+  return name;
+}
+
 async function showTaskStatus(sid, msgId) {
   try {
     const statusMap = await apiFetch('/session/status');
@@ -499,7 +684,7 @@ async function showTaskStatus(sid, msgId) {
     for (const [id, st] of Object.entries(statusMap || {})) {
       if (st.type === 'busy') {
         hasActive = true;
-        const info = await apiFetch(`/session/${id}`).catch(() => null);
+        const info = await apiFetch(`/session/${encodeURIComponent(id)}`).catch(() => null);
         const name = info?.title || id.slice(0, 16);
         const isCurrent = id === currentSessionId ? ' ◀当前' : '';
         lines.push(`▶ ${name} — 运行中${isCurrent}`);
@@ -520,38 +705,40 @@ function showHelp(sid, msgId) {
     '── 会话管理 ──',
     '/list (/l, /sessions)    查看会话列表',
     '/switch (/s) <编号|ID>   切换会话',
-    '/new (/create) <会话名>  新建会话（当前工作区）并切换',
+    '/new (/create) <会话名>  新建会话并切换（当前工作区）',
     '',
     '── 模式切换 ──',
     '/plan (/pl)              切换到 plan 模式',
     '/build (/bu)             切换到 build 模式',
     '',
-    '── 问题回答 ──',
-    '/answer (/ans) [问题编号] <内容> 回答AI提问，可用编号指定问题，为空则默认第1题',
-    '/skip (/pass, /ps) [编号]  跳过指定问题（默认当前）',
-    '/qlist (/ql, /questions)   查看所有待回答问题',
-    '/qshow (/qc, /qcurrent)    显示当前问题的完整内容',
-    '/qselect (/qs, /qsel) <编号>  选中指定问题为当前活跃',
+    '── 问题回答（通知中直接回复也可）──',
+    '/answer (/ans) [编号] <内容>  回答AI提问，默认第1题',
+    '/skip (/pass, /ps) [编号]     跳过指定问题（默认当前）',
+    '/qlist (/ql, /questions)      查看所有待回答问题',
+    '/qshow (/qc, /qcurrent)       显示当前问题详情',
+    '/qselect (/qs, /qsel) <编号>  选中指定问题为当前',
     '',
-    '── 权限审批 ──',
-    '/allow (/a) [编号|ID]    批准权限请求',
-    '/deny (/d) [编号|ID]     拒绝权限请求',
-    '/trust (/t) [编号|ID]    信任权限（不再询问）',
-    '/plist (/p, /pending)    查看待审批权限列表',
+    '── 权限审批（通知中直接回复也可）──',
+    '/allow (/a) [编号|ID]  批准权限请求（默认最新）',
+    '/deny (/d) [编号|ID]   拒绝权限请求',
+    '/trust (/t) [编号|ID]  信任权限（不再询问）',
+    '/plist (/p, /pending)  查看待审批权限列表',
     '',
     '── 工作区与任务 ──',
-    '/workspace (/ws)         查看/切换工作区',
-    '/status (/st)            查看任务运行状态',
-    '/cancel (/c)             取消当前AI执行',
+    '/workspace (/ws)        查看/切换/添加/删除工作区',
+    '/sd                     从 DB 同步所有 OpenCode 项目工作区',
+    '/status (/st)           查看任务运行状态',
+    '/cancel (/c)            取消当前AI执行',
     '',
     '── 通知与系统 ──',
-    '/mute (/m)               开关通知',
-    '/notify (/n)             查看通知状态',
-    '/autoclean (/ac) [天数]  查看/设置不活跃订阅清理阈值',
-    '/help (/h)               显示此帮助',
-    '/testnotify              发送测试通知（调试用）',
+    '/mute (/m)              开关主动通知',
+    '/notify (/n)            查看通知状态与订阅信息',
+    '/autoclean (/ac) [天数] 设置不活跃订阅自动清理天数',
+    '/testnotify             发送测试通知（调试用）',
+    '/help (/h)              显示此帮助',
     '',
-    '发送其他文字将转发给当前选中的AI会话',
+    '💡 通知消息中可直接回复答案或权限审批，无需输入命令',
+    '💡 未识别的消息将转发给当前选中的 AI 会话',
   ];
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
@@ -615,6 +802,32 @@ async function listQuestions(sid, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+function formatQuestionBody(questions) {
+  const multi = questions.length > 1;
+  let body = '';
+  if (multi) {
+    questions.forEach((qItem, idx) => {
+      const qText = qItem.question || '';
+      body += `\n\n${idx+1}. ${qText}`;
+      if (qItem.options?.length) {
+        body += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
+      }
+    });
+    body += '\n\n多个答案用逗号分隔，如：1, 2';
+  } else {
+    const qi = questions[0];
+    const q = qi.question || '';
+    const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
+    body += `\n${q}`;
+    if (opts) body += `\n${opts}`;
+    if (qi.isSecret) body += '\n🔒 答案将保密发送';
+    body += '\n回复内容，或 /ans (/answer) <内容> 提交';
+    if (opts) body += '，或发送编号选择';
+  }
+  body += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
+  return body;
+}
+
 async function listCurrentQuestion(sid, msgId) {
   if (!pendingQuestions) {
     const queued = pendingQuestionQueue.length;
@@ -635,26 +848,7 @@ async function listCurrentQuestion(sid, msgId) {
   const multi = questions.length > 1;
   let msg = multi ? `💬 待回答（共${questions.length}题）` : `💬 需要你回答`;
   if (sesLabel) msg = sesLabel + msg;
-  if (multi) {
-    questions.forEach((qItem, idx) => {
-      const qText = qItem.question || '';
-      msg += `\n\n${idx+1}. ${qText}`;
-      if (qItem.options?.length) {
-        msg += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
-      }
-    });
-    msg += '\n\n多个答案用逗号分隔，如：1, 2';
-    msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-  } else {
-    const q = qi.question || '';
-    const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
-    msg += `\n${q}`;
-    if (opts) msg += `\n${opts}`;
-    if (qi.isSecret) msg += '\n🔒 答案将保密发送';
-    msg += '\n回复内容，或 /ans (/answer) <内容> 提交';
-    if (opts) msg += '，或发送编号选择';
-    msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-  }
+  msg += formatQuestionBody(questions);
   reply(sid, msg);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -694,7 +888,7 @@ async function selectQuestion(sid, arg, msgId) {
   target.askTimestamp = ts;
   setTimeout(() => {
     if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
-  }, 300_000).unref?.();
+  },     QUESTION_AUTO_CLEAR_MS).unref?.();
   return listCurrentQuestion(sid, msgId);
 }
 
@@ -745,7 +939,7 @@ async function answerQuestion(sid, answer, msgId) {
     qData.askTimestamp = ts;
     setTimeout(() => {
       if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
-    }, 300_000).unref?.();
+    },     QUESTION_AUTO_CLEAR_MS).unref?.();
   }
 
   const targetId = currentSessionId;
@@ -756,12 +950,12 @@ async function answerQuestion(sid, answer, msgId) {
       reply(sid, '⚠️ 没有选中的会话，无法提交答案');
       if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
       pendingQuestions = null;
+      dequeueNextQuestion();
       return;
     }
     if (qData.sessionID && qData.sessionID !== targetId) {
-      reply(sid, '⚠️ 当前会话已切换，无法回答之前的问题');
+      reply(sid, `⚠️ 该问题属于会话「${getSessionName(qData.sessionID)}」，请用 /switch 切换到该会话后回答`);
       if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
-      pendingQuestions = null;
       return;
     }
   }
@@ -800,9 +994,9 @@ async function answerQuestion(sid, answer, msgId) {
     answers.push(answerText);
   }
 
+  const combined = answers.join(', ');
   pendingQuestions = null;
   await dequeueNextQuestion();
-  const combined = answers.join(', ');
   log(`[ANSWER] sid=${sid.slice(0,12)} answers=[${combined}]`);
   // Start streaming for the AI's response — use question's own sessionID for cross-session replies
   startStreaming(sid, qData.sessionID || targetId);
@@ -819,20 +1013,32 @@ async function answerQuestion(sid, answer, msgId) {
 
 async function answerViaQuestionApi(sid, targetId, answers, requestID) {
   try {
-    const res = await fetch(`${SERVER}/question/${requestID}/reply`, {
-      method: 'POST',
-      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answers: answers.map(a => [a]) }),
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000);
+    let res;
+    try {
+      res = await fetch(`${SERVER}/question/${requestID}/reply`, {
+        method: 'POST',
+        headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answers: answers.map(a => [a]) }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
     if (!res.ok) {
+      stopStreaming();
       const errText = await res.text();
       reply(sid, `⚠️ 回答提交失败 (${res.status}): ${errText.slice(0, 100)}`);
       await drainPendingNotifications();
       flushToWeChat();
       return;
     }
+    // Consume response body to release connection
+    await res.text();
     log(`[ANSWER] reply sent via question API, waiting for SSE response...`);
   } catch (err) {
+    stopStreaming();
     reply(sid, `❌ 回答提交失败: ${err.message}`);
     await drainPendingNotifications();
     flushToWeChat();
@@ -840,42 +1046,24 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
 }
 
 async function dequeueNextQuestion() {
+  if (pendingQuestions) { log('[DEQUEUE] skip: already a pending question'); return; }
   while (pendingQuestionQueue.length > 0) {
     const next = pendingQuestionQueue.shift();
     pendingQuestions = next;
     if (next.sessionID) currentSessionId = next.sessionID;
     const autoClear = setTimeout(() => {
       if (pendingQuestions?.askTimestamp === next.askTimestamp) { pendingQuestions = null; dequeueNextQuestion(); }
-    }, 300_000);
+    }, QUESTION_AUTO_CLEAR_MS);
     autoClear.unref?.();
     // Generate notification for the next question
     await fetchSessionName(next.sessionID);
     const sesLabel = next.sessionID ? `[${getSessionName(next.sessionID)}] ` : '';
     const qi = next.questions?.[0];
-    if (!qi) continue;
+    if (!qi) { pendingQuestions = null; clearTimeout(autoClear); continue; }
     const multi = next.questions.length > 1;
     let text = (multi ? `📌 下一题（共${next.questions.length}题）` : `📌 下一题`);
     if (sesLabel) text = sesLabel + text;
-    if (multi) {
-      next.questions.forEach((qItem, idx) => {
-        const qText = qItem.question || '';
-        text += `\n\n${idx+1}. ${qText}`;
-        if (qItem.options?.length) {
-          text += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
-        }
-      });
-        text += '\n\n多个答案用逗号分隔，如：1, 2';
-        text += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-    } else {
-      const q = qi.question || '';
-      const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
-      text += `\n${q}`;
-      if (opts) text += `\n${opts}`;
-      if (qi.isSecret) text += '\n🔒 答案将保密发送';
-      text += '\n回复内容，或 /ans (/answer) <内容> 提交';
-      if (opts) text += '，或发送编号选择';
-      text += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-    }
+    text += formatQuestionBody(next.questions);
     broadcastNotification(text);
     return;
   }
@@ -915,6 +1103,7 @@ async function skipQuestion(sid, arg, msgId) {
       await fetch(`${SERVER}/question/${requestID}/reject`, {
         method: 'POST',
         headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
       });
       log(`[SKIP] rejected question ${requestID.slice(0,16)}`);
     } catch (err) {
@@ -982,7 +1171,18 @@ function flushStream() {
 
 function finalizeStream() {
   if (!streamSid || streamFinalized) return;
-  flushStream();
+  if (streamBuf) {
+    const newText = streamBuf.slice(streamLastFlush.length);
+    if (newText) {
+      streamLastFlush = streamBuf;
+      try {
+        reply(streamSid, newText);
+        flushToWeChat();
+      } catch (e) {
+        log(`[STREAM] final flush error: ${e.message}`);
+      }
+    }
+  }
   streamFinalized = true;
   log(`[STREAM] finalized for ${streamSid.slice(0,12)}`);
   disarmWorkingNotice();
@@ -1033,13 +1233,17 @@ async function forwardToAIAsync(sid, targetId, text) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 120000);
-    const res = await fetch(`${SERVER}/session/${targetId}/message`, {
-      method: 'POST',
-      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ parts: [{ type: 'text', text }], agent: currentAgent }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    let res;
+    try {
+      res = await fetch(`${SERVER}/session/${encodeURIComponent(targetId)}/message`, {
+        method: 'POST',
+        headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parts: [{ type: 'text', text }], agent: currentAgent }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!res.ok) {
       stopStreaming();
@@ -1098,17 +1302,22 @@ function formatReply(data) {
 
   const blocks = [];
   if (reasoningBuf) {
-    const short = reasoningBuf.length > 150 ? reasoningBuf.slice(0, 150) + '...' : reasoningBuf;
-    blocks.push(`🤔 ${short}`);
+    blocks.push('┅'.repeat(16));
+    blocks.push('🤔 思考过程');
+    blocks.push('┅'.repeat(16));
+    blocks.push(reasoningBuf);
   }
   if (toolCalls.length) {
     const tools = toolCalls.slice(-6).map(t => `${t.status} ${t.name}`).join('\n');
-    blocks.push(`🔧\n${tools}`);
+    blocks.push(`\n🔧\n${tools}`);
   }
   const mainText = textParts.join('\n').trim();
   if (mainText) {
-    if (blocks.length) blocks.push('');
-    blocks.push(mainText.length > 1500 ? mainText.slice(0, 1500) + '\n\n...（输出过长，已截断）' : mainText);
+    if (reasoningBuf) {
+      blocks.push('');
+      blocks.push('━'.repeat(16) + ' 回答 ' + '━'.repeat(16));
+    }
+    blocks.push(mainText);
   }
   return blocks.join('\n');
 }
@@ -1146,7 +1355,8 @@ async function handleListSessions(msg) {
       updatedAt: s.time?.updated ? new Date(s.time.updated).toISOString() : undefined,
     }));
     sendResponse(msg.id, { sessions });
-  } catch {
+  } catch (e) {
+    log(`[ACP] session/list fetch failed: ${e.message}`);
     sendResponse(msg.id, { sessions: [] });
   }
 }
@@ -1155,7 +1365,7 @@ async function handleLoadSession(msg) {
   const sessionId = msg.params?.sessionId;
   if (!sessionId) { sendResponse(msg.id, { _meta: { error: 'sessionId required' } }); return; }
   try {
-    const data = await apiFetch(`/session/${sessionId}`);
+    const data = await apiFetch(`/session/${encodeURIComponent(sessionId)}`);
     currentSessionId = data.id || sessionId;
     saveSession(currentSessionId);
     sendResponse(msg.id, { sessionId: currentSessionId, cwd: data.directory || '', title: data.title || '',
@@ -1168,12 +1378,17 @@ async function handleLoadSession(msg) {
 async function handleCancel(msg) {
   const sid = msg.params?.sessionId || currentSessionId;
   if (sid) {
-    try { await fetch(`${SERVER}/session/${sid}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
+    try { await fetch(`${SERVER}/session/${encodeURIComponent(sid)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
   }
   sendResponse(msg.id, {});
 }
 
 /* ───────── Workspace ───────── */
+
+function wsPathEqual(a, b) {
+  if (!a || !b) return a === b;
+  try { return resolve(a).toLowerCase() === resolve(b).toLowerCase(); } catch { return a.toLowerCase() === b.toLowerCase(); }
+}
 
 function loadWorkspaces() {
   try {
@@ -1190,7 +1405,7 @@ function loadDefaultWorkspace() {
   try {
     if (existsSync(WORKSPACE_CURRENT_FILE)) {
       const saved = JSON.parse(readFileSync(WORKSPACE_CURRENT_FILE, 'utf8'));
-      const match = list.find(w => w.path === saved.path);
+      const match = list.find(w => wsPathEqual(w.path, saved.path));
       if (match) return match;
     }
   } catch {}
@@ -1203,6 +1418,10 @@ function saveCurrentWorkspace() {
 
 function getWorkspaceDir() {
   return currentWorkspace?.path || WORK_DIR;
+}
+
+function saveWorkspaces(list) {
+  try { writeFileSync(WORKSPACES_FILE, JSON.stringify(list, null, 2)); } catch {}
 }
 
 /* ───────── Session Persistence ───────── */
@@ -1246,10 +1465,10 @@ function loadSettings() {
       const data = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'));
       if (data && typeof data.cleanupDays === 'number') settings.cleanupDays = data.cleanupDays;
     }
-  } catch {}
+  } catch (e) { log(`[SETTINGS] load failed: ${e.message}`); }
 }
 function saveSettings() {
-  try { writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2)); } catch {}
+  try { writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2)); } catch (e) { log(`[SETTINGS] save failed: ${e.message}`); }
 }
 
 async function handleAutoClean(sid, arg, msgId) {
@@ -1390,6 +1609,7 @@ function broadcastNotification(text) {
       proactiveTimer = null;
       drainPendingNotifications(true).catch(e => log(`[TIMER] drain error: ${e.message}`));
     }, 15000);
+    proactiveTimer.unref?.();
     log(`[BROADCAST] proactive timer set for 15s`);
   }
 }
@@ -1544,7 +1764,7 @@ async function eventToNotification(type, props) {
       pendingQuestions = qData;
       setTimeout(() => {
         if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
-      }, 300_000).unref?.();
+      },     QUESTION_AUTO_CLEAR_MS).unref?.();
       log(`[EVENT] question.asked: stored ${questions.length} questions`);
       await fetchSessionName(props.sessionID);
       const sesLabel = props.sessionID ? `[${getSessionName(props.sessionID)}] ` : '';
@@ -1553,26 +1773,7 @@ async function eventToNotification(type, props) {
       const multi = questions.length > 1;
       let msg = multi ? `💬 待回答（共${questions.length}题）` : `💬 需要你回答`;
       if (sesLabel) msg = sesLabel + msg;
-      if (multi) {
-        questions.forEach((qItem, idx) => {
-          const qText = qItem.question || '';
-          msg += `\n\n${idx+1}. ${qText}`;
-          if (qItem.options?.length) {
-            msg += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
-          }
-        });
-        msg += '\n\n多个答案用逗号分隔，如：1, 2';
-        msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-      } else {
-        const q = qi.question || '';
-        const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
-        msg += `\n${q}`;
-        if (opts) msg += `\n${opts}`;
-        if (qi.isSecret) msg += '\n🔒 答案将保密发送';
-        msg += '\n回复内容，或 /ans (/answer) <内容> 提交';
-        if (opts) msg += '，或发送编号选择';
-        msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-      }
+      msg += formatQuestionBody(questions);
       return msg;
     }
     case 'permission.asked': {
@@ -1593,7 +1794,7 @@ async function eventToNotification(type, props) {
         setTimeout(() => {
           log(`[TIMER] auto-clean rid=${rid.slice(0,16)}...`);
           pendingPermissions.delete(rid);
-        }, 300_000);
+        },     QUESTION_AUTO_CLEAR_MS).unref?.();
         // Same-session dedup: only suppress if this has NO path and session already has pending
         // (approving one typically auto-approves related requests, but path info is critical)
         if (!p) {
@@ -1691,7 +1892,7 @@ async function eventToNotification(type, props) {
 async function fetchSessionName(id) {
   if (!id || sessionNames.has(id)) return;
   try {
-    const data = await apiFetch(`/session/${id}`);
+    const data = await apiFetch(`/session/${encodeURIComponent(id)}`);
     if (data.title) sessionNames.set(id, data.title);
   } catch {}
 }
@@ -1717,11 +1918,15 @@ async function connectSSE() {
       log(`[SSE] URL: ${eventUrl}`);
       const abortControl = new AbortController();
       const connTimer = setTimeout(() => abortControl.abort(), 15000);
-      const response = await fetch(eventUrl, {
-        headers: { Authorization: AUTH, 'x-opencode-directory': getWorkspaceDir() },
-        signal: abortControl.signal,
-      });
-      clearTimeout(connTimer);
+      let response;
+      try {
+        response = await fetch(eventUrl, {
+          headers: { Authorization: AUTH, 'x-opencode-directory': getWorkspaceDir() },
+          signal: abortControl.signal,
+        });
+      } finally {
+        clearTimeout(connTimer);
+      }
       if (!response.ok) throw new Error(`SSE ${response.status}`);
       if (!response.body) throw new Error('SSE body is null');
       sseReader = null;
@@ -1765,7 +1970,7 @@ async function connectSSE() {
                 }
                 if (eventId) {
                   recentEventIds.add(eventId);
-                  setTimeout(() => recentEventIds.delete(eventId), 10000);
+                  setTimeout(() => recentEventIds.delete(eventId), 10000).unref?.();
                 }
 
                 if (props.id) props.requestID ??= props.id;
@@ -1780,12 +1985,16 @@ async function connectSSE() {
                 // Handle session tracking side-effects before notification
                 await handleSseSideEffect(eventType, props).catch(e => log(`[SSE] side-effect error: ${e.message}`));
 
-                const text = await eventToNotification(eventType, props);
-                if (text) {
-                  log(`[SSE] notification generated: ${text.slice(0, 80).replace(/\n/g,'\\n')}`);
-                  broadcastNotification(text);
-                } else {
-                  log(`[SSE] eventToNotification returned null (suppressed)`);
+                try {
+                  const text = await eventToNotification(eventType, props);
+                  if (text) {
+                    log(`[SSE] notification generated: ${text.slice(0, 80).replace(/\n/g,'\\n')}`);
+                    broadcastNotification(text);
+                  } else {
+                    log(`[SSE] eventToNotification returned null (suppressed)`);
+                  }
+                } catch (e) {
+                  log(`[SSE] eventToNotification error: ${e.message}`);
                 }
               } catch (e) {
                 log(`[SSE] Parse error: ${e.message}`);
@@ -1796,7 +2005,7 @@ async function connectSSE() {
           } else if (trimmed.startsWith('event:')) {
             currentEvent = trimmed.slice(6).trim();
           } else if (trimmed.startsWith('data:')) {
-            currentData += trimmed.slice(5).trim() + '\n';
+            currentData += trimmed.slice(5).replace(/^ /, '') + '\n';
           }
         }
       }
