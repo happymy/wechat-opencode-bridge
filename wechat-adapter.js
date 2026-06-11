@@ -609,7 +609,9 @@ async function listQuestions(sid, msgId) {
   lines.push('─'.repeat(20));
   lines.push('/ans <内容|编号>  回答（默认当前第1题）');
   lines.push('/ans <编号> <内容>  回答指定编号问题');
-  lines.push('/skip [编号]      跳过指定问题');
+  lines.push('/qshow              查看当前问题详情');
+  lines.push('/qselect <编号>     选中指定问题为当前活跃');
+  lines.push('/skip [编号]        跳过指定问题');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -652,7 +654,7 @@ async function listCurrentQuestion(sid, msgId) {
     msg += '\n回复内容，或 /ans <内容> 提交';
     if (opts) msg += '，或发送编号选择';
   }
-  msg += '\n/skip 跳过，/qlist 查看全部待答';
+  msg += '\n/skip 跳过，/qlist 查看全部，/qselect <编号> 切换问题';
   reply(sid, msg);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -685,6 +687,8 @@ async function selectQuestion(sid, arg, msgId) {
     pendingQuestionQueue.unshift(pendingQuestions);
   }
   pendingQuestions = target;
+  // Auto-follow the question's session for cross-session answers
+  if (target.sessionID) currentSessionId = target.sessionID;
   // Reset auto-clear
   const ts = Date.now();
   target.askTimestamp = ts;
@@ -734,6 +738,8 @@ async function answerQuestion(sid, answer, msgId) {
       pendingQuestionQueue.unshift(pendingQuestions);
     }
     pendingQuestions = qData;
+    // Auto-follow the question's session for cross-session answers
+    if (qData.sessionID) currentSessionId = qData.sessionID;
     // Reset auto-clear timer
     const ts = Date.now();
     qData.askTimestamp = ts;
@@ -795,7 +801,7 @@ async function answerQuestion(sid, answer, msgId) {
   }
 
   pendingQuestions = null;
-  dequeueNextQuestion();
+  await dequeueNextQuestion();
   const combined = answers.join(', ');
   log(`[ANSWER] sid=${sid.slice(0,12)} answers=[${combined}]`);
   // Start streaming for the AI's response — use question's own sessionID for cross-session replies
@@ -837,6 +843,7 @@ async function dequeueNextQuestion() {
   while (pendingQuestionQueue.length > 0) {
     const next = pendingQuestionQueue.shift();
     pendingQuestions = next;
+    if (next.sessionID) currentSessionId = next.sessionID;
     const autoClear = setTimeout(() => {
       if (pendingQuestions?.askTimestamp === next.askTimestamp) { pendingQuestions = null; dequeueNextQuestion(); }
     }, 300_000);
@@ -858,7 +865,7 @@ async function dequeueNextQuestion() {
         }
       });
         text += '\n\n多个答案用逗号分隔，如：1, 2';
-        text += '\n/skip 跳过，/qlist 查看全部待答';
+        text += '\n/skip 跳过，/qlist 查看全部，/qshow 查看详情，/qselect <编号> 切换';
     } else {
       const q = qi.question || '';
       const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
@@ -867,7 +874,7 @@ async function dequeueNextQuestion() {
       if (qi.isSecret) text += '\n🔒 答案将保密发送';
       text += '\n回复内容，或 /ans <内容> 提交';
       if (opts) text += '，或发送编号选择';
-      text += '\n/skip 跳过，/qlist 查看全部待答';
+      text += '\n/skip 跳过，/qlist 查看全部，/qshow 查看详情，/qselect <编号> 切换';
     }
     broadcastNotification(text);
     return;
@@ -896,7 +903,7 @@ async function skipQuestion(sid, arg, msgId) {
   if (qIdx === 0 && pendingQuestions) {
     qData = pendingQuestions;
     pendingQuestions = null;
-    dequeueNextQuestion();
+    await dequeueNextQuestion();
   } else {
     const queuedIdx = qIdx - (pendingQuestions ? 1 : 0);
     qData = pendingQuestionQueue.splice(queuedIdx, 1)[0];
@@ -1412,11 +1419,11 @@ async function drainPendingNotifications(forceFlush) {
           log(`[DRAIN]   [${i}]: ${unique[i].slice(0,80).replace(/\n/g,'\\n')}`);
         }
       }
-      const permLines = unique.filter(t => /^📋 #/.test(t));
+      const permLines = unique.filter(t => /^#\d+/.test(t));
       if (permLines.length > 0) {
-        const others = unique.filter(t => !/^📋 #/.test(t));
+        const others = unique.filter(t => !/^#\d+/.test(t));
         let combined = permLines.join('\n');
-        combined += '\n/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号|requestID> 不输入编号，默认为#1';
+        combined += '\n/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号>';
         if (others.length > 0) combined += '\n' + others.join('\n');
         try { reply(sid, combined); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
       } else {
@@ -1544,6 +1551,7 @@ async function eventToNotification(type, props) {
           }
         });
         msg += '\n\n多个答案用逗号分隔，如：1, 2';
+        msg += '\n/skip 跳过，/qlist 查看全部，/qshow 查看详情，/qselect <编号> 切换';
       } else {
         const q = qi.question || '';
         const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
@@ -1552,7 +1560,7 @@ async function eventToNotification(type, props) {
         if (qi.isSecret) msg += '\n🔒 答案将保密发送';
         msg += '\n回复内容，或 /ans <内容> 提交';
         if (opts) msg += '，或发送编号选择';
-        msg += '\n/skip 跳过，/qlist 查看全部待答';
+        msg += '\n/skip 跳过，/qlist 查看全部，/qshow 查看详情，/qselect <编号> 切换';
       }
       return msg;
     }
@@ -1604,6 +1612,23 @@ async function eventToNotification(type, props) {
       }
       return null;
     }
+    case 'question.replied':
+    case 'question.rejected': {
+      const qrid = props.requestID;
+      log(`[EVENT] question.replied/rejected rid=${(qrid||'?').slice(0,16)}`);
+      if (qrid) {
+        if (pendingQuestions && pendingQuestions.requestID === qrid) {
+          pendingQuestions = null;
+          await dequeueNextQuestion();
+        }
+        const before = pendingQuestionQueue.length;
+        pendingQuestionQueue = pendingQuestionQueue.filter(q => q.requestID !== qrid);
+        if (pendingQuestionQueue.length !== before) {
+          log(`[EVENT] removed ${before - pendingQuestionQueue.length} from queue`);
+        }
+      }
+      return null;
+    }
     case 'session.idle': {
       if (props.sessionID && props.sessionID === streamSessionId) {
         finalizeStream();
@@ -1612,6 +1637,8 @@ async function eventToNotification(type, props) {
       if (pendingQuestions && pendingQuestions.sessionID === props.sessionID) {
         pendingQuestions = null;
       }
+      // Clear queued questions for this session
+      pendingQuestionQueue = pendingQuestionQueue.filter(q => q.sessionID !== props.sessionID);
       return idleNotification(props);
     }
     case 'session.status': {
