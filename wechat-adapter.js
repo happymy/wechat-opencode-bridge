@@ -1525,6 +1525,17 @@ async function eventToNotification(type, props) {
       const questions = props.questions || [];
       const ts = Date.now();
       const qData = { sessionID: props.sessionID, requestID: props.requestID, questions, askTimestamp: ts };
+      // Dedup: skip if same requestID is already active or queued
+      if (qData.requestID) {
+        if (pendingQuestions && pendingQuestions.requestID === qData.requestID) {
+          log(`[EVENT] question.asked: dedup (already active)`);
+          return null;
+        }
+        if (pendingQuestionQueue.some(q => q.requestID === qData.requestID)) {
+          log(`[EVENT] question.asked: dedup (already queued)`);
+          return null;
+        }
+      }
       if (pendingQuestions) {
         pendingQuestionQueue.push(qData);
         log(`[EVENT] question.asked: queued (${pendingQuestionQueue.length} in queue)`);
