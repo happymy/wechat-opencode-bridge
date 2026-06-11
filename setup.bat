@@ -118,7 +118,7 @@ echo.
 
 :: --- 6. wechat-acp ---
 echo [7/7] Refreshing wechat-acp...
-pwsh -NoLogo -Command "$c='$env:LOCALAPPDATA\npm-cache\_npx';if(Test-Path $c){Remove-Item -Recurse -Force \"$c\*\" -ErrorAction SilentlyContinue}"
+pwsh -NoLogo -Command "$c=\"$env:LOCALAPPDATA\npm-cache\_npx\";if(Test-Path $c){Remove-Item -Recurse -Force \"$c\*\" -ErrorAction SilentlyContinue}"
 call npx -y wechat-acp@latest --version 2>&1
 if errorlevel 1 (
     echo  [FAIL] wechat-acp download failed
