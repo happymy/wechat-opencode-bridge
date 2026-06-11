@@ -1,8 +1,9 @@
 import { createInterface } from 'node:readline';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { execSync } from 'node:child_process';
 
 const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
 const AUTH = 'Basic ' + Buffer.from(process.env.OPENCODE_AUTH || 'opencode:opencode').toString('base64');
@@ -37,6 +38,7 @@ let lastPromptText = '';      // last prompt text (for mirror suppression)
 let streamFinalized = false;  // true after finalizeStream runs (prevents double-finalize race)
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
+const QUESTION_AUTO_CLEAR_MS = 300000; // 5min before unanswered question auto-expires
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 
 /* ───────── Logging ───────── */
@@ -275,7 +277,7 @@ async function switchSession(sid, arg, msgId) {
 
   // Try as session ID directly
   try {
-    const data = await apiFetch(`/session/${arg}`);
+    const data = await apiFetch(`/session/${encodeURIComponent(arg)}`);
     currentSessionId = data.id || arg;
     saveSession(currentSessionId);
     reply(sid, `✅ 已切换到「${data.title || '(未命名)'}」`);
@@ -286,23 +288,33 @@ async function switchSession(sid, arg, msgId) {
 }
 
 function toggleMute(sid, msgId) {
-  const sub = getOrCreateSubscriber(sid);
-  sub.muted = !sub.muted;
-  saveSubscribers();
-  reply(sid, sub.muted ? '🔕 通知已关闭' : '🔔 通知已开启');
+  try {
+    const sub = getOrCreateSubscriber(sid);
+    sub.muted = !sub.muted;
+    saveSubscribers();
+    reply(sid, sub.muted ? '🔕 通知已关闭' : '🔔 通知已开启');
+  } catch (e) {
+    log(`[MUTE] error: ${e.message}`);
+    reply(sid, '⚠️ 操作失败');
+  }
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
 function showNotifyStatus(sid, msgId) {
-  const sub = getOrCreateSubscriber(sid);
-  const lines = [
-    '📡 通知设置',
-    `├ 状态: ${sub.muted ? '🔕 已静音' : '🔔 已开启'}`,
-    `├ 订阅用户: ${subscribers.length} 人`,
-    `├ 当前会话: ${currentSessionId ? currentSessionId.slice(0, 16) + '...' : '未选择'}`,
-    `└ 活跃监控: ${sessionStates.size} 个`,
-  ];
-  reply(sid, lines.join('\n'));
+  try {
+    const sub = getOrCreateSubscriber(sid);
+    const lines = [
+      '📡 通知设置',
+      `├ 状态: ${sub.muted ? '🔕 已静音' : '🔔 已开启'}`,
+      `├ 订阅用户: ${subscribers.length} 人`,
+      `├ 当前会话: ${currentSessionId ? currentSessionId.slice(0, 16) + '...' : '未选择'}`,
+      `└ 活跃监控: ${sessionStates.size} 个`,
+    ];
+    reply(sid, lines.join('\n'));
+  } catch (e) {
+    log(`[NOTIFY] error: ${e.message}`);
+    reply(sid, '⚠️ 获取通知状态失败');
+  }
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
@@ -315,7 +327,7 @@ async function cancelCurrent(sid, msgId) {
     return;
   }
   try {
-    await fetch(`${SERVER}/session/${target}/abort`, {
+    await fetch(`${SERVER}/session/${encodeURIComponent(target)}/abort`, {
       method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000),
     });
     reply(sid, '⏹️ 已发送取消请求');
@@ -467,7 +479,7 @@ async function handleWorkspace(sid, arg, msgId) {
   if (!arg) {
     const lines = ['📂 工作区', '─'.repeat(16)];
     list.forEach((w, i) => {
-      const mark = w.path === currentWorkspace?.path ? ' ◀' : '';
+      const mark = wsPathEqual(w.path, currentWorkspace?.path) ? ' ◀' : '';
       const shortPath = w.path.length > 50 ? '...' + w.path.slice(-47) : w.path;
       lines.push(`${i + 1}. ${w.name}${mark}`);
       lines.push(`   ${shortPath}`);
@@ -482,12 +494,17 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
-  const addMatch = arg.match(/^add\s+(.+?)(?:\s+(.+))?$/i);
+  const addMatch = arg.match(/^add\s+(.+?)(?:\s+(\S+))?$/i);
   if (addMatch) {
-    const dirPath = addMatch[1].trim();
+    let dirPath = addMatch[1].trim();
     let name = addMatch[2]?.trim() || basename(dirPath);
-    const existingPaths = new Set(list.map(w => w.path));
-    if (existingPaths.has(dirPath)) {
+    if (!dirPath || /[\x00-\x1f]/.test(dirPath)) {
+      reply(sid, '⚠️ 路径无效（包含非法字符）');
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    try { dirPath = resolve(dirPath); } catch { /* keep original if resolution fails */ }
+    if (list.some(w => wsPathEqual(w.path, dirPath))) {
       reply(sid, `⚠️ 工作区已存在: ${name} (${dirPath})`);
       sendResponse(msgId, { stopReason: 'end_turn' });
       return;
@@ -509,7 +526,7 @@ async function handleWorkspace(sid, arg, msgId) {
     }
     const removed = list.splice(idx, 1)[0];
     saveWorkspaces(list);
-    if (currentWorkspace?.path === removed.path) {
+    if (wsPathEqual(currentWorkspace?.path, removed.path)) {
       currentWorkspace = list[0] || { name: '主项目', path: WORK_DIR };
       saveCurrentWorkspace();
     }
@@ -534,53 +551,100 @@ async function handleWorkspace(sid, arg, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+function discoverWorkspacesViaDb() {
+  try {
+    const out = execSync(
+      'opencode db "SELECT id, worktree, sandboxes FROM project WHERE id != \'global\'" --format json',
+      { encoding: 'utf8', timeout: 15000 }
+    );
+    const projects = JSON.parse(out.trim());
+    if (!Array.isArray(projects)) return [];
+    const dirs = new Set();
+    for (const p of projects) {
+      if (p.worktree && p.worktree !== '/') {
+        dirs.add(p.worktree.replace(/\//g, '\\'));
+      }
+      if (p.sandboxes) {
+        try {
+          const boxes = JSON.parse(p.sandboxes);
+          if (Array.isArray(boxes)) {
+            for (const s of boxes) {
+              if (s) dirs.add(s.replace(/\//g, '\\'));
+            }
+          }
+        } catch (e) { log(`[SD] parse sandboxes JSON failed: ${e.message}`); }
+      }
+    }
+    return [...dirs];
+  } catch (err) {
+    log(`[SD] db query failed: ${err.message}`);
+    return [];
+  }
+}
+
 async function handleSyncDir(sid, msgId) {
   try {
     const existing = loadWorkspaces();
-    const existingPaths = new Set(existing.map(w => w.path));
+    const existingPaths = new Set(existing.map(w => w.path.toLowerCase()));
     const added = [];
     const skipped = [];
 
-    // Try project API first
-    const projects = await apiFetch('/project').catch(() => null);
-    if (Array.isArray(projects) && projects.length > 0) {
-      for (const p of projects) {
-        try {
-          const dirs = await apiFetch(`/project/${encodeURIComponent(p.id)}/directories`);
-          if (!Array.isArray(dirs)) continue;
-          for (const d of dirs) {
-            const dirPath = d.directory;
-            if (!dirPath) continue;
-            if (existingPaths.has(dirPath)) {
+    function isExisting(p) { return existingPaths.has(p.toLowerCase()); }
+    function markExisting(p) { existingPaths.add(p.toLowerCase()); }
+
+    const dbDirs = discoverWorkspacesViaDb();
+    if (dbDirs.length > 0) {
+      for (const dirPath of dbDirs) {
+        if (isExisting(dirPath)) {
+          skipped.push({ name: makeWsName(dirPath, existing), path: dirPath });
+          continue;
+        }
+        const name = makeWsName(dirPath, existing);
+        existing.push({ name, path: dirPath });
+        added.push({ name, path: dirPath });
+        markExisting(dirPath);
+      }
+    } else {
+      log('[SD] db returned no directories, trying HTTP API fallback...');
+      const projects = await apiFetch('/project').catch(() => null);
+      if (Array.isArray(projects) && projects.length > 0) {
+        for (const p of projects) {
+          try {
+            const dirs = await apiFetch(`/project/${encodeURIComponent(p.id)}/directories`);
+            if (!Array.isArray(dirs)) continue;
+            for (const d of dirs) {
+              const dirPath = d.directory;
+              if (!dirPath) continue;
+              if (isExisting(dirPath)) {
+                skipped.push({ name: basename(dirPath), path: dirPath });
+                continue;
+              }
+              const name = makeWsName(dirPath, existing);
+              existing.push({ name, path: dirPath });
+              added.push({ name, path: dirPath });
+              markExisting(dirPath);
+            }
+          } catch {
+            log(`[SD] skip project ${p.id?.slice(0, 16)}: directories endpoint failed`);
+          }
+        }
+      }
+
+      if (added.length === 0) {
+        log('[SD] project API yielded no directories, trying session fallback...');
+        const sessions = await apiFetch('/session').catch(() => null);
+        if (Array.isArray(sessions)) {
+          const dirs = [...new Set(sessions.map(s => s.directory).filter(Boolean))];
+          for (const dirPath of dirs) {
+            if (isExisting(dirPath)) {
               skipped.push({ name: basename(dirPath), path: dirPath });
               continue;
             }
             const name = makeWsName(dirPath, existing);
             existing.push({ name, path: dirPath });
             added.push({ name, path: dirPath });
-            existingPaths.add(dirPath);
+            markExisting(dirPath);
           }
-        } catch {
-          log(`[SD] skip project ${p.id?.slice(0, 16)}: directories endpoint failed`);
-        }
-      }
-    }
-
-    // Fallback: try session API (older OpenCode versions)
-    if (added.length === 0) {
-      log('[SD] project API yielded no directories, trying session fallback...');
-      const sessions = await apiFetch('/session').catch(() => null);
-      if (Array.isArray(sessions)) {
-        const dirs = [...new Set(sessions.map(s => s.directory).filter(Boolean))];
-        for (const dirPath of dirs) {
-          if (existingPaths.has(dirPath)) {
-            skipped.push({ name: basename(dirPath), path: dirPath });
-            continue;
-          }
-          const name = makeWsName(dirPath, existing);
-          existing.push({ name, path: dirPath });
-          added.push({ name, path: dirPath });
-          existingPaths.add(dirPath);
         }
       }
     }
@@ -597,9 +661,8 @@ async function handleSyncDir(sid, msgId) {
     if (skipped.length > 0) lines.push(`├ 跳过: ${skipped.map(s => s.name).join('、')}`);
     lines.push(`└ 总计: ${existing.length} 个工作区`);
     reply(sid, lines.join('\n'));
-  } catch (err) {
+    } catch (err) {
     reply(sid, `⚠️ 同步失败: ${err.message}`);
-  } finally {
     sendResponse(msgId, { stopReason: 'end_turn' });
   }
 }
@@ -621,7 +684,7 @@ async function showTaskStatus(sid, msgId) {
     for (const [id, st] of Object.entries(statusMap || {})) {
       if (st.type === 'busy') {
         hasActive = true;
-        const info = await apiFetch(`/session/${id}`).catch(() => null);
+        const info = await apiFetch(`/session/${encodeURIComponent(id)}`).catch(() => null);
         const name = info?.title || id.slice(0, 16);
         const isCurrent = id === currentSessionId ? ' ◀当前' : '';
         lines.push(`▶ ${name} — 运行中${isCurrent}`);
@@ -738,6 +801,32 @@ async function listQuestions(sid, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+function formatQuestionBody(questions) {
+  const multi = questions.length > 1;
+  let body = '';
+  if (multi) {
+    questions.forEach((qItem, idx) => {
+      const qText = qItem.question || '';
+      body += `\n\n${idx+1}. ${qText}`;
+      if (qItem.options?.length) {
+        body += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
+      }
+    });
+    body += '\n\n多个答案用逗号分隔，如：1, 2';
+  } else {
+    const qi = questions[0];
+    const q = qi.question || '';
+    const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
+    body += `\n${q}`;
+    if (opts) body += `\n${opts}`;
+    if (qi.isSecret) body += '\n🔒 答案将保密发送';
+    body += '\n回复内容，或 /ans (/answer) <内容> 提交';
+    if (opts) body += '，或发送编号选择';
+  }
+  body += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
+  return body;
+}
+
 async function listCurrentQuestion(sid, msgId) {
   if (!pendingQuestions) {
     const queued = pendingQuestionQueue.length;
@@ -758,26 +847,7 @@ async function listCurrentQuestion(sid, msgId) {
   const multi = questions.length > 1;
   let msg = multi ? `💬 待回答（共${questions.length}题）` : `💬 需要你回答`;
   if (sesLabel) msg = sesLabel + msg;
-  if (multi) {
-    questions.forEach((qItem, idx) => {
-      const qText = qItem.question || '';
-      msg += `\n\n${idx+1}. ${qText}`;
-      if (qItem.options?.length) {
-        msg += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
-      }
-    });
-    msg += '\n\n多个答案用逗号分隔，如：1, 2';
-    msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-  } else {
-    const q = qi.question || '';
-    const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
-    msg += `\n${q}`;
-    if (opts) msg += `\n${opts}`;
-    if (qi.isSecret) msg += '\n🔒 答案将保密发送';
-    msg += '\n回复内容，或 /ans (/answer) <内容> 提交';
-    if (opts) msg += '，或发送编号选择';
-    msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-  }
+  msg += formatQuestionBody(questions);
   reply(sid, msg);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -817,7 +887,7 @@ async function selectQuestion(sid, arg, msgId) {
   target.askTimestamp = ts;
   setTimeout(() => {
     if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
-  }, 300_000).unref?.();
+  },     QUESTION_AUTO_CLEAR_MS).unref?.();
   return listCurrentQuestion(sid, msgId);
 }
 
@@ -868,7 +938,7 @@ async function answerQuestion(sid, answer, msgId) {
     qData.askTimestamp = ts;
     setTimeout(() => {
       if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
-    }, 300_000).unref?.();
+    },     QUESTION_AUTO_CLEAR_MS).unref?.();
   }
 
   const targetId = currentSessionId;
@@ -982,7 +1052,7 @@ async function dequeueNextQuestion() {
     if (next.sessionID) currentSessionId = next.sessionID;
     const autoClear = setTimeout(() => {
       if (pendingQuestions?.askTimestamp === next.askTimestamp) { pendingQuestions = null; dequeueNextQuestion(); }
-    }, 300_000);
+    }, QUESTION_AUTO_CLEAR_MS);
     autoClear.unref?.();
     // Generate notification for the next question
     await fetchSessionName(next.sessionID);
@@ -992,26 +1062,7 @@ async function dequeueNextQuestion() {
     const multi = next.questions.length > 1;
     let text = (multi ? `📌 下一题（共${next.questions.length}题）` : `📌 下一题`);
     if (sesLabel) text = sesLabel + text;
-    if (multi) {
-      next.questions.forEach((qItem, idx) => {
-        const qText = qItem.question || '';
-        text += `\n\n${idx+1}. ${qText}`;
-        if (qItem.options?.length) {
-          text += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
-        }
-      });
-        text += '\n\n多个答案用逗号分隔，如：1, 2';
-        text += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-    } else {
-      const q = qi.question || '';
-      const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
-      text += `\n${q}`;
-      if (opts) text += `\n${opts}`;
-      if (qi.isSecret) text += '\n🔒 答案将保密发送';
-      text += '\n回复内容，或 /ans (/answer) <内容> 提交';
-      if (opts) text += '，或发送编号选择';
-      text += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-    }
+    text += formatQuestionBody(next.questions);
     broadcastNotification(text);
     return;
   }
@@ -1183,7 +1234,7 @@ async function forwardToAIAsync(sid, targetId, text) {
     const timeout = setTimeout(() => controller.abort(), 120000);
     let res;
     try {
-      res = await fetch(`${SERVER}/session/${targetId}/message`, {
+      res = await fetch(`${SERVER}/session/${encodeURIComponent(targetId)}/message`, {
         method: 'POST',
         headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
         body: JSON.stringify({ parts: [{ type: 'text', text }], agent: currentAgent }),
@@ -1298,7 +1349,8 @@ async function handleListSessions(msg) {
       updatedAt: s.time?.updated ? new Date(s.time.updated).toISOString() : undefined,
     }));
     sendResponse(msg.id, { sessions });
-  } catch {
+  } catch (e) {
+    log(`[ACP] session/list fetch failed: ${e.message}`);
     sendResponse(msg.id, { sessions: [] });
   }
 }
@@ -1307,7 +1359,7 @@ async function handleLoadSession(msg) {
   const sessionId = msg.params?.sessionId;
   if (!sessionId) { sendResponse(msg.id, { _meta: { error: 'sessionId required' } }); return; }
   try {
-    const data = await apiFetch(`/session/${sessionId}`);
+    const data = await apiFetch(`/session/${encodeURIComponent(sessionId)}`);
     currentSessionId = data.id || sessionId;
     saveSession(currentSessionId);
     sendResponse(msg.id, { sessionId: currentSessionId, cwd: data.directory || '', title: data.title || '',
@@ -1320,12 +1372,17 @@ async function handleLoadSession(msg) {
 async function handleCancel(msg) {
   const sid = msg.params?.sessionId || currentSessionId;
   if (sid) {
-    try { await fetch(`${SERVER}/session/${sid}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
+    try { await fetch(`${SERVER}/session/${encodeURIComponent(sid)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
   }
   sendResponse(msg.id, {});
 }
 
 /* ───────── Workspace ───────── */
+
+function wsPathEqual(a, b) {
+  if (!a || !b) return a === b;
+  try { return resolve(a).toLowerCase() === resolve(b).toLowerCase(); } catch { return a.toLowerCase() === b.toLowerCase(); }
+}
 
 function loadWorkspaces() {
   try {
@@ -1342,7 +1399,7 @@ function loadDefaultWorkspace() {
   try {
     if (existsSync(WORKSPACE_CURRENT_FILE)) {
       const saved = JSON.parse(readFileSync(WORKSPACE_CURRENT_FILE, 'utf8'));
-      const match = list.find(w => w.path === saved.path);
+      const match = list.find(w => wsPathEqual(w.path, saved.path));
       if (match) return match;
     }
   } catch {}
@@ -1402,10 +1459,10 @@ function loadSettings() {
       const data = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'));
       if (data && typeof data.cleanupDays === 'number') settings.cleanupDays = data.cleanupDays;
     }
-  } catch {}
+  } catch (e) { log(`[SETTINGS] load failed: ${e.message}`); }
 }
 function saveSettings() {
-  try { writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2)); } catch {}
+  try { writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2)); } catch (e) { log(`[SETTINGS] save failed: ${e.message}`); }
 }
 
 async function handleAutoClean(sid, arg, msgId) {
@@ -1701,7 +1758,7 @@ async function eventToNotification(type, props) {
       pendingQuestions = qData;
       setTimeout(() => {
         if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
-      }, 300_000).unref?.();
+      },     QUESTION_AUTO_CLEAR_MS).unref?.();
       log(`[EVENT] question.asked: stored ${questions.length} questions`);
       await fetchSessionName(props.sessionID);
       const sesLabel = props.sessionID ? `[${getSessionName(props.sessionID)}] ` : '';
@@ -1710,26 +1767,7 @@ async function eventToNotification(type, props) {
       const multi = questions.length > 1;
       let msg = multi ? `💬 待回答（共${questions.length}题）` : `💬 需要你回答`;
       if (sesLabel) msg = sesLabel + msg;
-      if (multi) {
-        questions.forEach((qItem, idx) => {
-          const qText = qItem.question || '';
-          msg += `\n\n${idx+1}. ${qText}`;
-          if (qItem.options?.length) {
-            msg += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
-          }
-        });
-        msg += '\n\n多个答案用逗号分隔，如：1, 2';
-        msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-      } else {
-        const q = qi.question || '';
-        const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
-        msg += `\n${q}`;
-        if (opts) msg += `\n${opts}`;
-        if (qi.isSecret) msg += '\n🔒 答案将保密发送';
-        msg += '\n回复内容，或 /ans (/answer) <内容> 提交';
-        if (opts) msg += '，或发送编号选择';
-        msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-      }
+      msg += formatQuestionBody(questions);
       return msg;
     }
     case 'permission.asked': {
@@ -1750,7 +1788,7 @@ async function eventToNotification(type, props) {
         setTimeout(() => {
           log(`[TIMER] auto-clean rid=${rid.slice(0,16)}...`);
           pendingPermissions.delete(rid);
-        }, 300_000).unref?.();
+        },     QUESTION_AUTO_CLEAR_MS).unref?.();
         // Same-session dedup: only suppress if this has NO path and session already has pending
         // (approving one typically auto-approves related requests, but path info is critical)
         if (!p) {
@@ -1848,7 +1886,7 @@ async function eventToNotification(type, props) {
 async function fetchSessionName(id) {
   if (!id || sessionNames.has(id)) return;
   try {
-    const data = await apiFetch(`/session/${id}`);
+    const data = await apiFetch(`/session/${encodeURIComponent(id)}`);
     if (data.title) sessionNames.set(id, data.title);
   } catch {}
 }
