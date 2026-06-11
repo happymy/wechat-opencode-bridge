@@ -37,6 +37,7 @@ let lastPromptSid = null;     // last wechat user who sent a prompt
 let lastPromptSessionId = null; // last session prompted
 let lastPromptText = '';      // last prompt text (for mirror suppression)
 let streamFinalized = false;  // true after finalizeStream runs (prevents double-finalize race)
+let reasoningFlushed = false; // true after reasoning separator has been pushed to WeChat
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
 const QUESTION_AUTO_CLEAR_MS = 300000; // 5min before unanswered question auto-expires
@@ -1132,6 +1133,7 @@ function startStreaming(sid, sessionId) {
   streamSessionId = sessionId;
   streamLastFlush = '';
   streamFinalized = false;
+  reasoningFlushed = false;
   log(`[STREAM] started sid=${sid.slice(0,12)} session=${sessionId.slice(0,12)}`);
   streamTimer = setInterval(() => flushStream(), STREAM_FLUSH_MS);
   streamTimer.unref?.();
@@ -1139,6 +1141,13 @@ function startStreaming(sid, sessionId) {
 
 function pushStream(chunk) {
   if (!streamSid || !chunk) return;
+  // First text delta after reasoning: flush reasoning with separator
+  if (streamReasoningBuf && !reasoningFlushed) {
+    reasoningFlushed = true;
+    const out = '┅'.repeat(16) + '\n🤔 思考过程\n' + '┅'.repeat(16) + '\n' + streamReasoningBuf
+      + '\n\n' + '━'.repeat(16) + ' 回答 ' + '━'.repeat(16) + '\n';
+    try { reply(streamSid, out); flushToWeChat(); } catch (e) {}
+  }
   // Mirror suppression: skip text that matches the user's own prompt
   if (lastPromptText && streamBuf.length < lastPromptText.length) {
     const candidate = streamBuf + chunk;
@@ -1159,29 +1168,41 @@ function pushReasoning(chunk) {
 }
 
 function flushStream() {
-  // No-op: all output is accumulated and sent by finalizeStream
-  // with proper separators between reasoning and answer text.
-  // Real-time streaming is not used for WeChat.
+  if (!streamSid || !streamBuf) return;
+  const newText = streamBuf.slice(streamLastFlush.length);
+  if (!newText) return;
+  const trimmed = newText.trim();
+  if (!trimmed || trimmed.length < 3) return;
+  streamLastFlush = streamBuf;
+  log(`[STREAM] flush ${trimmed.length} chars to ${streamSid.slice(0,12)}`);
+  try {
+    reply(streamSid, trimmed);
+    flushToWeChat();
+  } catch (e) {
+    log(`[STREAM] flush error: ${e.message}`);
+  }
 }
 
 function finalizeStream() {
   if (!streamSid || streamFinalized) return;
 
-  let output = '';
-  if (streamReasoningBuf) {
-    output += '┅'.repeat(16) + '\n🤔 思考过程\n' + '┅'.repeat(16) + '\n' + streamReasoningBuf;
-  }
-  if (streamBuf) {
-    if (output) output += '\n\n' + '━'.repeat(16) + ' 回答 ' + '━'.repeat(16) + '\n';
-    output += streamBuf;
+  // Reasoning never flushed (reasoning-only response, no text parts)
+  if (streamReasoningBuf && !reasoningFlushed) {
+    const out = '┅'.repeat(16) + '\n🤔 思考过程\n' + '┅'.repeat(16) + '\n' + streamReasoningBuf;
+    try { reply(streamSid, out); flushToWeChat(); } catch (e) {}
   }
 
-  if (output) {
-    try {
-      reply(streamSid, output);
-      flushToWeChat();
-    } catch (e) {
-      log(`[STREAM] final flush error: ${e.message}`);
+  // Flush any remaining unflushed text
+  if (streamBuf) {
+    const remainder = streamBuf.slice(streamLastFlush.length);
+    if (remainder) {
+      streamLastFlush = streamBuf;
+      try {
+        reply(streamSid, remainder);
+        flushToWeChat();
+      } catch (e) {
+        log(`[STREAM] final flush error: ${e.message}`);
+      }
     }
   }
 
@@ -1228,6 +1249,7 @@ function stopStreaming() {
   streamSessionId = null;
   streamLastFlush = '';
   lastPromptText = '';
+  reasoningFlushed = false;
 }
 
 /* ───────── AI Prompt Forwarding ───────── */
