@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
@@ -188,6 +188,8 @@ async function handleCommand(sid, text, msgId) {
       return selectQuestion(sid, arg, msgId);
     case '/autoclean': case '/ac':
       return handleAutoClean(sid, arg, msgId);
+    case '/sd':
+      return handleSyncDir(sid, msgId);
     case '/testnotify':
       return testNotify(sid, msgId);
     case '/help': case '/h':
@@ -355,6 +357,7 @@ async function switchAgent(sid, agent, msgId) {
 }
 
 async function listPermissions(sid, msgId) {
+  await syncPermissionsFromServer();
   if (pendingPermissions.size === 0) {
     reply(sid, '📋 当前没有待处理的权限请求');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -421,7 +424,7 @@ async function handlePermissionReply(sid, action, arg, msgId) {
     await apiFetch(`/permission/${encodeURIComponent(targetRid)}/reply`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reply: action, message: 'via wechat-adapter' }),
+      body: JSON.stringify({ reply: action, message: `via wechat-adapter (sid=${sid.slice(0,12)})` }),
     });
     const info = pendingPermissions.get(targetRid);
     const labels = { once: '✅ 已批准', always: '✅ 已信任', reject: '❌ 已拒绝' };
@@ -491,6 +494,49 @@ async function handleWorkspace(sid, arg, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+async function handleSyncDir(sid, msgId) {
+  try {
+    const sessions = await apiFetch('/session');
+    if (!Array.isArray(sessions) || sessions.length === 0) {
+      reply(sid, '⚠️ OpenCode 暂无会话，无法同步工作区');
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    const dirs = [...new Set(sessions.map(s => s.directory).filter(Boolean))];
+    if (dirs.length === 0) {
+      reply(sid, '⚠️ 所有会话均无目录信息，无法同步');
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    const existing = loadWorkspaces();
+    const existingNames = new Set(existing.map(w => w.name));
+    const existingPaths = new Set(existing.map(w => w.path));
+    const added = [];
+    const skipped = [];
+    for (const dir of dirs) {
+      const name = basename(dir);
+      if (existingNames.has(name) || existingPaths.has(dir)) {
+        skipped.push({ name, path: dir });
+      } else {
+        existing.push({ name, path: dir });
+        added.push({ name, path: dir });
+      }
+    }
+    saveWorkspaces(existing);
+    const lines = ['📂 工作区同步完成'];
+    lines.push(`├ 会话数: ${sessions.length}`);
+    lines.push(`├ 目录数: ${dirs.length}`);
+    if (added.length > 0) lines.push(`├ 新增: ${added.map(a => a.name).join('、')}`);
+    if (skipped.length > 0) lines.push(`├ 跳过: ${skipped.map(s => s.name).join('、')}`);
+    lines.push(`└ 总计: ${existing.length} 个工作区`);
+    reply(sid, lines.join('\n'));
+  } catch (err) {
+    reply(sid, `⚠️ 同步失败: ${err.message}`);
+  } finally {
+    sendResponse(msgId, { stopReason: 'end_turn' });
+  }
+}
+
 async function showTaskStatus(sid, msgId) {
   try {
     const statusMap = await apiFetch('/session/status');
@@ -541,6 +587,7 @@ function showHelp(sid, msgId) {
     '',
     '── 工作区与任务 ──',
     '/workspace (/ws)         查看/切换工作区',
+    '/sd                      从 OpenCode 会话同步工作区列表',
     '/status (/st)            查看任务运行状态',
     '/cancel (/c)             取消当前AI执行',
     '',
@@ -756,12 +803,12 @@ async function answerQuestion(sid, answer, msgId) {
       reply(sid, '⚠️ 没有选中的会话，无法提交答案');
       if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
       pendingQuestions = null;
+      dequeueNextQuestion();
       return;
     }
     if (qData.sessionID && qData.sessionID !== targetId) {
-      reply(sid, '⚠️ 当前会话已切换，无法回答之前的问题');
+      reply(sid, `⚠️ 该问题属于会话「${getSessionName(qData.sessionID)}」，请用 /switch 切换到该会话后回答`);
       if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
-      pendingQuestions = null;
       return;
     }
   }
@@ -800,9 +847,9 @@ async function answerQuestion(sid, answer, msgId) {
     answers.push(answerText);
   }
 
+  const combined = answers.join(', ');
   pendingQuestions = null;
   await dequeueNextQuestion();
-  const combined = answers.join(', ');
   log(`[ANSWER] sid=${sid.slice(0,12)} answers=[${combined}]`);
   // Start streaming for the AI's response — use question's own sessionID for cross-session replies
   startStreaming(sid, qData.sessionID || targetId);
@@ -819,20 +866,32 @@ async function answerQuestion(sid, answer, msgId) {
 
 async function answerViaQuestionApi(sid, targetId, answers, requestID) {
   try {
-    const res = await fetch(`${SERVER}/question/${requestID}/reply`, {
-      method: 'POST',
-      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answers: answers.map(a => [a]) }),
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000);
+    let res;
+    try {
+      res = await fetch(`${SERVER}/question/${requestID}/reply`, {
+        method: 'POST',
+        headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answers: answers.map(a => [a]) }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
     if (!res.ok) {
+      stopStreaming();
       const errText = await res.text();
       reply(sid, `⚠️ 回答提交失败 (${res.status}): ${errText.slice(0, 100)}`);
       await drainPendingNotifications();
       flushToWeChat();
       return;
     }
+    // Consume response body to release connection
+    await res.text();
     log(`[ANSWER] reply sent via question API, waiting for SSE response...`);
   } catch (err) {
+    stopStreaming();
     reply(sid, `❌ 回答提交失败: ${err.message}`);
     await drainPendingNotifications();
     flushToWeChat();
@@ -840,6 +899,7 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
 }
 
 async function dequeueNextQuestion() {
+  if (pendingQuestions) { log('[DEQUEUE] skip: already a pending question'); return; }
   while (pendingQuestionQueue.length > 0) {
     const next = pendingQuestionQueue.shift();
     pendingQuestions = next;
@@ -852,7 +912,7 @@ async function dequeueNextQuestion() {
     await fetchSessionName(next.sessionID);
     const sesLabel = next.sessionID ? `[${getSessionName(next.sessionID)}] ` : '';
     const qi = next.questions?.[0];
-    if (!qi) continue;
+    if (!qi) { pendingQuestions = null; clearTimeout(autoClear); continue; }
     const multi = next.questions.length > 1;
     let text = (multi ? `📌 下一题（共${next.questions.length}题）` : `📌 下一题`);
     if (sesLabel) text = sesLabel + text;
@@ -915,6 +975,7 @@ async function skipQuestion(sid, arg, msgId) {
       await fetch(`${SERVER}/question/${requestID}/reject`, {
         method: 'POST',
         headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
       });
       log(`[SKIP] rejected question ${requestID.slice(0,16)}`);
     } catch (err) {
@@ -982,7 +1043,18 @@ function flushStream() {
 
 function finalizeStream() {
   if (!streamSid || streamFinalized) return;
-  flushStream();
+  if (streamBuf) {
+    const newText = streamBuf.slice(streamLastFlush.length);
+    if (newText) {
+      streamLastFlush = streamBuf;
+      try {
+        reply(streamSid, newText);
+        flushToWeChat();
+      } catch (e) {
+        log(`[STREAM] final flush error: ${e.message}`);
+      }
+    }
+  }
   streamFinalized = true;
   log(`[STREAM] finalized for ${streamSid.slice(0,12)}`);
   disarmWorkingNotice();
@@ -1033,13 +1105,17 @@ async function forwardToAIAsync(sid, targetId, text) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 120000);
-    const res = await fetch(`${SERVER}/session/${targetId}/message`, {
-      method: 'POST',
-      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ parts: [{ type: 'text', text }], agent: currentAgent }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    let res;
+    try {
+      res = await fetch(`${SERVER}/session/${targetId}/message`, {
+        method: 'POST',
+        headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parts: [{ type: 'text', text }], agent: currentAgent }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!res.ok) {
       stopStreaming();
@@ -1203,6 +1279,10 @@ function saveCurrentWorkspace() {
 
 function getWorkspaceDir() {
   return currentWorkspace?.path || WORK_DIR;
+}
+
+function saveWorkspaces(list) {
+  try { writeFileSync(WORKSPACES_FILE, JSON.stringify(list, null, 2)); } catch {}
 }
 
 /* ───────── Session Persistence ───────── */
@@ -1390,6 +1470,7 @@ function broadcastNotification(text) {
       proactiveTimer = null;
       drainPendingNotifications(true).catch(e => log(`[TIMER] drain error: ${e.message}`));
     }, 15000);
+    proactiveTimer.unref?.();
     log(`[BROADCAST] proactive timer set for 15s`);
   }
 }
@@ -1593,7 +1674,7 @@ async function eventToNotification(type, props) {
         setTimeout(() => {
           log(`[TIMER] auto-clean rid=${rid.slice(0,16)}...`);
           pendingPermissions.delete(rid);
-        }, 300_000);
+        }, 300_000).unref?.();
         // Same-session dedup: only suppress if this has NO path and session already has pending
         // (approving one typically auto-approves related requests, but path info is critical)
         if (!p) {
@@ -1717,11 +1798,15 @@ async function connectSSE() {
       log(`[SSE] URL: ${eventUrl}`);
       const abortControl = new AbortController();
       const connTimer = setTimeout(() => abortControl.abort(), 15000);
-      const response = await fetch(eventUrl, {
-        headers: { Authorization: AUTH, 'x-opencode-directory': getWorkspaceDir() },
-        signal: abortControl.signal,
-      });
-      clearTimeout(connTimer);
+      let response;
+      try {
+        response = await fetch(eventUrl, {
+          headers: { Authorization: AUTH, 'x-opencode-directory': getWorkspaceDir() },
+          signal: abortControl.signal,
+        });
+      } finally {
+        clearTimeout(connTimer);
+      }
       if (!response.ok) throw new Error(`SSE ${response.status}`);
       if (!response.body) throw new Error('SSE body is null');
       sseReader = null;
@@ -1765,7 +1850,7 @@ async function connectSSE() {
                 }
                 if (eventId) {
                   recentEventIds.add(eventId);
-                  setTimeout(() => recentEventIds.delete(eventId), 10000);
+                  setTimeout(() => recentEventIds.delete(eventId), 10000).unref?.();
                 }
 
                 if (props.id) props.requestID ??= props.id;
@@ -1780,12 +1865,16 @@ async function connectSSE() {
                 // Handle session tracking side-effects before notification
                 await handleSseSideEffect(eventType, props).catch(e => log(`[SSE] side-effect error: ${e.message}`));
 
-                const text = await eventToNotification(eventType, props);
-                if (text) {
-                  log(`[SSE] notification generated: ${text.slice(0, 80).replace(/\n/g,'\\n')}`);
-                  broadcastNotification(text);
-                } else {
-                  log(`[SSE] eventToNotification returned null (suppressed)`);
+                try {
+                  const text = await eventToNotification(eventType, props);
+                  if (text) {
+                    log(`[SSE] notification generated: ${text.slice(0, 80).replace(/\n/g,'\\n')}`);
+                    broadcastNotification(text);
+                  } else {
+                    log(`[SSE] eventToNotification returned null (suppressed)`);
+                  }
+                } catch (e) {
+                  log(`[SSE] eventToNotification error: ${e.message}`);
                 }
               } catch (e) {
                 log(`[SSE] Parse error: ${e.message}`);
@@ -1796,7 +1885,7 @@ async function connectSSE() {
           } else if (trimmed.startsWith('event:')) {
             currentEvent = trimmed.slice(6).trim();
           } else if (trimmed.startsWith('data:')) {
-            currentData += trimmed.slice(5).trim() + '\n';
+            currentData += trimmed.slice(5).replace(/^ /, '') + '\n';
           }
         }
       }
