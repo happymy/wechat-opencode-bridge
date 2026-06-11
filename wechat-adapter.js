@@ -607,8 +607,7 @@ async function listQuestions(sid, msgId) {
     }
   });
   lines.push('─'.repeat(20));
-  lines.push('/ans (/answer) <内容|编号>  回答（默认当前第1题）');
-  lines.push('/ans (/answer) <编号> <内容>  回答指定编号问题');
+  lines.push('/ans (/answer) [问题编号] <内容>  回答指定编号问题，为空则默认第1题');
   lines.push('/qshow (/qc, /qcurrent)      查看当前问题详情');
   lines.push('/qselect (/qs, /qsel) <编号>  选中指定问题为当前活跃');
   lines.push('/skip (/pass, /ps) [编号]     跳过指定问题');
