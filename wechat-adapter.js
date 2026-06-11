@@ -28,6 +28,7 @@ let draining = false;
 
 // Streaming output state
 let streamBuf = '';           // accumulated stream text
+let streamReasoningBuf = '';  // accumulated reasoning text
 let streamSid = null;         // wechat subscriber sid to send streamed output to
 let streamSessionId = null;   // session being streamed
 let streamTimer = null;       // periodic flush timer
@@ -1126,6 +1127,7 @@ const STREAM_FLUSH_MS = 2000;
 function startStreaming(sid, sessionId) {
   stopStreaming();
   streamBuf = '';
+  streamReasoningBuf = '';
   streamSid = sid;
   streamSessionId = sessionId;
   streamLastFlush = '';
@@ -1142,7 +1144,6 @@ function pushStream(chunk) {
     const candidate = streamBuf + chunk;
     if (lastPromptText.startsWith(candidate) || candidate.startsWith(lastPromptText)) {
       streamBuf = candidate;
-      // Once we've accumulated past the prompt, advance lastFlush past the prompt prefix
       if (streamBuf.length >= lastPromptText.length) {
         streamLastFlush = lastPromptText;
       }
@@ -1152,37 +1153,38 @@ function pushStream(chunk) {
   streamBuf += chunk;
 }
 
+function pushReasoning(chunk) {
+  if (!streamSid || !chunk) return;
+  streamReasoningBuf += chunk;
+}
+
 function flushStream() {
-  if (!streamSid || !streamBuf) return;
-  const newText = streamBuf.slice(streamLastFlush.length);
-  if (!newText) return;
-  // Only flush if we have meaningful new content
-  const trimmed = newText.trim();
-  if (!trimmed || trimmed.length < 3) return;
-  streamLastFlush = streamBuf;
-  log(`[STREAM] flush ${trimmed.length} chars to ${streamSid.slice(0,12)}`);
-  try {
-    reply(streamSid, trimmed);
-    flushToWeChat();
-  } catch (e) {
-    log(`[STREAM] flush error: ${e.message}`);
-  }
+  // No-op: all output is accumulated and sent by finalizeStream
+  // with proper separators between reasoning and answer text.
+  // Real-time streaming is not used for WeChat.
 }
 
 function finalizeStream() {
   if (!streamSid || streamFinalized) return;
+
+  let output = '';
+  if (streamReasoningBuf) {
+    output += '┅'.repeat(16) + '\n🤔 思考过程\n' + '┅'.repeat(16) + '\n' + streamReasoningBuf;
+  }
   if (streamBuf) {
-    const newText = streamBuf.slice(streamLastFlush.length);
-    if (newText) {
-      streamLastFlush = streamBuf;
-      try {
-        reply(streamSid, newText);
-        flushToWeChat();
-      } catch (e) {
-        log(`[STREAM] final flush error: ${e.message}`);
-      }
+    if (output) output += '\n\n' + '━'.repeat(16) + ' 回答 ' + '━'.repeat(16) + '\n';
+    output += streamBuf;
+  }
+
+  if (output) {
+    try {
+      reply(streamSid, output);
+      flushToWeChat();
+    } catch (e) {
+      log(`[STREAM] final flush error: ${e.message}`);
     }
   }
+
   streamFinalized = true;
   log(`[STREAM] finalized for ${streamSid.slice(0,12)}`);
   disarmWorkingNotice();
@@ -1221,6 +1223,7 @@ function stopStreaming() {
     streamTimer = null;
   }
   streamBuf = '';
+  streamReasoningBuf = '';
   streamSid = null;
   streamSessionId = null;
   streamLastFlush = '';
@@ -1877,10 +1880,16 @@ async function eventToNotification(type, props) {
     case 'message.part.updated': {
       const psid = props.sessionID;
       if (psid) updateSessionState(psid, { lastActivity: Date.now() });
-      // Route streaming text to the active wechat prompt source
       if (psid && psid === streamSessionId) {
+        const partType = props.partType || props.part?.type || '';
+        const isReasoning = partType === 'reasoning' || partType === 'step-start';
         const delta = props.delta || props.part?.text || '';
-        if (delta) pushStream(delta);
+        if (!delta) return null;
+        if (isReasoning) {
+          pushReasoning(delta);
+        } else {
+          pushStream(delta);
+        }
       }
       return null;
     }
