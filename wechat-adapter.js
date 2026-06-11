@@ -22,7 +22,22 @@ let subscribers = [];
 let sessionStates = new Map();
 let pendingNotifications = [];
 let pendingPermissions = new Map();
+let pendingQuestions = null; // { sessionID, questions: [...], askTimestamp }
 let draining = false;
+
+// Streaming output state
+let streamBuf = '';           // accumulated stream text
+let streamSid = null;         // wechat subscriber sid to send streamed output to
+let streamSessionId = null;   // session being streamed
+let streamTimer = null;       // periodic flush timer
+let streamLastFlush = '';     // last flushed text (for dedup)
+let lastPromptSid = null;     // last wechat user who sent a prompt
+let lastPromptSessionId = null; // last session prompted
+let lastPromptText = '';      // last prompt text (for mirror suppression)
+let streamFinalized = false;  // true after finalizeStream runs (prevents double-finalize race)
+let workingTimer = null;      // "still working" notice timer
+const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
+let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 
 /* ───────── Logging ───────── */
 
@@ -89,6 +104,14 @@ async function handlePrompt(msg) {
 
     await drainPendingNotifications();
 
+    // If AI is waiting for an answer, route non-command text as answer
+    // Session check: only enforce if sessionID is known (some SSE events omit it)
+    if (pendingQuestions && !text.startsWith('/') && (!pendingQuestions.sessionID || pendingQuestions.sessionID === currentSessionId)) {
+      log(`[PROMPT] pending question, routing as answer`);
+      await answerQuestion(sid, text, msg.id);
+      return;
+    }
+
     if (text.startsWith('/')) {
       log(`[PROMPT] routing to handleCommand`);
       await handleCommand(sid, text, msg.id);
@@ -101,6 +124,13 @@ async function handlePrompt(msg) {
       sendResponse(msg.id, { stopReason: 'end_turn' });
       return;
     }
+
+    // Record prompt source for streaming output routing
+    lastPromptSid = sid;
+    lastPromptSessionId = targetId;
+    startStreaming(sid, targetId);
+    lastPromptText = text;
+    armWorkingNotice(sid);
 
     reply(sid, '⏳ 思考中...');
     sendResponse(msg.id, { stopReason: 'end_turn' });
@@ -146,6 +176,16 @@ async function handleCommand(sid, text, msgId) {
       return handlePermissionReply(sid, 'reject', arg, msgId);
     case '/trust': case '/t':
       return handlePermissionReply(sid, 'always', arg, msgId);
+    case '/answer': case '/ans':
+      return answerQuestion(sid, arg, msgId);
+    case '/skip': case '/pass': case '/ps':
+      return skipQuestion(sid, arg, msgId);
+    case '/qlist': case '/ql': case '/questions':
+      return listQuestions(sid, msgId);
+    case '/qshow': case '/qc': case '/qcurrent':
+      return listCurrentQuestion(sid, msgId);
+    case '/qs': case '/qsel': case '/qselect':
+      return selectQuestion(sid, arg, msgId);
     case '/autoclean': case '/ac':
       return handleAutoClean(sid, arg, msgId);
     case '/testnotify':
@@ -200,6 +240,8 @@ async function listSessions(sid, msgId) {
 }
 
 async function switchSession(sid, arg, msgId) {
+  stopStreaming();
+  disarmWorkingNotice();
   if (!arg) {
     reply(sid, '用法: /switch <编号|会话ID>\n先用 /list 查看会话列表');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -263,6 +305,7 @@ function showNotifyStatus(sid, msgId) {
 }
 
 async function cancelCurrent(sid, msgId) {
+  stopStreaming();
   const target = currentSessionId;
   if (!target) {
     reply(sid, '⚠️ 没有选中的会话');
@@ -281,6 +324,8 @@ async function cancelCurrent(sid, msgId) {
 }
 
 async function newSession(sid, title, msgId) {
+  stopStreaming();
+  disarmWorkingNotice();
   if (!title) {
     reply(sid, '用法: /new <会话名>\n示例: /new 修复登录bug');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -316,14 +361,19 @@ async function listPermissions(sid, msgId) {
     return;
   }
   const entries = [...pendingPermissions.entries()];
+  // Fetch all session names first
+  const sesIds = [...new Set(entries.map(([,info]) => info.sessionID).filter(Boolean))];
+  await Promise.all(sesIds.map(fetchSessionName));
   const lines = [`📋 待审批权限 (${entries.length}个)`];
   entries.forEach(([rid, info], i) => {
     const ago = Math.round((Date.now() - info.ts) / 1000);
-    const pathInfo = info.patterns ? ` | ${info.patterns.slice(0, 60)}` : '';
-    lines.push(`#${i + 1} ${info.permission}${pathInfo} | ${rid.slice(0, 16)}... | ${ago}秒前`);
+    const sesLabel = info.sessionID ? `[${getSessionName(info.sessionID)}]` : '';
+    const pathInfo = info.patterns ? `\n${info.patterns.slice(0, 80)}` : '';
+    lines.push(`#${i+1}${sesLabel} ${info.permission}${pathInfo}`);
+    lines.push(`${rid.slice(0,16)}... ${ago}秒前`);
   });
   lines.push('');
-  lines.push('/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号|requestID> 不输入编号，默认为#1');
+  lines.push('/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号>');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -432,8 +482,11 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
+  stopStreaming();
+  disarmWorkingNotice();
   currentWorkspace = list[num - 1];
   saveCurrentWorkspace();
+  restartSSE();
   reply(sid, `✅ 已切换到工作区「${currentWorkspace.name}」\n${currentWorkspace.path}\n使用 /new <会话名> 在该工作区创建会话`);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
@@ -473,6 +526,13 @@ function showHelp(sid, msgId) {
     '/plan (/pl)              切换到 plan 模式',
     '/build (/bu)             切换到 build 模式',
     '',
+    '── 问题回答 ──',
+    '/answer (/ans) [问题编号] <内容> 回答AI提问，可用编号指定问题，为空则默认第1题',
+    '/skip (/pass, /ps) [编号]  跳过指定问题（默认当前）',
+    '/qlist (/ql, /questions)   查看所有待回答问题',
+    '/qshow (/qc, /qcurrent)    显示当前问题的完整内容',
+    '/qselect (/qs, /qsel) <编号>  选中指定问题为当前活跃',
+    '',
     '── 权限审批 ──',
     '/allow (/a) [编号|ID]    批准权限请求',
     '/deny (/d) [编号|ID]     拒绝权限请求',
@@ -509,6 +569,464 @@ async function testNotify(sid, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+/* ───────── Question/Answer Handling ───────── */
+
+function getAllQuestions() {
+  const all = [];
+  if (pendingQuestions) all.push(pendingQuestions);
+  for (const q of pendingQuestionQueue) all.push(q);
+  return all;
+}
+
+async function listQuestions(sid, msgId) {
+  const all = getAllQuestions();
+  if (all.length === 0) {
+    reply(sid, '📋 当前没有待回答问题');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  // Fetch session names for all questions
+  for (const q of all) {
+    if (q.sessionID) await fetchSessionName(q.sessionID);
+  }
+  const lines = [`📋 待回答问题（${all.length}个）`];
+  lines.push('─'.repeat(20));
+  all.forEach((q, idx) => {
+    const num = idx + 1;
+    const active = idx === 0 && pendingQuestions ? ' ◀当前' : '';
+    const sesName = q.sessionID ? getSessionName(q.sessionID) : '?';
+    const qi = q.questions?.[0];
+    const qBrief = qi?.question?.slice(0, 40) || '(无描述)';
+    lines.push(`${num}. [${sesName}]${active}`);
+    lines.push(`   ${qBrief}`);
+    if (qi?.options?.length) {
+      lines.push('   ' + qi.options.slice(0, 6).map((o, j) => `${j+1}.${o.label}`).join(' '));
+    }
+    if (q.questions?.length > 1) {
+      lines.push(`   （共${q.questions.length}小题）`);
+    }
+  });
+  lines.push('─'.repeat(20));
+  lines.push('/ans (/answer) [问题编号] <内容>  回答指定编号问题，为空则默认第1题');
+  lines.push('/qshow (/qc, /qcurrent)      查看当前问题详情');
+  lines.push('/qselect (/qs, /qsel) <编号>  选中指定问题为当前活跃');
+  lines.push('/skip (/pass, /ps) [编号]     跳过指定问题');
+  reply(sid, lines.join('\n'));
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function listCurrentQuestion(sid, msgId) {
+  if (!pendingQuestions) {
+    const queued = pendingQuestionQueue.length;
+    if (queued > 0) {
+      reply(sid, `📌 当前无活跃问题，排队中 ${queued} 题，/qlist (/ql, /questions) 查看，/qselect (/qs, /qsel) <编号> 切换`);
+    } else {
+      reply(sid, '📋 当前没有待回答问题');
+    }
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const qData = pendingQuestions;
+  const questions = qData.questions || [];
+  const qi = questions[0];
+  if (!qi) { reply(sid, '💬 问题无详情'); sendResponse(msgId, { stopReason: 'end_turn' }); return; }
+  await fetchSessionName(qData.sessionID);
+  const sesLabel = qData.sessionID ? `[${getSessionName(qData.sessionID)}] ` : '';
+  const multi = questions.length > 1;
+  let msg = multi ? `💬 待回答（共${questions.length}题）` : `💬 需要你回答`;
+  if (sesLabel) msg = sesLabel + msg;
+  if (multi) {
+    questions.forEach((qItem, idx) => {
+      const qText = qItem.question || '';
+      msg += `\n\n${idx+1}. ${qText}`;
+      if (qItem.options?.length) {
+        msg += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
+      }
+    });
+    msg += '\n\n多个答案用逗号分隔，如：1, 2';
+    msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
+  } else {
+    const q = qi.question || '';
+    const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
+    msg += `\n${q}`;
+    if (opts) msg += `\n${opts}`;
+    if (qi.isSecret) msg += '\n🔒 答案将保密发送';
+    msg += '\n回复内容，或 /ans (/answer) <内容> 提交';
+    if (opts) msg += '，或发送编号选择';
+    msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
+  }
+  reply(sid, msg);
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function selectQuestion(sid, arg, msgId) {
+  const all = getAllQuestions();
+  if (all.length === 0) {
+    reply(sid, '📋 当前没有待回答问题');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const idx = parseInt(arg?.trim(), 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= all.length) {
+    reply(sid, `⚠️ 编号无效 (1-${all.length})`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  // Already current
+  if (idx === 0 && pendingQuestions) {
+    return listCurrentQuestion(sid, msgId);
+  }
+  const target = pendingQuestionQueue.splice(idx - (pendingQuestions ? 1 : 0), 1)[0];
+  if (!target) {
+    reply(sid, '⚠️ 该问题不存在');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  // Push current back to queue head
+  if (pendingQuestions) {
+    pendingQuestionQueue.unshift(pendingQuestions);
+  }
+  pendingQuestions = target;
+  // Auto-follow the question's session for cross-session answers
+  if (target.sessionID) currentSessionId = target.sessionID;
+  // Reset auto-clear
+  const ts = Date.now();
+  target.askTimestamp = ts;
+  setTimeout(() => {
+    if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
+  }, 300_000).unref?.();
+  return listCurrentQuestion(sid, msgId);
+}
+
+async function answerQuestion(sid, answer, msgId) {
+  const all = getAllQuestions();
+  if (all.length === 0) {
+    reply(sid, '⚠️ 当前没有待回答的问题');
+    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  // Parse "[N] <content>" — leading number means question index
+  let qIdx = 0;
+  let answerText = answer.trim();
+  const idxMatch = answerText.match(/^(\d+)\s+(.+)$/);
+  if (idxMatch) {
+    qIdx = parseInt(idxMatch[1], 10) - 1;
+    answerText = idxMatch[2].trim();
+    if (qIdx < 0 || qIdx >= all.length) {
+      reply(sid, `⚠️ 编号 ${idxMatch[1]} 超出范围 (1-${all.length})`);
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+  }
+
+  // Get the target question data and promote it to current if needed
+  let qData;
+  if (qIdx === 0 && pendingQuestions) {
+    qData = pendingQuestions;
+  } else {
+    // Remove from queue and put as current
+    const queuedIdx = qIdx - (pendingQuestions ? 1 : 0);
+    qData = pendingQuestionQueue.splice(queuedIdx, 1)[0];
+    if (!qData) {
+      reply(sid, '⚠️ 该问题不存在或已被回答');
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    // Move this question to current, push old current back to queue
+    if (pendingQuestions) {
+      pendingQuestionQueue.unshift(pendingQuestions);
+    }
+    pendingQuestions = qData;
+    // Auto-follow the question's session for cross-session answers
+    if (qData.sessionID) currentSessionId = qData.sessionID;
+    // Reset auto-clear timer
+    const ts = Date.now();
+    qData.askTimestamp = ts;
+    setTimeout(() => {
+      if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
+    }, 300_000).unref?.();
+  }
+
+  const targetId = currentSessionId;
+
+  // If we have a requestID (question API), session check is optional — the API binds to the question's session
+  if (!qData.requestID) {
+    if (!targetId) {
+      reply(sid, '⚠️ 没有选中的会话，无法提交答案');
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      pendingQuestions = null;
+      return;
+    }
+    if (qData.sessionID && qData.sessionID !== targetId) {
+      reply(sid, '⚠️ 当前会话已切换，无法回答之前的问题');
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      pendingQuestions = null;
+      return;
+    }
+  }
+
+  const qi = qData.questions?.[0];
+  const multi = qData.questions?.length > 1;
+
+  if (!answerText) {
+    reply(sid, '⚠️ 答案不能为空。请回复内容或用编号选择选项');
+    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  // Collect answers for all questions
+  let answers = [];
+  if (multi) {
+    const parts = answerText.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+    for (let i = 0; i < qData.questions.length; i++) {
+      const q = qData.questions[i];
+      let a = parts[i] || '';
+      if (q?.options?.length > 0 && /^\d+$/.test(a)) {
+        const idx = parseInt(a, 10) - 1;
+        if (idx >= 0 && idx < q.options.length) a = q.options[idx].label;
+      }
+      answers.push(a);
+    }
+  } else {
+    // Numeric option selection for single question
+    if (qi?.options?.length > 0 && /^\d+$/.test(answerText)) {
+      const idx = parseInt(answerText, 10) - 1;
+      if (idx >= 0 && idx < qi.options.length) {
+        answerText = qi.options[idx].label;
+        log(`[ANSWER] selected option ${answer} -> "${answerText}"`);
+      }
+    }
+    answers.push(answerText);
+  }
+
+  pendingQuestions = null;
+  await dequeueNextQuestion();
+  const combined = answers.join(', ');
+  log(`[ANSWER] sid=${sid.slice(0,12)} answers=[${combined}]`);
+  // Start streaming for the AI's response — use question's own sessionID for cross-session replies
+  startStreaming(sid, qData.sessionID || targetId);
+  lastPromptText = combined;
+  armWorkingNotice(sid);
+  reply(sid, `⏳ 已提交回答`);
+  if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+  if (qData.requestID) {
+    answerViaQuestionApi(sid, targetId, answers, qData.requestID).catch(e => log(`[ERR] answerAPI: ${e.message}`));
+  } else {
+    forwardToAIAsync(sid, targetId, combined).catch(e => log(`[ERR] answer: ${e.message}`));
+  }
+}
+
+async function answerViaQuestionApi(sid, targetId, answers, requestID) {
+  try {
+    const res = await fetch(`${SERVER}/question/${requestID}/reply`, {
+      method: 'POST',
+      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: answers.map(a => [a]) }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      reply(sid, `⚠️ 回答提交失败 (${res.status}): ${errText.slice(0, 100)}`);
+      await drainPendingNotifications();
+      flushToWeChat();
+      return;
+    }
+    log(`[ANSWER] reply sent via question API, waiting for SSE response...`);
+  } catch (err) {
+    reply(sid, `❌ 回答提交失败: ${err.message}`);
+    await drainPendingNotifications();
+    flushToWeChat();
+  }
+}
+
+async function dequeueNextQuestion() {
+  while (pendingQuestionQueue.length > 0) {
+    const next = pendingQuestionQueue.shift();
+    pendingQuestions = next;
+    if (next.sessionID) currentSessionId = next.sessionID;
+    const autoClear = setTimeout(() => {
+      if (pendingQuestions?.askTimestamp === next.askTimestamp) { pendingQuestions = null; dequeueNextQuestion(); }
+    }, 300_000);
+    autoClear.unref?.();
+    // Generate notification for the next question
+    await fetchSessionName(next.sessionID);
+    const sesLabel = next.sessionID ? `[${getSessionName(next.sessionID)}] ` : '';
+    const qi = next.questions?.[0];
+    if (!qi) continue;
+    const multi = next.questions.length > 1;
+    let text = (multi ? `📌 下一题（共${next.questions.length}题）` : `📌 下一题`);
+    if (sesLabel) text = sesLabel + text;
+    if (multi) {
+      next.questions.forEach((qItem, idx) => {
+        const qText = qItem.question || '';
+        text += `\n\n${idx+1}. ${qText}`;
+        if (qItem.options?.length) {
+          text += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
+        }
+      });
+        text += '\n\n多个答案用逗号分隔，如：1, 2';
+        text += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
+    } else {
+      const q = qi.question || '';
+      const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
+      text += `\n${q}`;
+      if (opts) text += `\n${opts}`;
+      if (qi.isSecret) text += '\n🔒 答案将保密发送';
+      text += '\n回复内容，或 /ans (/answer) <内容> 提交';
+      if (opts) text += '，或发送编号选择';
+      text += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
+    }
+    broadcastNotification(text);
+    return;
+  }
+}
+
+async function skipQuestion(sid, arg, msgId) {
+  const all = getAllQuestions();
+  if (all.length === 0) {
+    reply(sid, '⚠️ 当前没有待回答的问题');
+    if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  let qIdx = 0;
+  if (arg) {
+    qIdx = parseInt(arg.trim(), 10) - 1;
+    if (isNaN(qIdx) || qIdx < 0 || qIdx >= all.length) {
+      reply(sid, `⚠️ 编号无效 (1-${all.length})`);
+      if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+  }
+
+  // Get the target question
+  let qData;
+  if (qIdx === 0 && pendingQuestions) {
+    qData = pendingQuestions;
+    pendingQuestions = null;
+    await dequeueNextQuestion();
+  } else {
+    const queuedIdx = qIdx - (pendingQuestions ? 1 : 0);
+    qData = pendingQuestionQueue.splice(queuedIdx, 1)[0];
+  }
+
+  const requestID = qData?.requestID;
+  if (requestID) {
+    try {
+      await fetch(`${SERVER}/question/${requestID}/reject`, {
+        method: 'POST',
+        headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
+      });
+      log(`[SKIP] rejected question ${requestID.slice(0,16)}`);
+    } catch (err) {
+      log(`[SKIP] reject error: ${err.message}`);
+    }
+  }
+
+  const remaining = getAllQuestions().length;
+  const note = remaining > 0 ? `（还剩${remaining}题，/qlist (/ql, /questions) 查看，/qselect (/qs, /qsel) <编号> 切换）` : '';
+  fetchSessionName(qData?.sessionID).catch(() => {});
+  const sesLabel = qData?.sessionID ? ` [${getSessionName(qData.sessionID)}]` : '';
+  reply(sid, `⏭️ 已跳过${sesLabel}，${note}`);
+  if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+/* ───────── Streaming Output ───────── */
+
+const STREAM_FLUSH_MS = 2000;
+
+function startStreaming(sid, sessionId) {
+  stopStreaming();
+  streamBuf = '';
+  streamSid = sid;
+  streamSessionId = sessionId;
+  streamLastFlush = '';
+  streamFinalized = false;
+  log(`[STREAM] started sid=${sid.slice(0,12)} session=${sessionId.slice(0,12)}`);
+  streamTimer = setInterval(() => flushStream(), STREAM_FLUSH_MS);
+  streamTimer.unref?.();
+}
+
+function pushStream(chunk) {
+  if (!streamSid || !chunk) return;
+  // Mirror suppression: skip text that matches the user's own prompt
+  if (lastPromptText && streamBuf.length < lastPromptText.length) {
+    const candidate = streamBuf + chunk;
+    if (lastPromptText.startsWith(candidate) || candidate.startsWith(lastPromptText)) {
+      streamBuf = candidate;
+      // Once we've accumulated past the prompt, advance lastFlush past the prompt prefix
+      if (streamBuf.length >= lastPromptText.length) {
+        streamLastFlush = lastPromptText;
+      }
+      return;
+    }
+  }
+  streamBuf += chunk;
+}
+
+function flushStream() {
+  if (!streamSid || !streamBuf) return;
+  const newText = streamBuf.slice(streamLastFlush.length);
+  if (!newText) return;
+  // Only flush if we have meaningful new content
+  const trimmed = newText.trim();
+  if (!trimmed || trimmed.length < 3) return;
+  streamLastFlush = streamBuf;
+  log(`[STREAM] flush ${trimmed.length} chars to ${streamSid.slice(0,12)}`);
+  try {
+    reply(streamSid, trimmed);
+    flushToWeChat();
+  } catch (e) {
+    log(`[STREAM] flush error: ${e.message}`);
+  }
+}
+
+function finalizeStream() {
+  if (!streamSid || streamFinalized) return;
+  flushStream();
+  streamFinalized = true;
+  log(`[STREAM] finalized for ${streamSid.slice(0,12)}`);
+  disarmWorkingNotice();
+  stopStreaming();
+}
+
+/* ─── Working Notice ─── */
+
+function armWorkingNotice(sid) {
+  disarmWorkingNotice();
+  workingTimer = setTimeout(() => {
+    workingTimer = null;
+    if (!streamSid) return;
+    log(`[WORKING] sending working notice to ${sid.slice(0,12)}`);
+    try {
+      reply(sid, `⏳ 仍在处理中...\n「${lastPromptText.slice(0, 60)}」`);
+      flushToWeChat();
+    } catch (e) {
+      log(`[WORKING] error: ${e.message}`);
+    }
+  }, WORKING_NOTICE_DELAY);
+  workingTimer.unref?.();
+}
+
+function disarmWorkingNotice() {
+  if (workingTimer) {
+    clearTimeout(workingTimer);
+    workingTimer = null;
+  }
+}
+
+function stopStreaming() {
+  disarmWorkingNotice();
+  if (streamTimer) {
+    clearInterval(streamTimer);
+    streamTimer = null;
+  }
+  streamBuf = '';
+  streamSid = null;
+  streamSessionId = null;
+  streamLastFlush = '';
+  lastPromptText = '';
+}
+
 /* ───────── AI Prompt Forwarding ───────── */
 
 async function forwardToAIAsync(sid, targetId, text) {
@@ -524,6 +1042,7 @@ async function forwardToAIAsync(sid, targetId, text) {
     clearTimeout(timeout);
 
     if (!res.ok) {
+      stopStreaming();
       const errText = await res.text();
       reply(sid, `⚠️ 服务器错误 (${res.status}): ${errText.slice(0, 100)}`);
       await drainPendingNotifications();
@@ -533,12 +1052,22 @@ async function forwardToAIAsync(sid, targetId, text) {
 
     const data = await res.json();
     await drainPendingNotifications();
-    const formatted = formatReply(data);
-    if (formatted) {
-      reply(sid, formatted);
-      flushToWeChat();
+    // If streaming output was already finalized/progressed, skip final reply to avoid duplicates
+    if (streamFinalized) {
+      log(`[FWD] streaming already finalized for ${sid.slice(0,12)}, skipping final reply`);
+    } else if (streamSid === sid && streamLastFlush) {
+      log(`[FWD] streaming already sent output for ${sid.slice(0,12)}, skipping final reply`);
+      finalizeStream();
+    } else {
+      streamFinalized = true;
+      const formatted = formatReply(data);
+      if (formatted) {
+        reply(sid, formatted);
+        flushToWeChat();
+      }
     }
   } catch (err) {
+    stopStreaming();
     const isCancel = err.name === 'AbortError';
     reply(sid, isCancel ? '⏰ 请求超时，请重试' : `❌ ${err.message}`);
     await drainPendingNotifications();
@@ -798,6 +1327,7 @@ let recentNotifications = new Map(); // text → timestamp, dedup within 60s
 let perUserRecent = new Map(); // sid → { text → timestamp }
 let proactiveTimer = null;
 let recentEventIds = new Set(); // event ID → timestamp, dedup within 10s
+let sseReader = null;          // current SSE reader (for restart on workspace change)
 
 const DEDUP_WINDOW = 60000;
 const PER_USER_DEDUP_WINDOW = 60000;
@@ -825,11 +1355,11 @@ function broadcastNotification(text) {
 
   const targets = subscribers.filter(s => !s.muted);
   if (targets.length === 0) { log(`[BROADCAST] no active subscribers`); return; }
-  // Pick the most recently active subscriber; prefer current session if exists
+  // Pick the most recently active subscriber; prefer last prompt source if exists
   targets.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
   let best = targets[0];
-  if (currentSessionId) {
-    const cur = targets.find(t => t.sid === currentSessionId);
+  if (lastPromptSid) {
+    const cur = targets.find(t => t.sid === lastPromptSid);
     if (cur) best = cur;
   }
   log(`[BROADCAST] pushing to best subscriber: sid=${best.sid.slice(0,12)} (lastActive=${best.lastActive ? new Date(best.lastActive).toISOString() : 'never'})`);
@@ -889,11 +1419,11 @@ async function drainPendingNotifications(forceFlush) {
           log(`[DRAIN]   [${i}]: ${unique[i].slice(0,80).replace(/\n/g,'\\n')}`);
         }
       }
-      const permLines = unique.filter(t => /^📋 #/.test(t));
+      const permLines = unique.filter(t => /^#\d+/.test(t));
       if (permLines.length > 0) {
-        const others = unique.filter(t => !/^📋 #/.test(t));
+        const others = unique.filter(t => !/^#\d+/.test(t));
         let combined = permLines.join('\n');
-        combined += '\n/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号|requestID> 不输入编号，默认为#1';
+        combined += '\n/allow (/a) 批准 | /deny (/d) 拒绝 | /trust (/t) 信任 | +<编号>';
         if (others.length > 0) combined += '\n' + others.join('\n');
         try { reply(sid, combined); } catch (e) { log(`[DRAIN] reply error for ${sid}: ${e.message}`); }
       } else {
@@ -945,6 +1475,43 @@ async function idleNotification(props) {
   return `✅ ${name} · 完成`;
 }
 
+// Handle side-effects for SSE events (session tracking, etc.)
+async function handleSseSideEffect(type, props) {
+  switch (type) {
+    case 'tui.session.select': {
+      const sid = props.sessionID || props.id;
+      if (!sid || sid === currentSessionId) return;
+      log(`[SSE] tui.session.select: local switched to ${sid.slice(0,12)}`);
+      const oldId = currentSessionId;
+      currentSessionId = sid;
+      saveSession(sid);
+      await fetchSessionName(sid);
+      if (oldId) {
+        broadcastNotification(`🔄 已跟随到会话「${getSessionName(sid)}」`);
+      }
+      return;
+    }
+    case 'session.created': {
+      const sid = props.sessionID || props.id;
+      if (!sid) return;
+      log(`[SSE] session.created: ${sid.slice(0,12)}`);
+      // Optionally auto-follow new sessions (if they match current directory)
+      const dir = props.directory;
+      if (dir && normalizeDir(dir) === normalizeDir(getWorkspaceDir())) {
+        currentSessionId = sid;
+        saveSession(sid);
+        await fetchSessionName(sid);
+        broadcastNotification(`🆕 新会话已创建，已自动跟随`);
+      }
+      return;
+    }
+  }
+}
+
+function normalizeDir(p) {
+  return p.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+}
+
 // Map events to short, readable notifications. Return null to skip.
 async function eventToNotification(type, props) {
   switch (type) {
@@ -955,12 +1522,57 @@ async function eventToNotification(type, props) {
       return `❌ ${err.name}\n${brief.slice(0, 100)}`;
     }
     case 'question.asked': {
-      const qi = props.questions?.[0];
-      const q = qi?.question || '';
-      const opts = qi?.options?.slice(0, 4).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
-      let msg = `💬 需要你回答\n${q}`;
-      if (opts) msg += `\n${opts}`;
-      msg += `\n请直接回复你的答案`;
+      const questions = props.questions || [];
+      const ts = Date.now();
+      const qData = { sessionID: props.sessionID, requestID: props.requestID, questions, askTimestamp: ts };
+      // Dedup: skip if same requestID is already active or queued
+      if (qData.requestID) {
+        if (pendingQuestions && pendingQuestions.requestID === qData.requestID) {
+          log(`[EVENT] question.asked: dedup (already active)`);
+          return null;
+        }
+        if (pendingQuestionQueue.some(q => q.requestID === qData.requestID)) {
+          log(`[EVENT] question.asked: dedup (already queued)`);
+          return null;
+        }
+      }
+      if (pendingQuestions) {
+        pendingQuestionQueue.push(qData);
+        log(`[EVENT] question.asked: queued (${pendingQuestionQueue.length} in queue)`);
+        return null; // notification will be generated by dequeueNextQuestion
+      }
+      pendingQuestions = qData;
+      setTimeout(() => {
+        if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
+      }, 300_000).unref?.();
+      log(`[EVENT] question.asked: stored ${questions.length} questions`);
+      await fetchSessionName(props.sessionID);
+      const sesLabel = props.sessionID ? `[${getSessionName(props.sessionID)}] ` : '';
+      const qi = questions[0];
+      if (!qi) return '💬 AI 提出了一个问题（无详情）';
+      const multi = questions.length > 1;
+      let msg = multi ? `💬 待回答（共${questions.length}题）` : `💬 需要你回答`;
+      if (sesLabel) msg = sesLabel + msg;
+      if (multi) {
+        questions.forEach((qItem, idx) => {
+          const qText = qItem.question || '';
+          msg += `\n\n${idx+1}. ${qText}`;
+          if (qItem.options?.length) {
+            msg += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
+          }
+        });
+        msg += '\n\n多个答案用逗号分隔，如：1, 2';
+        msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
+      } else {
+        const q = qi.question || '';
+        const opts = qi.options?.slice(0, 6).map((o, i) => `${i + 1}. ${o.label}`).join('\n') || '';
+        msg += `\n${q}`;
+        if (opts) msg += `\n${opts}`;
+        if (qi.isSecret) msg += '\n🔒 答案将保密发送';
+        msg += '\n回复内容，或 /ans (/answer) <内容> 提交';
+        if (opts) msg += '，或发送编号选择';
+        msg += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
+      }
       return msg;
     }
     case 'permission.asked': {
@@ -995,8 +1607,12 @@ async function eventToNotification(type, props) {
           }
         }
       }
-      const sessionPerms = [...pendingPermissions.values()].filter(info => info.sessionID === sesId);
-      return `📋 #${sessionPerms.length} ${p || t}`;
+      await fetchSessionName(sesId);
+      const sesLabel = sesId ? `[${getSessionName(sesId)}] ` : '';
+      // WeChat eats leading spaces, so no indentation — path line starts directly after newline
+      const pathLine = p ? `\n${p}` : '';
+      const idx = pendingPermissions.size;
+      return `#${idx} ${sesLabel}${t}${pathLine}`;
     }
     case 'permission.replied': {
       const rid = props.requestID;
@@ -1007,13 +1623,40 @@ async function eventToNotification(type, props) {
       }
       return null;
     }
+    case 'question.replied':
+    case 'question.rejected': {
+      const qrid = props.requestID;
+      log(`[EVENT] question.replied/rejected rid=${(qrid||'?').slice(0,16)}`);
+      if (qrid) {
+        if (pendingQuestions && pendingQuestions.requestID === qrid) {
+          pendingQuestions = null;
+          await dequeueNextQuestion();
+        }
+        const before = pendingQuestionQueue.length;
+        pendingQuestionQueue = pendingQuestionQueue.filter(q => q.requestID !== qrid);
+        if (pendingQuestionQueue.length !== before) {
+          log(`[EVENT] removed ${before - pendingQuestionQueue.length} from queue`);
+        }
+      }
+      return null;
+    }
     case 'session.idle': {
+      if (props.sessionID && props.sessionID === streamSessionId) {
+        finalizeStream();
+      }
+      // Clear stale pending questions when session goes idle
+      if (pendingQuestions && pendingQuestions.sessionID === props.sessionID) {
+        pendingQuestions = null;
+      }
+      // Clear queued questions for this session
+      pendingQuestionQueue = pendingQuestionQueue.filter(q => q.sessionID !== props.sessionID);
       return idleNotification(props);
     }
     case 'session.status': {
       const st = props.status;
       if (!st) return null;
       if (st.type === 'idle') {
+        updateSessionState(props.sessionID, { retryCount: 0 });
         return idleNotification(props);
       }
       if (st.type === 'retry') {
@@ -1024,15 +1667,22 @@ async function eventToNotification(type, props) {
       }
       if (st.type === 'busy') {
         idleNotified.delete(props.sessionID);
-        updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now() });
+        updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now(), retryCount: 0 });
         return null;
       }
       return null;
     }
     case 'message.part.delta':
-    case 'message.part.updated':
-      if (props.sessionID) updateSessionState(props.sessionID, { lastActivity: Date.now() });
+    case 'message.part.updated': {
+      const psid = props.sessionID;
+      if (psid) updateSessionState(psid, { lastActivity: Date.now() });
+      // Route streaming text to the active wechat prompt source
+      if (psid && psid === streamSessionId) {
+        const delta = props.delta || props.part?.text || '';
+        if (delta) pushStream(delta);
+      }
       return null;
+    }
     default:
       return null;
   }
@@ -1044,6 +1694,14 @@ async function fetchSessionName(id) {
     const data = await apiFetch(`/session/${id}`);
     if (data.title) sessionNames.set(id, data.title);
   } catch {}
+}
+
+function restartSSE() {
+  log('[SSE] Restart requested');
+  if (sseReader) {
+    try { sseReader.cancel(); } catch (e) { log(`[SSE] cancel error: ${e.message}`); }
+    sseReader = null;
+  }
 }
 
 // ── SSE connection ──
@@ -1066,10 +1724,12 @@ async function connectSSE() {
       clearTimeout(connTimer);
       if (!response.ok) throw new Error(`SSE ${response.status}`);
       if (!response.body) throw new Error('SSE body is null');
+      sseReader = null;
       retryDelay = 1000;
       log('[SSE] Connected successfully');
 
       const reader = response.body.getReader();
+      sseReader = reader;
       const decoder = new TextDecoder();
       let buf = '';
       let currentEvent = '';
@@ -1117,6 +1777,9 @@ async function connectSSE() {
                 if (eventType === 'permission.asked' || eventType === 'permission.replied') {
                   log(`[SSE]    requestID=${props.requestID || '?'} permission=${props.permission || props.action || '?'}`);
                 }
+                // Handle session tracking side-effects before notification
+                await handleSseSideEffect(eventType, props).catch(e => log(`[SSE] side-effect error: ${e.message}`));
+
                 const text = await eventToNotification(eventType, props);
                 if (text) {
                   log(`[SSE] notification generated: ${text.slice(0, 80).replace(/\n/g,'\\n')}`);
@@ -1133,13 +1796,15 @@ async function connectSSE() {
           } else if (trimmed.startsWith('event:')) {
             currentEvent = trimmed.slice(6).trim();
           } else if (trimmed.startsWith('data:')) {
-            currentData += trimmed.slice(5).trim();
+            currentData += trimmed.slice(5).trim() + '\n';
           }
         }
       }
       log('[SSE] Stream ended, reconnecting...');
     } catch (err) {
       log(`[SSE] Error: ${err.message}, retry in ${retryDelay}ms`);
+    } finally {
+      sseReader = null;
     }
 
     await new Promise(r => setTimeout(r, retryDelay));

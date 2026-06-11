@@ -1,0 +1,27 @@
+{
+  "comment": "项目所需软件版本锁定，用于复现开发环境",
+  "runtime": {
+    "node": "24.16.0",
+    "npm": "11.13.0",
+    "bun": "1.3.14"
+  },
+  "shell": {
+    "pwsh": "7.6.1"
+  },
+  "vcs": {
+    "git": "2.54.0"
+  },
+  "opencode": {
+    "cli": "1.16.2",
+    "sdk": "^1.16.2",
+    "server": "http://localhost:4096",
+    "server_auth": "opencode:opencode (Basic)"
+  },
+  "repos": {
+    "opencode-quickstart-workspace": {
+      "remote": "https://github.com/happymy/opencode-quickstart-workspace.git",
+      "branch": "dev3",
+      "head": "7de9ebe"
+    }
+  }
+}
