@@ -527,7 +527,7 @@ function showHelp(sid, msgId) {
     '/build (/bu)             切换到 build 模式',
     '',
     '── 问题回答 ──',
-    '/answer (/ans) <内容|编号> 回答AI提问或选择选项',
+    '/answer (/ans) [问题编号] <内容> 回答AI提问，可用编号指定问题，为空则默认第1题',
     '/skip (/pass, /ps) [编号]  跳过指定问题（默认当前）',
     '/qlist (/ql, /questions)   查看所有待回答问题',
     '/qshow (/qc, /qcurrent)    显示当前问题的完整内容',
