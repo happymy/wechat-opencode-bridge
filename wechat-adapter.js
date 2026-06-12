@@ -820,6 +820,7 @@ async function listQuestions(sid, msgId) {
 }
 
 function formatQuestionBody(questions) {
+  if (!questions?.length) return '';
   const multi = questions.length > 1;
   let body = '';
   if (multi) {
@@ -967,7 +968,7 @@ async function answerQuestion(sid, answer, msgId) {
       reply(sid, '⚠️ 没有选中的会话，无法提交答案');
       if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
       pendingQuestions = null;
-      dequeueNextQuestion();
+      await dequeueNextQuestion();
       return;
     }
     if (qData.sessionID && qData.sessionID !== targetId) {
@@ -1222,11 +1223,14 @@ async function forwardToAIAsync(sid, targetId, text) {
     }
   } catch (err) {
     disarmWorkingNotice();
-    responseSent = true;
-    responseForSession = targetId;
+    if (responseForSession !== targetId) return; // superseded by newer prompt
     if (err.name === 'AbortError') {
+      // Timeout: server might still complete via SSE, let session.idle send the result
       reply(sid, '⏰ 请求超时，请重试');
+      // Do NOT set responseSent = true — session.idle will deliver accumulated text
     } else {
+      responseSent = true;
+      responseForSession = targetId;
       reply(sid, `❌ ${err.message}`);
     }
     await drainPendingNotifications();
@@ -1297,9 +1301,9 @@ async function handleLoadSession(msg) {
 }
 
 async function handleCancel(msg) {
-  const sid = msg.params?.sessionId || currentSessionId;
-  if (sid) {
-    try { await fetch(`${SERVER}/session/${encodeURIComponent(sid)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
+  const cancelTargets = [msg.params?.sessionId, currentSessionId].filter(Boolean);
+  for (const id of [...new Set(cancelTargets)]) {
+    try { await fetch(`${SERVER}/session/${encodeURIComponent(id)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
   }
   disarmWorkingNotice();
   pendingReplyText = '';
