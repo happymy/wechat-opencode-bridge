@@ -1418,12 +1418,24 @@ async function handleAutoClean(sid, arg, msgId) {
 
 /* ───────── I/O Helpers ───────── */
 
+const MAX_REPLY_LENGTH = 2000;
+
 function reply(sid, text) {
   log(`[REPLY] to=${sid.slice(0,12)} len=${text.length} text=${text.slice(0,80).replace(/\n/g,'\\n')}`);
-  sendNotification('session/update', {
-    sessionId: sid,
-    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: uuid() },
-  });
+  if (text.length <= MAX_REPLY_LENGTH) {
+    sendNotification('session/update', {
+      sessionId: sid,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: uuid() },
+    });
+    return;
+  }
+  for (let i = 0; i < text.length; i += MAX_REPLY_LENGTH) {
+    const chunk = text.slice(i, i + MAX_REPLY_LENGTH);
+    sendNotification('session/update', {
+      sessionId: sid,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: chunk }, messageId: uuid() },
+    });
+  }
 }
 
 function sendResponse(id, result) {
