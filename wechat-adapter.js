@@ -364,8 +364,8 @@ async function newSession(sid, title, msgId) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: title.trim() }),
     });
-    currentSessionId = data.id;
-    saveSession(data.id);
+    currentSessionId = data.id || 'sess_' + Date.now();
+    saveSession(currentSessionId);
     reply(sid, `✅ 已创建并切换到「${title.trim()}」`);
   } catch (err) {
     reply(sid, `⚠️ 创建失败: ${err.message}`);
@@ -1811,7 +1811,7 @@ async function eventToNotification(type, props) {
       const st = props.status;
       if (!st) return null;
       if (st.type === 'idle') {
-        updateSessionState(props.sessionID, { retryCount: 0 });
+        updateSessionState(props.sessionID, { retryCount: 0, busySince: undefined });
         return idleNotification(props);
       }
       if (st.type === 'retry') {
@@ -2010,7 +2010,7 @@ function startWatchdog() {
       }
       const staleCutoff = now - 30 * 60 * 1000;
       for (const [id, state] of sessionStates.entries()) {
-        if (!state.busySince && state.lastActivity && state.lastActivity < staleCutoff) {
+        if (state.lastActivity && state.lastActivity < staleCutoff) {
           sessionStates.delete(id);
           sessionNames.delete(id);
           idleNotified.delete(id);
