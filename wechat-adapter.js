@@ -26,16 +26,13 @@ let pendingPermissions = new Map();
 let pendingQuestions = null; // { sessionID, questions: [...], askTimestamp }
 let draining = false;
 
-// Streaming output state
-let streamBuf = '';           // accumulated stream text
-let streamSid = null;         // wechat subscriber sid to send streamed output to
-let streamSessionId = null;   // session being streamed
-let streamTimer = null;       // periodic flush timer
-let streamLastFlush = '';     // last flushed text (for dedup)
+// Response handling
 let lastPromptSid = null;     // last wechat user who sent a prompt
 let lastPromptSessionId = null; // last session prompted
-let lastPromptText = '';      // last prompt text (for mirror suppression)
-let streamFinalized = false;  // true after finalizeStream runs (prevents double-finalize race)
+let lastPromptText = '';      // last prompt text
+let pendingReplyText = '';    // accumulated text parts for question API responses
+let responseSent = false;     // true after final reply is sent (prevents double-reply)
+let responseForSession = null; // session ID that the pending response is for
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
 const QUESTION_AUTO_CLEAR_MS = 300000; // 5min before unanswered question auto-expires
@@ -130,8 +127,10 @@ async function handlePrompt(msg) {
     // Record prompt source for streaming output routing
     lastPromptSid = sid;
     lastPromptSessionId = targetId;
-    startStreaming(sid, targetId);
     lastPromptText = text;
+    pendingReplyText = '';
+    responseSent = false;
+    responseForSession = targetId;
     armWorkingNotice(sid);
 
     reply(sid, '⏳ 思考中...');
@@ -244,8 +243,12 @@ async function listSessions(sid, msgId) {
 }
 
 async function switchSession(sid, arg, msgId) {
-  stopStreaming();
   disarmWorkingNotice();
+  pendingReplyText = '';
+  responseSent = true;
+  responseForSession = null;
+  lastPromptSessionId = null;
+  lastPromptSid = null;
   if (!arg) {
     reply(sid, '用法: /switch <编号|会话ID>\n先用 /list 查看会话列表');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -319,7 +322,12 @@ function showNotifyStatus(sid, msgId) {
 }
 
 async function cancelCurrent(sid, msgId) {
-  stopStreaming();
+  disarmWorkingNotice();
+  pendingReplyText = '';
+  responseSent = true;
+  responseForSession = null;
+  lastPromptSessionId = null;
+  lastPromptSid = null;
   const target = currentSessionId;
   if (!target) {
     reply(sid, '⚠️ 没有选中的会话');
@@ -338,8 +346,12 @@ async function cancelCurrent(sid, msgId) {
 }
 
 async function newSession(sid, title, msgId) {
-  stopStreaming();
   disarmWorkingNotice();
+  pendingReplyText = '';
+  responseSent = true;
+  responseForSession = null;
+  lastPromptSessionId = null;
+  lastPromptSid = null;
   if (!title) {
     reply(sid, '用法: /new <会话名>\n示例: /new 修复登录bug');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -542,8 +554,12 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
-  stopStreaming();
   disarmWorkingNotice();
+  pendingReplyText = '';
+  responseSent = true;
+  responseForSession = null;
+  lastPromptSessionId = null;
+  lastPromptSid = null;
   currentWorkspace = list[num - 1];
   saveCurrentWorkspace();
   restartSSE();
@@ -661,6 +677,7 @@ async function handleSyncDir(sid, msgId) {
     if (skipped.length > 0) lines.push(`├ 跳过: ${skipped.map(s => s.name).join('、')}`);
     lines.push(`└ 总计: ${existing.length} 个工作区`);
     reply(sid, lines.join('\n'));
+    sendResponse(msgId, { stopReason: 'end_turn' });
     } catch (err) {
     reply(sid, `⚠️ 同步失败: ${err.message}`);
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -870,7 +887,8 @@ async function selectQuestion(sid, arg, msgId) {
   if (idx === 0 && pendingQuestions) {
     return listCurrentQuestion(sid, msgId);
   }
-  const target = pendingQuestionQueue.splice(idx - (pendingQuestions ? 1 : 0), 1)[0];
+  const queueIdx = pendingQuestions ? idx - 1 : idx;
+  const target = pendingQuestionQueue.splice(queueIdx, 1)[0];
   if (!target) {
     reply(sid, '⚠️ 该问题不存在');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -916,12 +934,11 @@ async function answerQuestion(sid, answer, msgId) {
 
   // Get the target question data and promote it to current if needed
   let qData;
-  if (qIdx === 0 && pendingQuestions) {
+  if (pendingQuestions && qIdx === 0) {
     qData = pendingQuestions;
   } else {
-    // Remove from queue and put as current
-    const queuedIdx = qIdx - (pendingQuestions ? 1 : 0);
-    qData = pendingQuestionQueue.splice(queuedIdx, 1)[0];
+    const qIdxInQueue = pendingQuestions ? qIdx - 1 : qIdx;
+    qData = pendingQuestionQueue.splice(qIdxInQueue, 1)[0];
     if (!qData) {
       reply(sid, '⚠️ 该问题不存在或已被回答');
       if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
@@ -998,9 +1015,13 @@ async function answerQuestion(sid, answer, msgId) {
   pendingQuestions = null;
   await dequeueNextQuestion();
   log(`[ANSWER] sid=${sid.slice(0,12)} answers=[${combined}]`);
-  // Start streaming for the AI's response — use question's own sessionID for cross-session replies
-  startStreaming(sid, qData.sessionID || targetId);
+  lastPromptSid = sid;
+  lastPromptSessionId = qData.sessionID || targetId;
   lastPromptText = combined;
+  disarmWorkingNotice();
+  pendingReplyText = '';
+  responseSent = false;
+  responseForSession = qData.sessionID || targetId;
   armWorkingNotice(sid);
   reply(sid, `⏳ 已提交回答`);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
@@ -1027,18 +1048,23 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
       clearTimeout(timeout);
     }
     if (!res.ok) {
-      stopStreaming();
+      disarmWorkingNotice();
+      responseSent = true;
+      responseForSession = null;
+      pendingReplyText = '';
       const errText = await res.text();
       reply(sid, `⚠️ 回答提交失败 (${res.status}): ${errText.slice(0, 100)}`);
       await drainPendingNotifications();
       flushToWeChat();
       return;
     }
-    // Consume response body to release connection
     await res.text();
     log(`[ANSWER] reply sent via question API, waiting for SSE response...`);
   } catch (err) {
-    stopStreaming();
+    disarmWorkingNotice();
+    responseSent = true;
+    responseForSession = null;
+    pendingReplyText = '';
     reply(sid, `❌ 回答提交失败: ${err.message}`);
     await drainPendingNotifications();
     flushToWeChat();
@@ -1088,13 +1114,16 @@ async function skipQuestion(sid, arg, msgId) {
 
   // Get the target question
   let qData;
-  if (qIdx === 0 && pendingQuestions) {
-    qData = pendingQuestions;
-    pendingQuestions = null;
-    await dequeueNextQuestion();
+  if (pendingQuestions) {
+    if (qIdx === 0) {
+      qData = pendingQuestions;
+      pendingQuestions = null;
+      await dequeueNextQuestion();
+    } else {
+      qData = pendingQuestionQueue.splice(qIdx - 1, 1)[0];
+    }
   } else {
-    const queuedIdx = qIdx - (pendingQuestions ? 1 : 0);
-    qData = pendingQuestionQueue.splice(queuedIdx, 1)[0];
+    qData = pendingQuestionQueue.splice(qIdx, 1)[0];
   }
 
   const requestID = qData?.requestID;
@@ -1119,83 +1148,13 @@ async function skipQuestion(sid, arg, msgId) {
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
-/* ───────── Streaming Output ───────── */
-
-const STREAM_FLUSH_MS = 2000;
-
-function startStreaming(sid, sessionId) {
-  stopStreaming();
-  streamBuf = '';
-  streamSid = sid;
-  streamSessionId = sessionId;
-  streamLastFlush = '';
-  streamFinalized = false;
-  log(`[STREAM] started sid=${sid.slice(0,12)} session=${sessionId.slice(0,12)}`);
-  streamTimer = setInterval(() => flushStream(), STREAM_FLUSH_MS);
-  streamTimer.unref?.();
-}
-
-function pushStream(chunk) {
-  if (!streamSid || !chunk) return;
-  // Mirror suppression: skip text that matches the user's own prompt
-  if (lastPromptText && streamBuf.length < lastPromptText.length) {
-    const candidate = streamBuf + chunk;
-    if (lastPromptText.startsWith(candidate) || candidate.startsWith(lastPromptText)) {
-      streamBuf = candidate;
-      // Once we've accumulated past the prompt, advance lastFlush past the prompt prefix
-      if (streamBuf.length >= lastPromptText.length) {
-        streamLastFlush = lastPromptText;
-      }
-      return;
-    }
-  }
-  streamBuf += chunk;
-}
-
-function flushStream() {
-  if (!streamSid || !streamBuf) return;
-  const newText = streamBuf.slice(streamLastFlush.length);
-  if (!newText) return;
-  // Only flush if we have meaningful new content
-  const trimmed = newText.trim();
-  if (!trimmed || trimmed.length < 3) return;
-  streamLastFlush = streamBuf;
-  log(`[STREAM] flush ${trimmed.length} chars to ${streamSid.slice(0,12)}`);
-  try {
-    reply(streamSid, trimmed);
-    flushToWeChat();
-  } catch (e) {
-    log(`[STREAM] flush error: ${e.message}`);
-  }
-}
-
-function finalizeStream() {
-  if (!streamSid || streamFinalized) return;
-  if (streamBuf) {
-    const newText = streamBuf.slice(streamLastFlush.length);
-    if (newText) {
-      streamLastFlush = streamBuf;
-      try {
-        reply(streamSid, newText);
-        flushToWeChat();
-      } catch (e) {
-        log(`[STREAM] final flush error: ${e.message}`);
-      }
-    }
-  }
-  streamFinalized = true;
-  log(`[STREAM] finalized for ${streamSid.slice(0,12)}`);
-  disarmWorkingNotice();
-  stopStreaming();
-}
-
-/* ─── Working Notice ─── */
+/* ───────── Working Notice ───────── */
 
 function armWorkingNotice(sid) {
   disarmWorkingNotice();
   workingTimer = setTimeout(() => {
     workingTimer = null;
-    if (!streamSid) return;
+    if (responseSent) return;
     log(`[WORKING] sending working notice to ${sid.slice(0,12)}`);
     try {
       reply(sid, `⏳ 仍在处理中...\n「${lastPromptText.slice(0, 60)}」`);
@@ -1212,19 +1171,6 @@ function disarmWorkingNotice() {
     clearTimeout(workingTimer);
     workingTimer = null;
   }
-}
-
-function stopStreaming() {
-  disarmWorkingNotice();
-  if (streamTimer) {
-    clearInterval(streamTimer);
-    streamTimer = null;
-  }
-  streamBuf = '';
-  streamSid = null;
-  streamSessionId = null;
-  streamLastFlush = '';
-  lastPromptText = '';
 }
 
 /* ───────── AI Prompt Forwarding ───────── */
@@ -1246,7 +1192,9 @@ async function forwardToAIAsync(sid, targetId, text) {
     }
 
     if (!res.ok) {
-      stopStreaming();
+      disarmWorkingNotice();
+      responseSent = true;
+      responseForSession = targetId;
       const errText = await res.text();
       reply(sid, `⚠️ 服务器错误 (${res.status}): ${errText.slice(0, 100)}`);
       await drainPendingNotifications();
@@ -1256,24 +1204,31 @@ async function forwardToAIAsync(sid, targetId, text) {
 
     const data = await res.json();
     await drainPendingNotifications();
-    // If streaming output was already finalized/progressed, skip final reply to avoid duplicates
-    if (streamFinalized) {
-      log(`[FWD] streaming already finalized for ${sid.slice(0,12)}, skipping final reply`);
-    } else if (streamSid === sid && streamLastFlush) {
-      log(`[FWD] streaming already sent output for ${sid.slice(0,12)}, skipping final reply`);
-      finalizeStream();
-    } else {
-      streamFinalized = true;
-      const formatted = formatReply(data);
-      if (formatted) {
-        reply(sid, formatted);
-        flushToWeChat();
-      }
+    if (responseSent && responseForSession === targetId) {
+      log(`[FWD] response already sent for ${sid.slice(0,12)}, skipping`);
+      return;
+    }
+    if (responseForSession !== targetId) {
+      log(`[FWD] stale response for session ${targetId?.slice(0,12)}, expected ${responseForSession?.slice(0,12)}, skipping`);
+      return;
+    }
+    responseSent = true;
+    disarmWorkingNotice();
+    idleNotified.add(targetId); // prevent "完成" from session.status(idle)
+    const formatted = formatReply(data);
+    if (formatted) {
+      reply(sid, formatted);
+      flushToWeChat();
     }
   } catch (err) {
-    stopStreaming();
-    const isCancel = err.name === 'AbortError';
-    reply(sid, isCancel ? '⏰ 请求超时，请重试' : `❌ ${err.message}`);
+    disarmWorkingNotice();
+    responseSent = true;
+    responseForSession = targetId;
+    if (err.name === 'AbortError') {
+      reply(sid, '⏰ 请求超时，请重试');
+    } else {
+      reply(sid, `❌ ${err.message}`);
+    }
     await drainPendingNotifications();
     flushToWeChat();
   }
@@ -1281,45 +1236,11 @@ async function forwardToAIAsync(sid, targetId, text) {
 
 function formatReply(data) {
   const parts = data?.parts || [];
-  if (!parts.length) return '';
+  if (!parts.length) return '🤖\n（无文本响应）';
 
-  let textParts = [];
-  let toolCalls = [];
-  let reasoningBuf = '';
-
-  for (const p of parts) {
-    if (p.type === 'text' && p.text) textParts.push(p.text);
-    else if (p.type === 'reasoning' && p.text) reasoningBuf += p.text;
-    else if (p.type === 'tool' && p.tool) {
-      const toolName = p.tool || '未知';
-      const s = p.state;
-      const success = s?.status === 'completed' || s?.status === 'success';
-      const error = s?.status === 'error' || s?.status === 'failed';
-      const statusIcon = success ? '✅' : error ? '❌' : '🔄';
-      toolCalls.push({ name: toolName, status: statusIcon });
-    }
-  }
-
-  const blocks = [];
-  if (reasoningBuf) {
-    blocks.push('┅'.repeat(16));
-    blocks.push('🤔 思考过程');
-    blocks.push('┅'.repeat(16));
-    blocks.push(reasoningBuf);
-  }
-  if (toolCalls.length) {
-    const tools = toolCalls.slice(-6).map(t => `${t.status} ${t.name}`).join('\n');
-    blocks.push(`\n🔧\n${tools}`);
-  }
-  const mainText = textParts.join('\n').trim();
-  if (mainText) {
-    if (reasoningBuf) {
-      blocks.push('');
-      blocks.push('━'.repeat(16) + ' 回答 ' + '━'.repeat(16));
-    }
-    blocks.push(mainText);
-  }
-  return blocks.join('\n');
+  const texts = parts.filter(p => p.type === 'text' && p.text).map(p => p.text);
+  const mainText = texts.join('\n').trim();
+  return mainText ? `🤖\n${mainText}` : '🤖\n（完成）';
 }
 
 /* ───────── ACP Handlers ───────── */
@@ -1380,6 +1301,12 @@ async function handleCancel(msg) {
   if (sid) {
     try { await fetch(`${SERVER}/session/${encodeURIComponent(sid)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
   }
+  disarmWorkingNotice();
+  pendingReplyText = '';
+  responseSent = true;
+  responseForSession = null;
+  lastPromptSessionId = null;
+  lastPromptSid = null;
   sendResponse(msg.id, {});
 }
 
@@ -1615,8 +1542,12 @@ function broadcastNotification(text) {
 }
 
 async function drainPendingNotifications(forceFlush) {
-  if (draining || pendingNotifications.length === 0) {
-    log(`[DRAIN] skip: draining=${draining} pending=${pendingNotifications.length}`);
+  if (draining) {
+    log(`[DRAIN] skip: already draining`);
+    return;
+  }
+  if (pendingNotifications.length === 0) {
+    log(`[DRAIN] skip: no pending`);
     return;
   }
   draining = true;
@@ -1842,15 +1773,26 @@ async function eventToNotification(type, props) {
       return null;
     }
     case 'session.idle': {
-      if (props.sessionID && props.sessionID === streamSessionId) {
-        finalizeStream();
-      }
-      // Clear stale pending questions when session goes idle
+      // Clear stale pending questions for this session
       if (pendingQuestions && pendingQuestions.sessionID === props.sessionID) {
         pendingQuestions = null;
       }
-      // Clear queued questions for this session
       pendingQuestionQueue = pendingQuestionQueue.filter(q => q.sessionID !== props.sessionID);
+
+      if (props.sessionID && props.sessionID === lastPromptSessionId && !responseSent) {
+        responseSent = true;
+        responseForSession = props.sessionID;
+        disarmWorkingNotice();
+        const text = pendingReplyText.trim();
+        pendingReplyText = '';
+        if (text) {
+          idleNotified.add(props.sessionID); // prevent "完成" from session.status(idle)
+          reply(lastPromptSid, `🤖\n${text}`);
+          flushToWeChat();
+          return null;
+        }
+        return idleNotification(props);
+      }
       return idleNotification(props);
     }
     case 'session.status': {
@@ -1877,10 +1819,11 @@ async function eventToNotification(type, props) {
     case 'message.part.updated': {
       const psid = props.sessionID;
       if (psid) updateSessionState(psid, { lastActivity: Date.now() });
-      // Route streaming text to the active wechat prompt source
-      if (psid && psid === streamSessionId) {
+      // Only accumulate text parts for the active session
+      const partType = props.partType || props.type;
+      if (psid && psid === lastPromptSessionId && partType === 'text') {
         const delta = props.delta || props.part?.text || '';
-        if (delta) pushStream(delta);
+        if (delta) pendingReplyText += delta;
       }
       return null;
     }

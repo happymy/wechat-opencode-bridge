@@ -40,4 +40,4 @@ echo ==========================================
 echo  Restart complete! WeChat bridge is ready.
 echo ==========================================
 
-pause
+echo pause
