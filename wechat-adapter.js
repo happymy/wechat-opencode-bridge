@@ -1264,6 +1264,7 @@ async function forwardToAIAsync(sid, targetId, text) {
     responseSent = true;
     disarmWorkingNotice();
     idleNotified.add(targetId); // prevent "完成" from session.status(idle)
+    pendingReplyText = ''; // clear any residual SSE deltas
     const formatted = formatReply(data);
     if (formatted) {
       reply(sid, formatted);
@@ -1274,6 +1275,7 @@ async function forwardToAIAsync(sid, targetId, text) {
     if (responseForSession !== targetId) return; // superseded by newer prompt
     if (err.name === 'AbortError') {
       const accumulated = pendingReplyText.trim();
+      log(`[FWD] timeout: lastSid=${(lastPromptSessionId||'?').slice(0,12)} targetId=${(targetId||'?').slice(0,12)} text_len=${text.length} pending_len=${pendingReplyText.length} accumulated_len=${accumulated.length}`);
       pendingReplyText = '';
       responseSent = true;
       responseForSession = targetId;
@@ -1879,6 +1881,21 @@ async function eventToNotification(type, props) {
       if (!st) return null;
       if (st.type === 'idle') {
         updateSessionState(props.sessionID, { retryCount: 0, busySince: undefined });
+        // Check accumulated text before falling through to idleNotification
+        if (props.sessionID && props.sessionID === lastPromptSessionId) {
+          const text = pendingReplyText.trim();
+          pendingReplyText = '';
+          if (text) {
+            responseSent = true;
+            responseForSession = props.sessionID;
+            disarmWorkingNotice();
+            idleNotified.add(props.sessionID);
+            log(`[STATUS.IDLE] replying with text len=${text.length}`);
+            reply(lastPromptSid, `🤖 ${text}`);
+            flushToWeChat();
+            return null;
+          }
+        }
         return idleNotification(props);
       }
       if (st.type === 'retry') {
@@ -1899,10 +1916,11 @@ async function eventToNotification(type, props) {
       const psid = props.sessionID;
       if (psid) updateSessionState(psid, { lastActivity: Date.now() });
       // Only accumulate text parts for the active session
-      const partType = props.partType || props.type;
-      if (psid && psid === lastPromptSessionId && partType === 'text') {
-        const delta = props.delta || props.part?.text || '';
-        if (delta) pendingReplyText += delta;
+      const partType = props.field || props.partType;
+      const delta = props.delta || props.part?.text || '';
+      log(`[SSE] delta: type=${type} field="${partType}" delta_len=${delta.length} psid=${(psid||'?').slice(0,12)} lastSid=${(lastPromptSessionId||'?').slice(0,12)} pending_len=${pendingReplyText.length}`);
+      if (psid && psid === lastPromptSessionId && partType === 'text' && delta) {
+        pendingReplyText += delta;
       }
       return null;
     }
@@ -1975,7 +1993,7 @@ async function connectSSE() {
           const trimmed = line.trim();
           if (trimmed === '') {
             if (currentData) {
-              const rawBrief = currentData.slice(0, 120);
+              const rawBrief = currentData.slice(0, 400);
               log(`[SSE] raw data: ${rawBrief}`);
               try {
                 const parsed = JSON.parse(currentData);
