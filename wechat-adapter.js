@@ -35,7 +35,7 @@ let responseSent = false;     // true after final reply is sent (prevents double
 let responseForSession = null; // session ID that the pending response is for
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
-const QUESTION_AUTO_CLEAR_MS = 300000; // 5min before unanswered question auto-expires
+const QUESTION_AUTO_CLEAR_MS = 86400000; // 24h safety net (server never auto-expires)
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 
 /* ───────── Logging ───────── */
@@ -131,6 +131,7 @@ async function handlePrompt(msg) {
     pendingReplyText = '';
     responseSent = false;
     responseForSession = targetId;
+    idleNotified.delete(targetId); // allow fresh idle events for this session
     armWorkingNotice(sid);
 
     reply(sid, '⏳ 思考中...');
@@ -357,9 +358,8 @@ async function newSession(sid, title, msgId) {
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
-  const dir = getWorkspaceDir();
   try {
-    const data = await apiFetch(`/session?directory=${encodeURIComponent(dir)}`, {
+    const data = await apiFetch('/session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: title.trim() }),
@@ -482,6 +482,54 @@ async function syncPermissionsFromServer() {
     log(`[SYNC] done: ${before} -> ${pendingPermissions.size}`);
   } catch (e) {
     log(`[SYNC] fetch failed: ${e.message}`);
+  }
+}
+
+async function syncPendingFromServer() {
+  const dir = getWorkspaceDir();
+  try {
+    const permList = await apiFetch(`/permission?directory=${encodeURIComponent(dir)}`);
+    const serverPermIds = new Set((Array.isArray(permList) ? permList : []).map(r => r.id));
+    for (const [rid] of pendingPermissions) {
+      if (!serverPermIds.has(rid)) {
+        log(`[SYNC] removing local perm rid=${rid.slice(0,16)}... (not on server)`);
+        pendingPermissions.delete(rid);
+      }
+    }
+    log(`[SYNC] perm synced: ${pendingPermissions.size} remaining`);
+  } catch (e) {
+    log(`[SYNC] perm sync failed: ${e.message}`);
+  }
+  try {
+    const allQuestions = getAllQuestions();
+    if (allQuestions.length === 0) return;
+    const seen = new Set();
+    for (const q of allQuestions) {
+      const qsid = q.sessionID;
+      if (!qsid || seen.has(qsid)) continue;
+      seen.add(qsid);
+      try {
+        const sessQs = await apiFetch(`/session/${encodeURIComponent(qsid)}/question`);
+        const validIds = new Set((sessQs?.data || []).map(r => r.id));
+        for (const q2 of allQuestions) {
+          if (q2.sessionID !== qsid) continue;
+          if (q2.requestID && !validIds.has(q2.requestID)) {
+            log(`[SYNC] removing local question rid=${q2.requestID.slice(0,16)}... (not on server)`);
+            if (pendingQuestions?.requestID === q2.requestID) {
+              pendingQuestions = null;
+            } else {
+              const qIdx = pendingQuestionQueue.findIndex(q => q.requestID === q2.requestID);
+              if (qIdx >= 0) pendingQuestionQueue.splice(qIdx, 1);
+            }
+          }
+        }
+      } catch (e) {
+        log(`[SYNC] session ${qsid.slice(0,12)} question sync failed: ${e.message}`);
+      }
+    }
+    log(`[SYNC] questions synced: ${getAllQuestions().length} remaining`);
+  } catch (e) {
+    log(`[SYNC] question sync failed: ${e.message}`);
   }
 }
 
@@ -1216,6 +1264,7 @@ async function forwardToAIAsync(sid, targetId, text) {
     responseSent = true;
     disarmWorkingNotice();
     idleNotified.add(targetId); // prevent "完成" from session.status(idle)
+    pendingReplyText = ''; // clear any residual SSE deltas
     const formatted = formatReply(data);
     if (formatted) {
       reply(sid, formatted);
@@ -1225,9 +1274,18 @@ async function forwardToAIAsync(sid, targetId, text) {
     disarmWorkingNotice();
     if (responseForSession !== targetId) return; // superseded by newer prompt
     if (err.name === 'AbortError') {
-      // Timeout: server might still complete via SSE, let session.idle send the result
-      reply(sid, '⏰ 请求超时，请重试');
-      // Do NOT set responseSent = true — session.idle will deliver accumulated text
+      const accumulated = pendingReplyText.trim();
+      log(`[FWD] timeout: lastSid=${(lastPromptSessionId||'?').slice(0,12)} targetId=${(targetId||'?').slice(0,12)} text_len=${text.length} pending_len=${pendingReplyText.length} accumulated_len=${accumulated.length}`);
+      pendingReplyText = '';
+      responseSent = true;
+      responseForSession = targetId;
+      idleNotified.add(targetId);
+      disarmWorkingNotice();
+      if (accumulated) {
+        reply(sid, `🤖 ${accumulated}`);
+      } else {
+        reply(sid, '⏰ 请求超时，请重试');
+      }
     } else {
       responseSent = true;
       responseForSession = targetId;
@@ -1240,11 +1298,11 @@ async function forwardToAIAsync(sid, targetId, text) {
 
 function formatReply(data) {
   const parts = data?.parts || [];
-  if (!parts.length) return '🤖\n（无文本响应）';
+  if (!parts.length) return '🤖 （无文本响应）';
 
   const texts = parts.filter(p => p.type === 'text' && p.text).map(p => p.text);
   const mainText = texts.join('\n').trim();
-  return mainText ? `🤖\n${mainText}` : '🤖\n（完成）';
+  return mainText ? `🤖 ${mainText}` : '🤖 （完成）';
 }
 
 /* ───────── ACP Handlers ───────── */
@@ -1795,19 +1853,26 @@ async function eventToNotification(type, props) {
       }
       pendingQuestionQueue = pendingQuestionQueue.filter(q => q.sessionID !== props.sessionID);
 
-      if (props.sessionID && props.sessionID === lastPromptSessionId && !responseSent) {
-        responseSent = true;
-        responseForSession = props.sessionID;
-        disarmWorkingNotice();
+      if (props.sessionID && props.sessionID === lastPromptSessionId) {
         const text = pendingReplyText.trim();
         pendingReplyText = '';
         if (text) {
+          responseSent = true;
+          responseForSession = props.sessionID;
+          disarmWorkingNotice();
           idleNotified.add(props.sessionID); // prevent "完成" from session.status(idle)
-          reply(lastPromptSid, `🤖\n${text}`);
+          log(`[IDLE] replying with text len=${text.length}`);
+          reply(lastPromptSid, `🤖 ${text}`);
           flushToWeChat();
           return null;
         }
-        return idleNotification(props);
+        if (!responseSent) {
+          // No text from SSE yet — forwardToAIAsync will deliver from HTTP response
+          // Don't set responseSent here; don't send "完成" notification
+          log(`[IDLE] no text accumulated, deferring to forwardToAIAsync`);
+          idleNotified.add(props.sessionID);
+          return null;
+        }
       }
       return idleNotification(props);
     }
@@ -1816,6 +1881,21 @@ async function eventToNotification(type, props) {
       if (!st) return null;
       if (st.type === 'idle') {
         updateSessionState(props.sessionID, { retryCount: 0, busySince: undefined });
+        // Check accumulated text before falling through to idleNotification
+        if (props.sessionID && props.sessionID === lastPromptSessionId) {
+          const text = pendingReplyText.trim();
+          pendingReplyText = '';
+          if (text) {
+            responseSent = true;
+            responseForSession = props.sessionID;
+            disarmWorkingNotice();
+            idleNotified.add(props.sessionID);
+            log(`[STATUS.IDLE] replying with text len=${text.length}`);
+            reply(lastPromptSid, `🤖 ${text}`);
+            flushToWeChat();
+            return null;
+          }
+        }
         return idleNotification(props);
       }
       if (st.type === 'retry') {
@@ -1836,10 +1916,11 @@ async function eventToNotification(type, props) {
       const psid = props.sessionID;
       if (psid) updateSessionState(psid, { lastActivity: Date.now() });
       // Only accumulate text parts for the active session
-      const partType = props.partType || props.type;
-      if (psid && psid === lastPromptSessionId && partType === 'text') {
-        const delta = props.delta || props.part?.text || '';
-        if (delta) pendingReplyText += delta;
+      const partType = props.field || props.partType;
+      const delta = props.delta || props.part?.text || '';
+      log(`[SSE] delta: type=${type} field="${partType}" delta_len=${delta.length} psid=${(psid||'?').slice(0,12)} lastSid=${(lastPromptSessionId||'?').slice(0,12)} pending_len=${pendingReplyText.length}`);
+      if (psid && psid === lastPromptSessionId && partType === 'text' && delta) {
+        pendingReplyText += delta;
       }
       return null;
     }
@@ -1891,6 +1972,7 @@ async function connectSSE() {
       sseReader = null;
       retryDelay = 1000;
       log('[SSE] Connected successfully');
+      syncPendingFromServer().catch(e => log(`[SYNC] reconnect sync error: ${e.message}`));
 
       const reader = response.body.getReader();
       sseReader = reader;
@@ -1911,7 +1993,7 @@ async function connectSSE() {
           const trimmed = line.trim();
           if (trimmed === '') {
             if (currentData) {
-              const rawBrief = currentData.slice(0, 120);
+              const rawBrief = currentData.slice(0, 400);
               log(`[SSE] raw data: ${rawBrief}`);
               try {
                 const parsed = JSON.parse(currentData);
@@ -2021,9 +2103,10 @@ function startWatchdog() {
         }
       }
 
-      // Periodic subscriber cleanup (run every 30 min)
+      // Periodic subscriber cleanup & server sync (run every 30 min)
       if (now - lastCleanupCheck > CLEANUP_INTERVAL) {
         lastCleanupCheck = now;
+        syncPendingFromServer().catch(e => log(`[SYNC] periodic sync error: ${e.message}`));
         const inactiveCutoff = now - settings.cleanupDays * 24 * 60 * 60 * 1000;
         const before = subscribers.length;
         subscribers = subscribers.filter(s => {
