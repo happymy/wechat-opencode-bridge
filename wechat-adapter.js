@@ -205,10 +205,32 @@ async function handleCommand(sid, text, msgId) {
 
 /* ───────── Command Handlers ───────── */
 
+async function getWorkspaceSessions() {
+  const dir = getWorkspaceDir();
+  const candidates = [dir];
+  for (const sub of ['plan', 'build', 'debug']) {
+    const subDir = join(dir, sub);
+    if (!candidates.some(c => c.toLowerCase() === subDir.toLowerCase())) candidates.push(subDir);
+  }
+  for (const d of candidates) {
+    const qs = new URLSearchParams({ directory: d, limit: '100' }).toString();
+    const res = await apiFetch(`/api/session?${qs}`).catch(() => null);
+    if (res?.data && Array.isArray(res.data) && res.data.length > 0) {
+      return res.data;
+    }
+  }
+  const fallback = await apiFetch('/session').catch(() => null);
+  if (Array.isArray(fallback)) {
+    const dirLower = dir.toLowerCase();
+    return fallback.filter(s => s.directory && s.directory.toLowerCase().startsWith(dirLower));
+  }
+  return [];
+}
+
 async function listSessions(sid, msgId) {
   try {
-    const sessions = await apiFetch('/session');
-    if (!Array.isArray(sessions) || sessions.length === 0) {
+    const sessions = await getWorkspaceSessions();
+    if (sessions.length === 0) {
       reply(sid, '📋 暂无会话');
       sendResponse(msgId, { stopReason: 'end_turn' });
       return;
@@ -259,7 +281,7 @@ async function switchSession(sid, arg, msgId) {
   // Try as number index first
   if (/^\d+$/.test(arg)) {
     try {
-      const sessions = await apiFetch('/session');
+      const sessions = await getWorkspaceSessions();
       if (!Array.isArray(sessions)) throw new Error('获取会话列表失败');
       const sorted = [...sessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
       const idx = parseInt(arg, 10) - 1;
@@ -364,7 +386,7 @@ async function newSession(sid, title, msgId) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: title.trim() }),
     });
-    currentSessionId = data.id || 'sess_' + Date.now();
+    currentSessionId = (data.id || 'sess_' + Date.now());
     saveSession(currentSessionId);
     reply(sid, `✅ 已创建并切换到「${title.trim()}」`);
   } catch (err) {
