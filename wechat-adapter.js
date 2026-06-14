@@ -212,24 +212,55 @@ async function getWorkspaceSessions() {
     const subDir = join(dir, sub);
     if (!candidates.some(c => c.toLowerCase() === subDir.toLowerCase())) candidates.push(subDir);
   }
+  if (currentSessionId) {
+    try {
+      const cur = await apiFetch(`/session/${encodeURIComponent(currentSessionId)}`).catch(() => null);
+      if (cur?.directory) {
+        const curDir = cur.directory;
+        if (!candidates.some(c => normalizeDir(c) === normalizeDir(curDir))) {
+          candidates.push(curDir);
+        }
+      }
+    } catch {}
+  }
+  let seen = new Set();
+  const result = [];
   for (const d of candidates) {
     const qs = new URLSearchParams({ directory: d, limit: '100' }).toString();
     const res = await apiFetch(`/api/session?${qs}`).catch(() => null);
-    if (res?.data && Array.isArray(res.data) && res.data.length > 0) {
-      return res.data;
+    if (res?.data && Array.isArray(res.data)) {
+      for (const s of res.data) {
+        if (!seen.has(s.id)) { seen.add(s.id); result.push(s); }
+      }
     }
   }
+  if (result.length > 0) return result;
   const fallback = await apiFetch('/session').catch(() => null);
   if (Array.isArray(fallback)) {
-    const dirLower = dir.toLowerCase();
-    return fallback.filter(s => s.directory && s.directory.toLowerCase().startsWith(dirLower));
+    const dirs = [...new Set(candidates.map(d => normalizeDir(d)))];
+    return fallback.filter(s => s.directory && dirs.some(d => normalizeDir(s.directory).startsWith(d)));
   }
   return [];
 }
 
 async function listSessions(sid, msgId) {
   try {
-    const sessions = await getWorkspaceSessions();
+    let sessions = await getWorkspaceSessions();
+    if (!Array.isArray(sessions)) sessions = [];
+
+    let currentInList = sessions.some(s => s.id === currentSessionId);
+    if (!currentInList && currentSessionId) {
+      try {
+        const cur = await apiFetch(`/session/${encodeURIComponent(currentSessionId)}`).catch(() => null);
+        if (cur && cur.id) {
+          if (!sessions.some(s => s.id === cur.id)) {
+            sessions.unshift(cur);
+          }
+          currentInList = true;
+        }
+      } catch {}
+    }
+
     if (sessions.length === 0) {
       reply(sid, '📋 暂无会话');
       sendResponse(msgId, { stopReason: 'end_turn' });
@@ -246,6 +277,7 @@ async function listSessions(sid, msgId) {
         .map(([id]) => id)
     );
 
+    const wsDir = getWorkspaceDir();
     const lines = [`📋 会话 (${sessions.length}个)`];
     lines.push('─'.repeat(16));
     show.forEach((s, i) => {
@@ -253,9 +285,14 @@ async function listSessions(sid, msgId) {
       const busy = busyIds.has(s.id) ? '▶' : ' ';
       const name = s.title || '(未命名)';
       const model = s.model?.id?.split('/').pop() || '';
-      lines.push(`${String(i + 1).padStart(2)} ${active}${busy} ${name}${model ? ' [' + model + ']' : ''}`);
+      const marker = (s.directory && normalizeDir(s.directory) !== normalizeDir(wsDir)) ? ' ⚡' : '';
+      lines.push(`${String(i + 1).padStart(2)} ${active}${busy} ${name}${model ? ' [' + model + ']' : ''}${marker}`);
     });
     if (sessions.length > maxShow) lines.push(`...及另外 ${sessions.length - maxShow} 个`);
+    if (!currentInList && currentSessionId) {
+      lines.push('─'.repeat(16));
+      lines.push('⚠️ 当前会话不在本工作区，编号切换不可用');
+    }
     lines.push('─'.repeat(16));
     lines.push('回复编号选会话，/switch <编号|ID> 切换');
     reply(sid, lines.join('\n'));
@@ -381,10 +418,11 @@ async function newSession(sid, title, msgId) {
     return;
   }
   try {
+    const dir = getWorkspaceDir();
     const data = await apiFetch('/session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: title.trim() }),
+      body: JSON.stringify({ title: title.trim(), directory: dir }),
     });
     currentSessionId = (data.id || 'sess_' + Date.now());
     saveSession(currentSessionId);
@@ -559,18 +597,15 @@ async function handleWorkspace(sid, arg, msgId) {
   const list = loadWorkspaces();
 
   if (!arg) {
-    const lines = ['📂 工作区', '─'.repeat(16)];
+    const lines = ['📂 工作区'];
     list.forEach((w, i) => {
       const mark = wsPathEqual(w.path, currentWorkspace?.path) ? ' ◀' : '';
-      const shortPath = w.path.length > 50 ? '...' + w.path.slice(-47) : w.path;
-      lines.push(`${i + 1}. ${w.name}${mark}`);
-      lines.push(`   ${shortPath}`);
+      lines.push(`#${i + 1} ${w.name}${mark} | ${w.path}`);
     });
-    lines.push('─'.repeat(16));
-    lines.push(`当前: ${currentWorkspace?.name}`);
-    lines.push('/workspace <编号> 切换');
-    lines.push('/workspace add <路径> [名称] 添加工作区');
-    lines.push('/workspace del <编号> 删除工作区');
+    lines.push('');
+    lines.push('/ws <编号>  切换');
+    lines.push('/ws add <路径> [名称]  添加');
+    lines.push('/ws del <编号>  删除');
     reply(sid, lines.join('\n'));
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
