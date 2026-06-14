@@ -8,20 +8,29 @@
   "shell": {
     "pwsh": "7.6.1"
   },
+  "script": {
+    "python": "3.14.2"
+  },
   "vcs": {
     "git": "2.54.0"
   },
   "opencode": {
-    "cli": "1.16.2",
+    "cli": "1.17.3",
     "sdk": "^1.16.2",
     "server": "http://localhost:4096",
     "server_auth": "opencode:opencode (Basic)"
+  },
+  "wechat": {
+    "acp": "0.8.0"
   },
   "repos": {
     "opencode-quickstart-workspace": {
       "remote": "https://github.com/happymy/opencode-quickstart-workspace.git",
       "branch": "dev3",
       "head": "7de9ebe"
+    },
+    "pk-opencode-webui": {
+      "remote": "https://github.com/prokube/pk-opencode-webui.git"
     }
   }
 }
