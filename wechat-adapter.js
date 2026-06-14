@@ -151,7 +151,7 @@ async function handleCommand(sid, text, msgId) {
 
   switch (cmd) {
     case '/list': case '/l': case '/sessions':
-      return listSessions(sid, msgId);
+      return listSessions(sid, arg, msgId);
     case '/switch': case '/s':
       return switchSession(sid, arg, msgId);
     case '/mute': case '/m':
@@ -212,41 +212,34 @@ async function getWorkspaceSessions() {
     const subDir = join(dir, sub);
     if (!candidates.some(c => c.toLowerCase() === subDir.toLowerCase())) candidates.push(subDir);
   }
-  if (currentSessionId) {
-    try {
-      const cur = await apiFetch(`/session/${encodeURIComponent(currentSessionId)}`).catch(() => null);
-      if (cur?.directory) {
-        const curDir = cur.directory;
-        if (!candidates.some(c => normalizeDir(c) === normalizeDir(curDir))) {
-          candidates.push(curDir);
-        }
-      }
-    } catch {}
-  }
-  let seen = new Set();
-  const result = [];
   for (const d of candidates) {
     const qs = new URLSearchParams({ directory: d, limit: '100' }).toString();
     const res = await apiFetch(`/api/session?${qs}`).catch(() => null);
-    if (res?.data && Array.isArray(res.data)) {
-      for (const s of res.data) {
-        if (!seen.has(s.id)) { seen.add(s.id); result.push(s); }
-      }
+    if (res?.data && Array.isArray(res.data) && res.data.length > 0) {
+      return res.data;
     }
   }
-  if (result.length > 0) return result;
   const fallback = await apiFetch('/session').catch(() => null);
   if (Array.isArray(fallback)) {
-    const dirs = [...new Set(candidates.map(d => normalizeDir(d)))];
-    return fallback.filter(s => s.directory && dirs.some(d => normalizeDir(s.directory).startsWith(d)));
+    const dirLower = dir.toLowerCase();
+    return fallback.filter(s => s.directory && s.directory.toLowerCase().startsWith(dirLower));
   }
   return [];
 }
 
-async function listSessions(sid, msgId) {
+async function listSessions(sid, arg, msgId) {
   try {
-    let sessions = await getWorkspaceSessions();
-    if (!Array.isArray(sessions)) sessions = [];
+    let sessions;
+    const allMatch = arg?.match(/^all\s*(\d+)?$/i);
+    const isAll = !!allMatch;
+    const allLimit = allMatch?.[1] ? parseInt(allMatch[1], 10) : 50;
+    if (isAll) {
+      const raw = await apiFetch('/session').catch(() => null);
+      sessions = Array.isArray(raw) ? raw : [];
+    } else {
+      sessions = await getWorkspaceSessions();
+      if (!Array.isArray(sessions)) sessions = [];
+    }
 
     let currentInList = sessions.some(s => s.id === currentSessionId);
     if (!currentInList && currentSessionId) {
@@ -267,7 +260,7 @@ async function listSessions(sid, msgId) {
       return;
     }
     const sorted = [...sessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
-    const maxShow = 20;
+    const maxShow = isAll ? allLimit : 20;
     const show = sorted.slice(0, maxShow);
 
     const statusMap = await apiFetch('/session/status').catch(() => ({}));
@@ -294,7 +287,7 @@ async function listSessions(sid, msgId) {
       lines.push('⚠️ 当前会话不在本工作区，编号切换不可用');
     }
     lines.push('─'.repeat(16));
-    lines.push('回复编号选会话，/switch <编号|ID> 切换');
+    lines.push(isAll ? '/switch <编号|ID> 切换  |  /l 查看本工作区' : '/l all [+数字]  返回全部会话前N条');
     reply(sid, lines.join('\n'));
   } catch (err) {
     reply(sid, `⚠️ 获取列表失败: ${err.message}`);
@@ -825,7 +818,7 @@ function showHelp(sid, msgId) {
     '🤖 微信远程编程助手',
     '─'.repeat(20),
     '── 会话管理 ──',
-    '/list (/l, /sessions)    查看会话列表',
+    '/list (/l, /sessions)    查看会话列表；/l all [+数字] 返回全部会话前N条',
     '/switch (/s) <编号|ID>   切换会话',
     '/new (/create) <会话名>  新建会话并切换（当前工作区）',
     '',
