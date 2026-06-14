@@ -208,8 +208,20 @@ async function handleCommand(sid, text, msgId) {
 async function listSessions(sid, msgId) {
   try {
     const dir = getWorkspaceDir();
-    const all = await apiFetch('/session');
-    const sessions = Array.isArray(all) ? all.filter(s => s.directory === dir) : [];
+    const candidates = [dir];
+    for (const sub of ['plan', 'build', 'debug']) {
+      const subDir = join(dir, sub);
+      if (!candidates.some(c => c.toLowerCase() === subDir.toLowerCase())) candidates.push(subDir);
+    }
+    let sessions = [];
+    for (const d of candidates) {
+      const qs = new URLSearchParams({ directory: d, limit: '100' }).toString();
+      const res = await apiFetch(`/api/session?${qs}`).catch(() => null);
+      if (res?.data && Array.isArray(res.data) && res.data.length > 0) {
+        sessions = res.data;
+        break;
+      }
+    }
     if (sessions.length === 0) {
       reply(sid, '📋 暂无会话');
       sendResponse(msgId, { stopReason: 'end_turn' });
@@ -361,20 +373,12 @@ async function newSession(sid, title, msgId) {
     return;
   }
   try {
-    const dir = getWorkspaceDir();
-    const data = await apiFetch('/api/session', {
+    const data = await apiFetch('/session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: title.trim(), location: { directory: dir } }),
-    }).catch(async () => {
-      const fallback = await apiFetch('/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: title.trim() }),
-      });
-      return { data: fallback };
+      body: JSON.stringify({ title: title.trim() }),
     });
-    currentSessionId = (data.data?.id || data.id || 'sess_' + Date.now());
+    currentSessionId = (data.id || 'sess_' + Date.now());
     saveSession(currentSessionId);
     reply(sid, `✅ 已创建并切换到「${title.trim()}」`);
   } catch (err) {
