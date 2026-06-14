@@ -208,8 +208,9 @@ async function handleCommand(sid, text, msgId) {
 async function listSessions(sid, msgId) {
   try {
     const dir = getWorkspaceDir();
-    const sessions = await apiFetch('/session?directory=' + encodeURIComponent(dir));
-    if (!Array.isArray(sessions) || sessions.length === 0) {
+    const all = await apiFetch('/session');
+    const sessions = Array.isArray(all) ? all.filter(s => s.directory === dir) : [];
+    if (sessions.length === 0) {
       reply(sid, '📋 暂无会话');
       sendResponse(msgId, { stopReason: 'end_turn' });
       return;
@@ -361,12 +362,19 @@ async function newSession(sid, title, msgId) {
   }
   try {
     const dir = getWorkspaceDir();
-    const data = await apiFetch('/session?directory=' + encodeURIComponent(dir), {
+    const data = await apiFetch('/api/session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: title.trim() }),
+      body: JSON.stringify({ title: title.trim(), location: { directory: dir } }),
+    }).catch(async () => {
+      const fallback = await apiFetch('/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: title.trim() }),
+      });
+      return { data: fallback };
     });
-    currentSessionId = data.id || 'sess_' + Date.now();
+    currentSessionId = (data.data?.id || data.id || 'sess_' + Date.now());
     saveSession(currentSessionId);
     reply(sid, `✅ 已创建并切换到「${title.trim()}」`);
   } catch (err) {
