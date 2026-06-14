@@ -207,7 +207,8 @@ async function handleCommand(sid, text, msgId) {
 
 async function listSessions(sid, msgId) {
   try {
-    const sessions = await apiFetch('/session');
+    const dir = getWorkspaceDir();
+    const sessions = await apiFetch('/session?directory=' + encodeURIComponent(dir));
     if (!Array.isArray(sessions) || sessions.length === 0) {
       reply(sid, '📋 暂无会话');
       sendResponse(msgId, { stopReason: 'end_turn' });
@@ -359,7 +360,8 @@ async function newSession(sid, title, msgId) {
     return;
   }
   try {
-    const data = await apiFetch('/session', {
+    const dir = getWorkspaceDir();
+    const data = await apiFetch('/session?directory=' + encodeURIComponent(dir), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: title.trim() }),
