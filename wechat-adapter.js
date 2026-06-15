@@ -53,8 +53,8 @@ const QUESTION_AUTO_CLEAR_MS = 86400000; // 24h safety net (server never auto-ex
 const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
 const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
 const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
-const REALTIME_FLUSH_MS = 100; // FULL 模式实时流式刷出间隔 (ms)
-const REALTIME_MIN_FLUSH = 30; // FULL 模式最小累积字符数后立即刷出
+const REALTIME_FLUSH_MS = 500; // FULL 模式实时流式刷出间隔 (ms)
+const REALTIME_MIN_FLUSH = 300; // FULL 模式最小累积字符数后立即刷出
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 let realtimeBuffer = '';       // FULL 模式实时文本缓冲
 let realtimeFlushTimer = null; // 实时刷出定时器
@@ -63,6 +63,40 @@ let lastReasoningTime = 0;     // 推理开始时间戳（PAD 模式显示时长
 let currentTextMessageId = null; // 当前回复的持久 messageId，所有文本块合并为一条微信消息
 let sseReadTimer = null;       // SSE 读取超时定时器
 let sseConnectionActive = false; // SSE 连接活跃标记
+
+/* ───────── Stdout Write Queue (backpressure-safe) ───────── */
+
+const stdoutQueue = [];
+let stdoutDraining = false;
+const STDOUT_QUEUE_LIMIT = 200;
+let stdoutQueueWarned = false;
+
+function writeStdout(msg) {
+  stdoutQueue.push(msg);
+  if (stdoutQueue.length > STDOUT_QUEUE_LIMIT && !stdoutQueueWarned) {
+    stdoutQueueWarned = true;
+    log(`[WARN] stdout queue ${stdoutQueue.length}, wechat-acp may be overloaded`);
+  }
+  if (!stdoutDraining) processStdoutQueue();
+}
+
+function processStdoutQueue() {
+  stdoutDraining = true;
+  while (stdoutQueue.length > 0) {
+    const msg = stdoutQueue[0];
+    const canContinue = process.stdout.write(msg);
+    if (!canContinue) {
+      process.stdout.once('drain', () => {
+        stdoutDraining = false;
+        processStdoutQueue();
+      });
+      return;
+    }
+    stdoutQueue.shift();
+  }
+  stdoutDraining = false;
+  stdoutQueueWarned = false;
+}
 
 /* ───────── Logging ───────── */
 
@@ -302,7 +336,7 @@ async function listSessions(sid, arg, msgId) {
     const maxShow = isAll ? allLimit : 20;
     const show = sorted.slice(0, maxShow);
 
-    const statusMap = await apiFetch('/api/session/status').catch(() => ({}));
+    const statusMap = await apiFetch('/session/status').catch(() => ({}));
     const busyIds = new Set(
       Object.entries(statusMap)
         .filter(([, s]) => s.type === 'busy')
@@ -430,7 +464,7 @@ async function cancelCurrent(sid, msgId) {
     return;
   }
   try {
-    await fetch(`${SERVER}/api/session/${encodeURIComponent(target)}/abort`, {
+    await fetch(`${SERVER}/session/${encodeURIComponent(target)}/abort`, {
       method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000),
     });
     reply(sid, '⏹️ 已发送取消请求');
@@ -597,7 +631,7 @@ async function handlePermissionReply(sid, action, arg, msgId) {
     if (!permSid) {
       throw new Error('未知会话，无法提交权限回复');
     }
-    await apiFetch(`/api/session/${encodeURIComponent(permSid)}/permission/${encodeURIComponent(targetRid)}/reply`, {
+    await apiFetch(`/permission/${encodeURIComponent(targetRid)}/reply`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reply: action, message: `via wechat-adapter (sid=${sid.slice(0,12)})` }),
@@ -618,7 +652,8 @@ async function handlePermissionReply(sid, action, arg, msgId) {
 async function syncPermissionsFromServer() {
   log(`[SYNC] start pendingPermissions.size=${pendingPermissions.size}`);
   try {
-    const list = await apiFetch(`/api/permission/request?location[directory]=${encodeURIComponent(getWorkspaceDir())}`);
+    const raw = await apiFetch(`/permission`);
+    const list = Array.isArray(raw) ? raw : (raw?.data || []);
     log(`[SYNC] server returned ${Array.isArray(list) ? list.length + ' items' : typeof list}`);
     if (!Array.isArray(list)) { log(`[SYNC] not an array, skipping`); return; }
     const serverIds = new Set(list.map(r => r.id));
@@ -637,9 +672,9 @@ async function syncPermissionsFromServer() {
 }
 
 async function syncPendingFromServer() {
-  const dir = getWorkspaceDir();
   try {
-    const permList = await apiFetch(`/api/permission/request?location[directory]=${encodeURIComponent(dir)}`);
+    const raw = await apiFetch(`/permission`);
+    const permList = Array.isArray(raw) ? raw : (raw?.data || []);
     const serverPermIds = new Set((Array.isArray(permList) ? permList : []).map(r => r.id));
     for (const [rid] of pendingPermissions) {
       if (!serverPermIds.has(rid)) {
@@ -660,8 +695,9 @@ async function syncPendingFromServer() {
       if (!qsid || seen.has(qsid)) continue;
       seen.add(qsid);
       try {
-        const sessQs = await apiFetch(`/api/session/${encodeURIComponent(qsid)}/question`);
-        const validIds = new Set((sessQs?.data || []).map(r => r.id));
+        const rawQs = await apiFetch(`/question?sessionID=${encodeURIComponent(qsid)}`);
+        const sessQs = Array.isArray(rawQs) ? rawQs : (rawQs?.data || []);
+        const validIds = new Set((sessQs || []).map(r => r.id));
         for (const q2 of allQuestions) {
           if (q2.sessionID !== qsid) continue;
           if (q2.requestID && !validIds.has(q2.requestID)) {
@@ -893,7 +929,7 @@ function makeWsName(dirPath, existing) {
 
 async function showTaskStatus(sid, msgId) {
   try {
-    const statusMap = await apiFetch('/api/session/status');
+    const statusMap = await apiFetch('/session/status');
     const lines = ['📊 任务状态', '─'.repeat(14)];
     let hasActive = false;
     for (const [id, st] of Object.entries(statusMap || {})) {
@@ -1245,7 +1281,7 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
     const timeout = setTimeout(() => controller.abort(), SESSION_MESSAGE_TIMEOUT);
     let res;
     try {
-      res = await fetch(`${SERVER}/api/session/${encodeURIComponent(targetId)}/question/${encodeURIComponent(requestID)}/reply`, {
+      res = await fetch(`${SERVER}/question/${encodeURIComponent(requestID)}/reply`, {
         method: 'POST',
         headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
         body: JSON.stringify({ answers: answers.map(a => [a]) }),
@@ -1337,7 +1373,7 @@ async function skipQuestion(sid, arg, msgId) {
   const qSessID = qData?.sessionID;
   if (requestID && qSessID) {
     try {
-      await fetch(`${SERVER}/api/session/${encodeURIComponent(qSessID)}/question/${encodeURIComponent(requestID)}/reject`, {
+      await fetch(`${SERVER}/question/${encodeURIComponent(requestID)}/reject`, {
         method: 'POST',
         headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -1524,7 +1560,7 @@ async function handleLoadSession(msg) {
 async function handleCancel(msg) {
   const cancelTargets = [msg.params?.sessionId, currentSessionId].filter(Boolean);
   for (const id of [...new Set(cancelTargets)]) {
-    try { await fetch(`${SERVER}/api/session/${encodeURIComponent(id)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
+    try { await fetch(`${SERVER}/session/${encodeURIComponent(id)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
   }
   disarmWorkingNotice();
   pendingReplyText = '';
@@ -1668,14 +1704,14 @@ function reply(sid, text, msgId) {
 }
 
 function sendResponse(id, result) {
-  const msg = JSON.stringify({ jsonrpc: '2.0', id, result });
-  process.stdout.write(msg + '\n');
+  const msg = JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n';
+  writeStdout(msg);
   log(`→ response id=${id} ok${result._meta?.error ? ' ERR=' + result._meta.error : ''}`);
 }
 
 function sendNotification(method, params) {
-  const msg = JSON.stringify({ jsonrpc: '2.0', method, params });
-  process.stdout.write(msg + '\n');
+  const msg = JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n';
+  writeStdout(msg);
   log(`→ notify ${method} ${params.sessionId ? 'sid='+params.sessionId.slice(0,12) : ''} ${params.update?.sessionUpdate || ''} ${params.update?.content?.type || ''}`);
 }
 
@@ -2080,11 +2116,13 @@ async function eventToNotification(type, props) {
       return null;
     }
     case 'session.idle': {
-      // Clear stale pending questions for this session
-      if (pendingQuestions && pendingQuestions.sessionID === props.sessionID) {
-        pendingQuestions = null;
+      // Clear stale pending questions only if no active interaction
+      if (lastPromptSessionId !== props.sessionID) {
+        if (pendingQuestions && pendingQuestions.sessionID === props.sessionID) {
+          pendingQuestions = null;
+        }
+        pendingQuestionQueue = pendingQuestionQueue.filter(q => q.sessionID !== props.sessionID);
       }
-      pendingQuestionQueue = pendingQuestionQueue.filter(q => q.sessionID !== props.sessionID);
       clearToolStates();
 
       if (props.sessionID && props.sessionID === lastPromptSessionId) {
@@ -2231,15 +2269,16 @@ async function eventToNotification(type, props) {
         if (partType === 'reasoning') {
           if (reasonTime.start && !toolStates.has(partId + '_reason')) {
             toolStates.set(partId + '_reason', { startTime: Date.now() });
-            if (lastPromptSid) reply(lastPromptSid, '🤔 Thinking...');
+            if (lastPromptSid) realtimeReply(lastPromptSid, '🤔 Thinking...');
           }
           if (delta && lastPromptSid) {
-            reply(lastPromptSid, '🤔 ' + delta);
+            realtimeBuffer += delta;
+            pendingReplyText += delta;
           }
           if (reasonTime.end) {
             const ts = toolStates.get(partId + '_reason');
             const dur = ts ? formatDuration(ts.startTime) : '';
-            if (lastPromptSid) reply(lastPromptSid, `✅ Thinking complete${dur ? ' (' + dur + ')' : ''}`);
+            if (lastPromptSid) realtimeReply(lastPromptSid, `✅ Thinking complete${dur ? ' (' + dur + ')' : ''}`);
             toolStates.delete(partId + '_reason');
           }
           return null;
@@ -2249,21 +2288,21 @@ async function eventToNotification(type, props) {
             if (!toolStates.has(partId)) {
               toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
               const inp = formatToolInput(part.input);
-              if (lastPromptSid) reply(lastPromptSid, `🔧 ${toolName}${inp ? ' ' + inp : ''}`);
+              if (lastPromptSid) realtimeReply(lastPromptSid, `🔧 ${toolName}${inp ? ' ' + inp : ''}`);
             }
           } else if (toolStatus === 'completed') {
             clearToolStates();
             const outBrief = toolOutput ? toolOutput.replace(/\n/g, ' ').slice(0, 120) : '';
             if (lastPromptSid) {
               if (outBrief) {
-                reply(lastPromptSid, `✅ ${toolName}\n${outBrief}`);
+                realtimeReply(lastPromptSid, `✅ ${toolName}\n${outBrief}`);
               } else {
-                reply(lastPromptSid, `✅ ${toolName}`);
+                realtimeReply(lastPromptSid, `✅ ${toolName}`);
               }
             }
           } else if (toolStatus === 'error') {
             clearToolStates();
-            if (lastPromptSid) reply(lastPromptSid, `❌ ${toolName}: ${toolOutput || 'error'}`);
+            if (lastPromptSid) realtimeReply(lastPromptSid, `❌ ${toolName}: ${toolOutput || 'error'}`);
           }
           return null;
         }
@@ -2335,8 +2374,9 @@ async function eventToNotification(type, props) {
 async function fetchSessionName(id) {
   if (!id || sessionNames.has(id)) return;
   try {
-    const data = await apiFetch(`/api/session/${encodeURIComponent(id)}`);
-    if (data.title) sessionNames.set(id, data.title);
+    const raw = await apiFetch(`/api/session/${encodeURIComponent(id)}`);
+    const data = raw?.data || raw;
+    if (data?.title) sessionNames.set(id, data.title);
   } catch {}
 }
 
