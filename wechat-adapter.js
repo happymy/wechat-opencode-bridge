@@ -558,6 +558,12 @@ async function handleFilterLevel(sid, arg, msgId) {
     }
     lines.push('─'.repeat(14));
     lines.push('/f (FULL) 全部显示  |  /pd (PAD) 摘要显示  |  /ph (PHONE) 极简显示');
+    lines.push('');
+    lines.push('⚠️ FULL 模式通过微信实时推送每个文本增量，');
+    lines.push('   长文本时微信 API 限流或网络波动可能导致部分消息丢失。');
+    lines.push('   如需完整响应，建议使用 PAD 模式的折叠摘要，');
+    lines.push('   或通过 OpenCode Web UI (http://localhost:4096) 查看完整输出。');
+    lines.push('   推荐使用 PAD 模式（默认）。');
     reply(sid, lines.join('\n'));
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
@@ -574,7 +580,11 @@ async function handleFilterLevel(sid, arg, msgId) {
 async function setFilterLevel(sid, level, msgId) {
   filterLevel = level;
   saveFilterLevel();
-  reply(sid, `${levelIcon(level)} 已切换到 ${level.toUpperCase()} 模式\n${levelDesc(level)}`);
+  let msg = `${levelIcon(level)} 已切换到 ${level.toUpperCase()} 模式\n${levelDesc(level)}`;
+  if (level === 'full') {
+    msg += '\n\n⚠️ FULL 模式通过微信实时推送每个文本增量，长文本时微信 API 限流或网络波动可能导致部分消息丢失。推荐使用 PAD 模式，或通过 OpenCode Web UI (http://localhost:4096) 查看完整输出。';
+  }
+  reply(sid, msg);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
@@ -583,7 +593,7 @@ function levelIcon(lv) {
 }
 function levelDesc(lv) {
   return {
-    full: '实时流式输出，每个工具/文本增量即时发送',
+    full: '实时流式输出 ⚠️ 长文本可能丢消息，推荐在 Web UI 使用',
     pad: '折叠摘要（工具调用、推理时间折叠为单行），隐藏工具输出',
     phone: '极简模式，仅显示 AI 文本回复和错误',
   }[lv] || '';
@@ -1074,6 +1084,11 @@ function showHelp(sid, msgId) {
     '',
     '💡 通知消息中可直接回复答案或权限审批，无需输入命令',
     '💡 未识别的消息将转发给当前选中的 AI 会话',
+    '',
+    '⚠️ FULL 模式 ( /f )：实时推送每个文本/工具增量到微信',
+    '   长文本时微信 API 限流或网络波动可能导致消息丢失。',
+    '   推荐使用 PAD 模式 ( /pd )，确保完整输出。',
+    '   完整输出也可在 OpenCode Web UI (http://localhost:4096) 查看。',
   ];
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
@@ -1562,7 +1577,10 @@ async function forwardToAIAsync(sid, targetId, text) {
     const accumulated = pendingReplyText.trim();
     pendingReplyText = '';
     pendingTruncated = false;
-    if (accumulated) {
+    // FULL mode: streaming chunks already sent via flushToWeChat, skip duplicate
+    if (isFull()) {
+      flushToWeChat();
+    } else if (accumulated) {
       reply(sid, `🤖 ${accumulated}`);
       flushToWeChat();
     } else {
@@ -1581,7 +1599,12 @@ async function forwardToAIAsync(sid, targetId, text) {
       pendingReplyText = '';
       pendingTruncated = false;
       responseSent = true;
-      responseForSession = targetId;
+      responseForSession = null;
+      lastPromptSessionId = null;
+      lastPromptSid = null;
+      currentTextMessageId = null;
+      realtimeBuffer = '';
+      if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
       idleNotified.add(targetId);
       disarmWorkingNotice();
       if (accumulated) {
@@ -1593,7 +1616,12 @@ async function forwardToAIAsync(sid, targetId, text) {
       pendingReplyText = '';
       pendingTruncated = false;
       responseSent = true;
-      responseForSession = targetId;
+      responseForSession = null;
+      lastPromptSessionId = null;
+      lastPromptSid = null;
+      currentTextMessageId = null;
+      realtimeBuffer = '';
+      if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
       reply(sid, `❌ ${err.message}`);
     }
     await drainPendingNotifications();
