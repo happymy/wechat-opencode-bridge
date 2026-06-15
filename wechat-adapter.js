@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { execSync } from 'node:child_process';
+import { execSync, exec } from 'node:child_process';
 
 const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
 const AUTH = 'Basic ' + Buffer.from(process.env.OPENCODE_AUTH || 'opencode:opencode').toString('base64');
@@ -33,12 +33,14 @@ function isPhone() { return filterLevel === 'phone'; }
 
 filterLevel = loadFilterLevel();
 let lineBuf = '';
+let lineBufOverflowCount = 0;
 let subscribers = [];
 let sessionStates = new Map();
 let pendingNotifications = [];
 let pendingPermissions = new Map();
 let pendingQuestions = null;
 let draining = false;
+let pendingTruncated = false;
 
 // Response handling
 let lastPromptSid = null;     // last wechat user who sent a prompt
@@ -68,13 +70,26 @@ let sseConnectionActive = false; // SSE 连接活跃标记
 
 const stdoutQueue = [];
 let stdoutDraining = false;
-const STDOUT_QUEUE_LIMIT = 200;
-const STDOUT_DROP_BATCH = 50;
+const STDOUT_WARN_THRESHOLD = 200;
+const STDOUT_QUEUE_LIMIT = 500;
+const STDOUT_DROP_BATCH = 100;
+
+let stdoutDropLogged = new Set();
 
 function writeStdout(msg) {
   if (stdoutQueue.length >= STDOUT_QUEUE_LIMIT + STDOUT_DROP_BATCH) {
     const dropped = stdoutQueue.splice(0, stdoutQueue.length - STDOUT_QUEUE_LIMIT);
-    log(`[WARN] stdout queue overload: dropped ${dropped.length} oldest messages, queue=${stdoutQueue.length}`);
+    const isResponse = /"jsonrpc"\s*:\s*"2\.0"\s*,\s*"id"\s*:/.test(msg);
+    if (isResponse) {
+      stdoutQueue.push(msg);
+      log(`[WARN] stdout queue overflow, preserved response, dropped ${dropped.length} notifications`);
+      if (!stdoutDraining) processStdoutQueue();
+      return;
+    }
+    log(`[WARN] stdout queue overflow: dropped ${dropped.length} oldest messages`);
+  } else if (stdoutQueue.length >= STDOUT_WARN_THRESHOLD && !stdoutDropLogged.has(Math.floor(stdoutQueue.length / 50))) {
+    stdoutDropLogged.add(Math.floor(stdoutQueue.length / 50));
+    log(`[WARN] stdout queue growing: ${stdoutQueue.length} items`);
   }
   stdoutQueue.push(msg);
   if (!stdoutDraining) processStdoutQueue();
@@ -121,9 +136,13 @@ function uuid() { return randomUUID() || 'msg_' + Date.now() + '_' + Math.random
 
 /* ───────── ACP Protocol ───────── */
 
-rl.on('line', (line) => {
-  if (lineBuf.length > 65536) { log('[WARN] lineBuf overflow, clearing'); lineBuf = ''; }
-  lineBuf += line;
+  rl.on('line', (line) => {
+    if (lineBuf.length > 65536) {
+      lineBufOverflowCount++;
+      log(`[WARN] lineBuf overflow #${lineBufOverflowCount}, clearing (size=${lineBuf.length})`);
+      lineBuf = '';
+    }
+    lineBuf += line;
   let msg;
   try { msg = JSON.parse(lineBuf); lineBuf = ''; } catch { return; }
   const m = msg.method;
@@ -199,6 +218,7 @@ async function handlePrompt(msg) {
     lastPromptSessionId = targetId;
     lastPromptText = text;
     pendingReplyText = '';
+    pendingTruncated = false;
     responseSent = false;
     responseForSession = targetId;
     currentTextMessageId = uuid();
@@ -378,6 +398,7 @@ async function listSessions(sid, arg, msgId) {
 async function switchSession(sid, arg, msgId) {
   disarmWorkingNotice();
   pendingReplyText = '';
+  pendingTruncated = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -459,6 +480,7 @@ function showNotifyStatus(sid, msgId) {
 async function cancelCurrent(sid, msgId) {
   disarmWorkingNotice();
   pendingReplyText = '';
+  pendingTruncated = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -484,6 +506,7 @@ async function cancelCurrent(sid, msgId) {
 async function newSession(sid, title, msgId) {
   disarmWorkingNotice();
   pendingReplyText = '';
+  pendingTruncated = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -796,6 +819,7 @@ async function handleWorkspace(sid, arg, msgId) {
 
   disarmWorkingNotice();
   pendingReplyText = '';
+  pendingTruncated = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -839,6 +863,43 @@ function discoverWorkspacesViaDb() {
   }
 }
 
+async function discoverWorkspacesViaDbAsync() {
+  try {
+    const { stdout } = await new Promise((resolve, reject) => {
+      exec(
+        'opencode db "SELECT id, worktree, sandboxes FROM project WHERE id != \'global\'" --format json',
+        { encoding: 'utf8', timeout: 15000 },
+        (err, stdout) => {
+          if (err) reject(err);
+          else resolve({ stdout });
+        }
+      );
+    });
+    const projects = JSON.parse(stdout.trim());
+    if (!Array.isArray(projects)) return [];
+    const dirs = new Set();
+    for (const p of projects) {
+      if (p.worktree && p.worktree !== '/') {
+        dirs.add(p.worktree.replace(/\//g, '\\'));
+      }
+      if (p.sandboxes) {
+        try {
+          const boxes = JSON.parse(p.sandboxes);
+          if (Array.isArray(boxes)) {
+            for (const s of boxes) {
+              if (s) dirs.add(s.replace(/\//g, '\\'));
+            }
+          }
+        } catch (e) { log(`[SD] parse sandboxes JSON failed: ${e.message}`); }
+      }
+    }
+    return [...dirs];
+  } catch (err) {
+    log(`[SD] async db query failed: ${err.message}`);
+    return [];
+  }
+}
+
 async function handleSyncDir(sid, msgId) {
   try {
     const existing = loadWorkspaces();
@@ -849,7 +910,7 @@ async function handleSyncDir(sid, msgId) {
     function isExisting(p) { return existingPaths.has(p.toLowerCase()); }
     function markExisting(p) { existingPaths.add(p.toLowerCase()); }
 
-    const dbDirs = discoverWorkspacesViaDb();
+    const dbDirs = await discoverWorkspacesViaDbAsync();
     if (dbDirs.length > 0) {
       for (const dirPath of dbDirs) {
         if (isExisting(dirPath)) {
@@ -1276,6 +1337,7 @@ async function answerQuestion(sid, answer, msgId) {
   currentTextMessageId = uuid();
   disarmWorkingNotice();
   pendingReplyText = '';
+  pendingTruncated = false;
   responseSent = false;
   responseForSession = qData.sessionID || targetId;
   armWorkingNotice(sid);
@@ -1308,6 +1370,7 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
       responseSent = true;
       responseForSession = null;
       pendingReplyText = '';
+      pendingTruncated = false;
       const errText = await res.text();
       reply(sid, `⚠️ 回答提交失败 (${res.status}): ${errText.slice(0, 100)}`);
       await drainPendingNotifications();
@@ -1321,6 +1384,7 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
     responseSent = true;
     responseForSession = null;
     pendingReplyText = '';
+    pendingTruncated = false;
     reply(sid, `❌ 回答提交失败: ${err.message}`);
     await drainPendingNotifications();
     flushToWeChat();
@@ -1486,6 +1550,7 @@ async function forwardToAIAsync(sid, targetId, text) {
     idleNotified.add(targetId);
     const accumulated = pendingReplyText.trim();
     pendingReplyText = '';
+    pendingTruncated = false;
     if (accumulated) {
       reply(sid, `🤖 ${accumulated}`);
       flushToWeChat();
@@ -1503,6 +1568,7 @@ async function forwardToAIAsync(sid, targetId, text) {
       const accumulated = pendingReplyText.trim();
       log(`[FWD] timeout: lastSid=${(lastPromptSessionId||'?').slice(0,12)} targetId=${(targetId||'?').slice(0,12)} text_len=${text.length} pending_len=${pendingReplyText.length} accumulated_len=${accumulated.length}`);
       pendingReplyText = '';
+      pendingTruncated = false;
       responseSent = true;
       responseForSession = targetId;
       idleNotified.add(targetId);
@@ -1513,6 +1579,8 @@ async function forwardToAIAsync(sid, targetId, text) {
         reply(sid, '⏰ 请求超时，请重试');
       }
     } else {
+      pendingReplyText = '';
+      pendingTruncated = false;
       responseSent = true;
       responseForSession = targetId;
       reply(sid, `❌ ${err.message}`);
@@ -1591,6 +1659,7 @@ async function handleCancel(msg) {
   }
   disarmWorkingNotice();
   pendingReplyText = '';
+  pendingTruncated = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -1743,12 +1812,12 @@ function sendNotification(method, params) {
 }
 
 async function apiFetch(path, opts = {}) {
-  const method = opts.method || 'GET';
+  const { headers: extraHeaders, timeout = 15000, ...rest } = opts;
+  const method = rest.method || 'GET';
   log(`[API] ${method} ${path}`);
-  const { headers: extraHeaders, ...rest } = opts;
   const res = await fetch(`${SERVER}${path}`, {
     headers: { Authorization: AUTH, ...extraHeaders },
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(timeout),
     ...rest,
   });
   log(`[API] => ${res.status} ${method} ${path}`);
@@ -2175,6 +2244,8 @@ async function eventToNotification(type, props) {
             reply(lastPromptSid, '🤖 ' + realtimeBuffer, currentTextMessageId);
             realtimeBuffer = '';
           }
+          pendingReplyText = '';
+          pendingTruncated = false;
           if (!responseSent) {
             responseSent = true;
             responseForSession = props.sessionID;
@@ -2223,6 +2294,8 @@ async function eventToNotification(type, props) {
               reply(lastPromptSid, '🤖 ' + realtimeBuffer, currentTextMessageId);
               realtimeBuffer = '';
             }
+            pendingReplyText = '';
+            pendingTruncated = false;
             if (!responseSent) {
               responseSent = true;
               responseForSession = props.sessionID;
@@ -2299,7 +2372,8 @@ async function eventToNotification(type, props) {
           scheduleRealtimeFlush(lastPromptSid);
           if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
             pendingReplyText += delta;
-          } else if (!pendingReplyText.endsWith('…（内容过长）')) {
+          } else if (!pendingTruncated) {
+            pendingTruncated = true;
             pendingReplyText += '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
           }
           if (realtimeBuffer.length >= REALTIME_MIN_FLUSH || /[\n。！？.!?]/.test(delta)) {
@@ -2367,8 +2441,9 @@ async function eventToNotification(type, props) {
         if (partType === 'text' && delta) {
           if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
             pendingReplyText += delta;
-          } else if (!pendingReplyText.endsWith('…（过长截断）')) {
-            pendingReplyText += '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+          } else if (!pendingTruncated) {
+            pendingTruncated = true;
+            pendingReplyText += '\n\n…（内容过长）';
           }
         }
         return null;
@@ -2378,8 +2453,9 @@ async function eventToNotification(type, props) {
       if (partType === 'text' && delta) {
         if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
           pendingReplyText += delta;
-        } else if (!pendingReplyText.endsWith('…（过长截断）')) {
-          pendingReplyText += '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+        } else if (!pendingTruncated) {
+          pendingTruncated = true;
+          pendingReplyText += '\n\n…（内容过长）';
         }
         return null;
       }
@@ -2400,7 +2476,7 @@ async function eventToNotification(type, props) {
         if ((toolStatus === 'running' || !toolStatus) && !toolStates.has(partId)) {
           toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
           const inp = formatToolInput(part.input);
-          return `⚙${toolName}${inp ? ' ' + inp : ''}`;
+          return `⚙ ${toolName}${inp ? ' ' + inp : ''}`;
         }
         if (toolStatus === 'completed') {
           clearToolStates();
@@ -2495,6 +2571,7 @@ async function connectSSE() {
         }
         if (sseTimedOut) {
           log(`[SSE] timeout triggered before read completed, breaking`);
+          sseConnectionActive = false;
           break;
         }
         const { done, value } = readResult;
@@ -2572,6 +2649,7 @@ async function connectSSE() {
       log(`[SSE] Error: ${err.message}, retry in ${retryDelay}ms`);
     } finally {
       sseReader = null;
+      sseConnectionActive = false;
     }
 
     await new Promise(r => setTimeout(r, retryDelay));
@@ -2586,10 +2664,24 @@ function startWatchdog() {
   const STUCK_ALERT_MS = 10 * 60 * 1000;
   let lastCleanupCheck = 0;
   const CLEANUP_INTERVAL = 30 * 60 * 1000;
+  let lastPermSyncCheck = 0;
+  const PERM_SYNC_INTERVAL = 5 * 60 * 1000;
+  let lastSseHealthWarn = 0;
 
   setInterval(() => {
     try {
       const now = Date.now();
+
+      // SSE 连接健康检查
+      if (!sseConnectionActive && sseReader === null) {
+        if (now - lastSseHealthWarn > 60000) {
+          lastSseHealthWarn = now;
+          log(`[WATCHDOG] SSE connection is down (reader=null), connectSSE() should be reconnecting...`);
+        }
+      } else if (sseConnectionActive) {
+        lastSseHealthWarn = 0;
+      }
+
       for (const [id, state] of sessionStates.entries()) {
         if (state.busySince && state.lastActivity) {
           const busyDuration = now - state.busySince;
@@ -2619,7 +2711,19 @@ function startWatchdog() {
           idleNotified.delete(id);
         }
       }
+      // 清理孤儿 sessionNames（有 entry 但对应的 session 已不存在）
+      const activeSessionIds = new Set([...sessionStates.keys(), currentSessionId].filter(Boolean));
+      for (const [id] of sessionNames) {
+        if (!activeSessionIds.has(id) && (Date.now() - (sessionNames.get(id)?.ts || 0) > 3600000)) {
+          sessionNames.delete(id);
+        }
+      }
 
+      // Periodic permission sync (run every 5 min)
+      if (now - lastPermSyncCheck > PERM_SYNC_INTERVAL) {
+        lastPermSyncCheck = now;
+        syncPermissionsFromServer().catch(e => log(`[SYNC] perm sync error: ${e.message}`));
+      }
       // Periodic subscriber cleanup & server sync (run every 30 min)
       if (now - lastCleanupCheck > CLEANUP_INTERVAL) {
         lastCleanupCheck = now;
@@ -2649,6 +2753,13 @@ function startWatchdog() {
             if (ts < dedupCutoff) userMap.delete(txt);
           }
         }
+        // Clean stdout drop warning log cache
+        stdoutDropLogged.clear();
+      }
+
+      // Warn if pendingReplyText is very large (wechat-acp chunks[] may be growing unbounded)
+      if (pendingReplyText.length > 30000) {
+        log(`[WATCHDOG] WARN: pendingReplyText=${pendingReplyText.length} chars, wechat-acp chunks buffer may be large`);
       }
     } catch (e) {
       log(`[WATCHDOG] error: ${e.message}`);
