@@ -445,7 +445,7 @@ async function newSession(sid, title, msgId) {
   }
   try {
     const dir = getWorkspaceDir();
-    const data = await apiFetch('/session', {
+    const data = await apiFetch('/api/session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: title.trim(), directory: dir }),
@@ -1457,10 +1457,11 @@ async function handleNewSession(msg) {
     return;
   }
   try {
-    const res = await fetch(`${SERVER}/session`, {
+    const dir = getWorkspaceDir();
+    const res = await fetch(`${SERVER}/api/session`, {
       method: 'POST',
       headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'WeChat' }),
+      body: JSON.stringify({ title: 'WeChat', directory: dir }),
     });
     const data = res.ok ? await res.json() : {};
     currentSessionId = data.id || ('sess_' + Date.now());
