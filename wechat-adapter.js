@@ -252,10 +252,11 @@ async function getWorkspaceSessions() {
       return res.data;
     }
   }
-  const fallback = await apiFetch('/session').catch(() => null);
-  if (Array.isArray(fallback)) {
+  const fallback = await apiFetch('/api/session?limit=100').catch(() => null);
+  const list = Array.isArray(fallback) ? fallback : (fallback?.data || []);
+  if (list.length > 0) {
     const dirLower = dir.toLowerCase();
-    return fallback.filter(s => s.directory && s.directory.toLowerCase().startsWith(dirLower));
+    return list.filter(s => s.directory && s.directory.toLowerCase().startsWith(dirLower));
   }
   return [];
 }
@@ -267,8 +268,8 @@ async function listSessions(sid, arg, msgId) {
     const isAll = !!allMatch;
     const allLimit = allMatch?.[1] ? parseInt(allMatch[1], 10) : 50;
     if (isAll) {
-      const raw = await apiFetch('/session').catch(() => null);
-      sessions = Array.isArray(raw) ? raw : [];
+      const raw = await apiFetch('/api/session?limit=100').catch(() => null);
+      sessions = Array.isArray(raw) ? raw : (raw?.data || []);
     } else {
       sessions = await getWorkspaceSessions();
       if (!Array.isArray(sessions)) sessions = [];
@@ -277,7 +278,7 @@ async function listSessions(sid, arg, msgId) {
     let currentInList = sessions.some(s => s.id === currentSessionId);
     if (!currentInList && currentSessionId) {
       try {
-        const cur = await apiFetch(`/session/${encodeURIComponent(currentSessionId)}`).catch(() => null);
+        const cur = await apiFetch(`/api/session/${encodeURIComponent(currentSessionId)}`).catch(() => null);
         if (cur && cur.id) {
           if (!sessions.some(s => s.id === cur.id)) {
             sessions.unshift(cur);
@@ -296,7 +297,7 @@ async function listSessions(sid, arg, msgId) {
     const maxShow = isAll ? allLimit : 20;
     const show = sorted.slice(0, maxShow);
 
-    const statusMap = await apiFetch('/session/status').catch(() => ({}));
+    const statusMap = await apiFetch('/api/session/status').catch(() => ({}));
     const busyIds = new Set(
       Object.entries(statusMap)
         .filter(([, s]) => s.type === 'busy')
@@ -366,7 +367,7 @@ async function switchSession(sid, arg, msgId) {
 
   // Try as session ID directly
   try {
-    const data = await apiFetch(`/session/${encodeURIComponent(arg)}`);
+    const data = await apiFetch(`/api/session/${encodeURIComponent(arg)}`);
     currentSessionId = data.id || arg;
     saveSession(currentSessionId);
     reply(sid, `✅ 已切换到「${data.title || '(未命名)'}」`);
@@ -421,7 +422,7 @@ async function cancelCurrent(sid, msgId) {
     return;
   }
   try {
-    await fetch(`${SERVER}/session/${encodeURIComponent(target)}/abort`, {
+    await fetch(`${SERVER}/api/session/${encodeURIComponent(target)}/abort`, {
       method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000),
     });
     reply(sid, '⏹️ 已发送取消请求');
@@ -807,11 +808,11 @@ async function handleSyncDir(sid, msgId) {
       }
     } else {
       log('[SD] db returned no directories, trying HTTP API fallback...');
-      const projects = await apiFetch('/project').catch(() => null);
+      const projects = await apiFetch('/api/project').catch(() => null);
       if (Array.isArray(projects) && projects.length > 0) {
         for (const p of projects) {
           try {
-            const dirs = await apiFetch(`/project/${encodeURIComponent(p.id)}/directories`);
+            const dirs = await apiFetch(`/api/project/${encodeURIComponent(p.id)}/directories`);
             if (!Array.isArray(dirs)) continue;
             for (const d of dirs) {
               const dirPath = d.directory;
@@ -833,9 +834,10 @@ async function handleSyncDir(sid, msgId) {
 
       if (added.length === 0) {
         log('[SD] project API yielded no directories, trying session fallback...');
-        const sessions = await apiFetch('/session').catch(() => null);
-        if (Array.isArray(sessions)) {
-          const dirs = [...new Set(sessions.map(s => s.directory).filter(Boolean))];
+        const sessions = await apiFetch('/api/session?limit=100').catch(() => null);
+        const sessionsList = Array.isArray(sessions) ? sessions : (sessions?.data || []);
+        if (sessionsList.length > 0) {
+          const dirs = [...new Set(sessionsList.map(s => s.directory).filter(Boolean))];
           for (const dirPath of dirs) {
             if (isExisting(dirPath)) {
               skipped.push({ name: basename(dirPath), path: dirPath });
@@ -880,13 +882,13 @@ function makeWsName(dirPath, existing) {
 
 async function showTaskStatus(sid, msgId) {
   try {
-    const statusMap = await apiFetch('/session/status');
+    const statusMap = await apiFetch('/api/session/status');
     const lines = ['📊 任务状态', '─'.repeat(14)];
     let hasActive = false;
     for (const [id, st] of Object.entries(statusMap || {})) {
       if (st.type === 'busy') {
         hasActive = true;
-        const info = await apiFetch(`/session/${encodeURIComponent(id)}`).catch(() => null);
+        const info = await apiFetch(`/api/session/${encodeURIComponent(id)}`).catch(() => null);
         const name = info?.title || id.slice(0, 16);
         const isCurrent = id === currentSessionId ? ' ◀当前' : '';
         lines.push(`▶ ${name} — 运行中${isCurrent}`);
@@ -1476,9 +1478,10 @@ async function handleNewSession(msg) {
 
 async function handleListSessions(msg) {
   try {
-    const res = await fetch(`${SERVER}/session`, { headers: { Authorization: AUTH } });
+    const res = await fetch(`${SERVER}/api/session?limit=100`, { headers: { Authorization: AUTH } });
     const list = res.ok ? await res.json() : [];
-    const sessions = (Array.isArray(list) ? list : []).map(s => ({
+    const arr = Array.isArray(list) ? list : (list?.data || []);
+    const sessions = arr.map(s => ({
       sessionId: s.id, cwd: s.directory || '', title: s.title || '',
       updatedAt: s.time?.updated ? new Date(s.time.updated).toISOString() : undefined,
     }));
@@ -1493,7 +1496,7 @@ async function handleLoadSession(msg) {
   const sessionId = msg.params?.sessionId;
   if (!sessionId) { sendResponse(msg.id, { _meta: { error: 'sessionId required' } }); return; }
   try {
-    const data = await apiFetch(`/session/${encodeURIComponent(sessionId)}`);
+    const data = await apiFetch(`/api/session/${encodeURIComponent(sessionId)}`);
     currentSessionId = data.id || sessionId;
     saveSession(currentSessionId);
     sendResponse(msg.id, { sessionId: currentSessionId, cwd: data.directory || '', title: data.title || '',
@@ -1506,7 +1509,7 @@ async function handleLoadSession(msg) {
 async function handleCancel(msg) {
   const cancelTargets = [msg.params?.sessionId, currentSessionId].filter(Boolean);
   for (const id of [...new Set(cancelTargets)]) {
-    try { await fetch(`${SERVER}/session/${encodeURIComponent(id)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
+    try { await fetch(`${SERVER}/api/session/${encodeURIComponent(id)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
   }
   disarmWorkingNotice();
   pendingReplyText = '';
@@ -2250,7 +2253,7 @@ async function eventToNotification(type, props) {
 async function fetchSessionName(id) {
   if (!id || sessionNames.has(id)) return;
   try {
-    const data = await apiFetch(`/session/${encodeURIComponent(id)}`);
+    const data = await apiFetch(`/api/session/${encodeURIComponent(id)}`);
     if (data.title) sessionNames.set(id, data.title);
   } catch {}
 }
