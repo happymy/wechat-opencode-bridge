@@ -53,7 +53,12 @@ const QUESTION_AUTO_CLEAR_MS = 86400000; // 24h safety net (server never auto-ex
 const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
 const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
 const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
+const REALTIME_FLUSH_MS = 400; // FULL 模式实时流式刷出间隔 (ms)
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
+let realtimeBuffer = '';       // FULL 模式实时文本缓冲
+let realtimeFlushTimer = null; // 实时刷出定时器
+let toolStates = new Map();    // partId -> { tool, input, startTime } 工具状态跟踪
+let lastReasoningTime = 0;     // 推理开始时间戳（PAD 模式显示时长用）
 
 /* ───────── Logging ───────── */
 
@@ -1830,6 +1835,51 @@ function flushToWeChat() {
   });
 }
 
+// ───────── Realtime streaming helpers (FULL mode) ─────────
+
+function flushRealtime(sid) {
+  if (realtimeFlushTimer) {
+    clearTimeout(realtimeFlushTimer);
+    realtimeFlushTimer = null;
+  }
+  if (realtimeBuffer && sid) {
+    const text = realtimeBuffer;
+    realtimeBuffer = '';
+    reply(sid, text);
+  }
+}
+
+function scheduleRealtimeFlush(sid) {
+  if (realtimeFlushTimer) clearTimeout(realtimeFlushTimer);
+  realtimeFlushTimer = setTimeout(() => flushRealtime(sid), REALTIME_FLUSH_MS);
+  realtimeFlushTimer.unref?.();
+}
+
+function realtimeReply(sid, text) {
+  reply(sid, text);
+}
+
+function formatToolInput(input) {
+  if (!input) return '';
+  if (typeof input === 'string') return input.slice(0, 60);
+  if (typeof input === 'object') {
+    const v = Object.values(input).find(v => typeof v === 'string');
+    return v ? v.slice(0, 60) : Object.keys(input)[0] || '';
+  }
+  return '';
+}
+
+function formatDuration(startTime) {
+  if (!startTime) return '';
+  const dur = ((Date.now() - startTime) / 1000).toFixed(1);
+  return `${dur}s`;
+}
+
+function clearToolStates() {
+  toolStates.clear();
+  lastReasoningTime = 0;
+}
+
 function updateSessionState(id, updates) {
   const existing = sessionStates.get(id) || {};
   const next = { ...existing, ...updates };
@@ -2002,8 +2052,10 @@ async function eventToNotification(type, props) {
         pendingQuestions = null;
       }
       pendingQuestionQueue = pendingQuestionQueue.filter(q => q.sessionID !== props.sessionID);
+      clearToolStates();
 
       if (props.sessionID && props.sessionID === lastPromptSessionId) {
+        if (isFull()) flushRealtime(lastPromptSid);
         const text = pendingReplyText.trim();
         pendingReplyText = '';
         if (text) {
@@ -2012,7 +2064,7 @@ async function eventToNotification(type, props) {
           disarmWorkingNotice();
           idleNotified.add(props.sessionID);
           log(`[IDLE] replying with text len=${text.length}`);
-          reply(lastPromptSid, `🤖 ${isPhone() ? text : text}`);
+          reply(lastPromptSid, `🤖 ${text}`);
           flushToWeChat();
           return null;
         }
@@ -2030,8 +2082,10 @@ async function eventToNotification(type, props) {
       const st = props.status;
       if (!st) return null;
       if (st.type === 'idle') {
+        clearToolStates();
         updateSessionState(props.sessionID, { retryCount: 0, busySince: undefined });
         if (props.sessionID && props.sessionID === lastPromptSessionId) {
+          if (isFull()) flushRealtime(lastPromptSid);
           const text = pendingReplyText.trim();
           pendingReplyText = '';
           if (text) {
@@ -2066,17 +2120,125 @@ async function eventToNotification(type, props) {
     case 'message.part.updated': {
       const psid = props.sessionID;
       if (psid) updateSessionState(psid, { lastActivity: Date.now() });
-      // Only accumulate text parts for the active session
-      const partType = props.field || props.partType;
-      const delta = props.delta || props.part?.text || '';
-      log(`[SSE] delta: type=${type} field="${partType}" delta_len=${delta.length} psid=${(psid||'?').slice(0,12)} lastSid=${(lastPromptSessionId||'?').slice(0,12)} pending_len=${pendingReplyText.length}`);
-      if (psid && psid === lastPromptSessionId && partType === 'text' && delta) {
+      if (!psid || psid !== lastPromptSessionId) return null;
+
+      const part = props.part || {};
+      const partType = props.field || props.partType || part.type || '';
+      const isDeltaEvent = type === 'message.part.delta';
+      // delta events carry incremental content; updated events carry full snapshots (only use explicit delta)
+      const delta = isDeltaEvent ? (props.delta || part.text || '') : (props.delta || '');
+      const toolName = part.tool || '';
+      const toolStatus = part.state?.status || '';
+      const toolOutput = part.state?.output || '';
+      const partId = part.id || '';
+      const reasonTime = part.time || {};
+
+      log(`[SSE] delta: type=${type} field="${partType}" tool="${toolName}" delta_len=${delta.length} psid=${(psid||'?').slice(0,12)}`);
+
+      if (isFull()) {
+        // ── FULL: real-time streaming ──
+        if (partType === 'text' && delta) {
+          realtimeBuffer += delta;
+          scheduleRealtimeFlush(lastPromptSid);
+          return null;
+        }
+        if (partType === 'reasoning') {
+          if (reasonTime.start && !toolStates.has(partId + '_reason')) {
+            toolStates.set(partId + '_reason', { startTime: Date.now() });
+            realtimeReply(lastPromptSid, '🤔 Thinking...');
+          }
+          if (delta) {
+            realtimeBuffer += '🤔 ' + delta;
+            scheduleRealtimeFlush(lastPromptSid);
+          }
+          if (reasonTime.end) {
+            const ts = toolStates.get(partId + '_reason');
+            const dur = ts ? formatDuration(ts.startTime) : '';
+            flushRealtime(lastPromptSid);
+            realtimeReply(lastPromptSid, `✅ Thinking complete${dur ? ' (' + dur + ')' : ''}`);
+            toolStates.delete(partId + '_reason');
+          }
+          return null;
+        }
+        if (toolName) {
+          if (toolStatus === 'running' || (!toolStatus && !toolStates.has(partId))) {
+            if (!toolStates.has(partId)) {
+              toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
+              const inp = formatToolInput(part.input);
+              realtimeReply(lastPromptSid, `🔧 ${toolName}${inp ? ' ' + inp : ''}`);
+            }
+          } else if (toolStatus === 'completed') {
+            clearToolStates();
+            const outBrief = toolOutput ? toolOutput.replace(/\n/g, ' ').slice(0, 120) : '';
+            if (outBrief) {
+              realtimeReply(lastPromptSid, `✅ ${toolName}\n${outBrief}`);
+            } else {
+              realtimeReply(lastPromptSid, `✅ ${toolName}`);
+            }
+          } else if (toolStatus === 'error') {
+            clearToolStates();
+            realtimeReply(lastPromptSid, `❌ ${toolName}: ${toolOutput || 'error'}`);
+          }
+          return null;
+        }
+        if (delta) {
+          realtimeBuffer += delta;
+          scheduleRealtimeFlush(lastPromptSid);
+        }
+        return null;
+      }
+
+      if (isPhone()) {
+        // ── PHONE: text only ──
+        if (partType === 'text' && delta) {
+          if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
+            pendingReplyText += delta;
+          } else if (!pendingReplyText.endsWith('…（过长截断）')) {
+            pendingReplyText += '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+          }
+        }
+        return null;
+      }
+
+      // ── PAD (default): collapsed summaries ──
+      if (partType === 'text' && delta) {
         if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
           pendingReplyText += delta;
         } else if (!pendingReplyText.endsWith('…（过长截断）')) {
           pendingReplyText += '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
         }
+        return null;
       }
+
+      if (partType === 'reasoning') {
+        if (reasonTime.start) {
+          lastReasoningTime = Date.now();
+        }
+        if (reasonTime.end && lastReasoningTime) {
+          const dur = formatDuration(lastReasoningTime);
+          lastReasoningTime = 0;
+          return `+ Thinking: ${dur}`;
+        }
+        return null;
+      }
+
+      if (toolName) {
+        if ((toolStatus === 'running' || !toolStatus) && !toolStates.has(partId)) {
+          toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
+          const inp = formatToolInput(part.input);
+          return `⚙${toolName}${inp ? ' ' + inp : ''}`;
+        }
+        if (toolStatus === 'completed') {
+          clearToolStates();
+          return `✅ ${toolName}`;
+        }
+        if (toolStatus === 'error') {
+          clearToolStates();
+          return `❌ ${toolName}: ${toolOutput || 'error'}`;
+        }
+        return null;
+      }
+
       return null;
     }
     default:
