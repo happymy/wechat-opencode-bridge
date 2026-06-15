@@ -18,12 +18,26 @@ const rl = createInterface({ input: process.stdin });
 let currentSessionId = loadSession();
 let currentWorkspace = loadDefaultWorkspace();
 let currentAgent = 'build';
+let filterLevel = 'pad';
+const FILTER_LEVELS = ['full', 'pad', 'phone'];
+const FILTER_FILE = join(WORK_DIR, '.wechat-filter.json');
+function loadFilterLevel() {
+  try {
+    if (existsSync(FILTER_FILE)) return JSON.parse(readFileSync(FILTER_FILE, 'utf8')).level || 'pad';
+  } catch {}
+  return 'pad';
+}
+function saveFilterLevel() { try { writeFileSync(FILTER_FILE, JSON.stringify({ level: filterLevel })); } catch {} }
+function isFull() { return filterLevel === 'full'; }
+function isPhone() { return filterLevel === 'phone'; }
+
+filterLevel = loadFilterLevel();
 let lineBuf = '';
 let subscribers = [];
 let sessionStates = new Map();
 let pendingNotifications = [];
 let pendingPermissions = new Map();
-let pendingQuestions = null; // { sessionID, questions: [...], askTimestamp }
+let pendingQuestions = null;
 let draining = false;
 
 // Response handling
@@ -36,7 +50,15 @@ let responseForSession = null; // session ID that the pending response is for
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
 const QUESTION_AUTO_CLEAR_MS = 86400000; // 24h safety net (server never auto-expires)
+const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
+const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
+const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
+const REALTIME_FLUSH_MS = 400; // FULL 模式实时流式刷出间隔 (ms)
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
+let realtimeBuffer = '';       // FULL 模式实时文本缓冲
+let realtimeFlushTimer = null; // 实时刷出定时器
+let toolStates = new Map();    // partId -> { tool, input, startTime } 工具状态跟踪
+let lastReasoningTime = 0;     // 推理开始时间戳（PAD 模式显示时长用）
 
 /* ───────── Logging ───────── */
 
@@ -67,8 +89,11 @@ rl.on('line', (line) => {
         loadSession: true,
         promptCapabilities: { audio: false, embeddedContext: false, image: false },
         sessionCapabilities: { list: {} },
+        mcpCapabilities: { http: false, sse: false },
+        auth: {},
       },
       agentInfo: { name: 'opencode-wechat-bot', version: '4.0.0' },
+      authMethods: [],
     });
   } else if (m === 'session/new') {
     handleNewSession(msg).catch(e => log(`[ERR] session/new: ${e.message}`));
@@ -139,7 +164,7 @@ async function handlePrompt(msg) {
     forwardToAIAsync(sid, targetId, text).catch(e => log(`[ERR] fwd: ${e.message}`));
   } catch (err) {
     log(`[ERR] handlePrompt: ${err.message}`);
-    sendResponse(msg.id, { stopReason: 'error' });
+    sendResponse(msg.id, { stopReason: 'end_turn', _meta: { error: err.message } });
   }
 }
 
@@ -150,10 +175,8 @@ async function handleCommand(sid, text, msgId) {
   log(`[CMD] cmd=${cmd} arg="${arg.slice(0,40)}"`);
 
   switch (cmd) {
-    case '/list': case '/l': case '/sessions':
+    case '/list': case '/l': case '/ls': case '/sessions':
       return listSessions(sid, arg, msgId);
-    case '/switch': case '/s':
-      return switchSession(sid, arg, msgId);
     case '/mute': case '/m':
       return toggleMute(sid, msgId);
     case '/notify': case '/n':
@@ -166,8 +189,18 @@ async function handleCommand(sid, text, msgId) {
       return switchAgent(sid, 'plan', msgId);
     case '/build': case '/bu':
       return switchAgent(sid, 'build', msgId);
-    case '/new': case '/create':
+    case '/nl': case '/new': case '/create':
       return newSession(sid, arg, msgId);
+    case '/sw': case '/switch': case '/s':
+      return switchSession(sid, arg, msgId);
+    case '/level': case '/lvl':
+      return handleFilterLevel(sid, arg, msgId);
+    case '/f':
+      return setFilterLevel(sid, 'full', msgId);
+    case '/pd':
+      return setFilterLevel(sid, 'pad', msgId);
+    case '/ph':
+      return setFilterLevel(sid, 'phone', msgId);
     case '/workspace': case '/ws':
       return handleWorkspace(sid, arg, msgId);
     case '/plist': case '/pending': case '/p':
@@ -219,10 +252,11 @@ async function getWorkspaceSessions() {
       return res.data;
     }
   }
-  const fallback = await apiFetch('/session').catch(() => null);
-  if (Array.isArray(fallback)) {
+  const fallback = await apiFetch('/api/session?limit=100').catch(() => null);
+  const list = Array.isArray(fallback) ? fallback : (fallback?.data || []);
+  if (list.length > 0) {
     const dirLower = dir.toLowerCase();
-    return fallback.filter(s => s.directory && s.directory.toLowerCase().startsWith(dirLower));
+    return list.filter(s => s.directory && s.directory.toLowerCase().startsWith(dirLower));
   }
   return [];
 }
@@ -234,8 +268,8 @@ async function listSessions(sid, arg, msgId) {
     const isAll = !!allMatch;
     const allLimit = allMatch?.[1] ? parseInt(allMatch[1], 10) : 50;
     if (isAll) {
-      const raw = await apiFetch('/session').catch(() => null);
-      sessions = Array.isArray(raw) ? raw : [];
+      const raw = await apiFetch('/api/session?limit=100').catch(() => null);
+      sessions = Array.isArray(raw) ? raw : (raw?.data || []);
     } else {
       sessions = await getWorkspaceSessions();
       if (!Array.isArray(sessions)) sessions = [];
@@ -244,7 +278,7 @@ async function listSessions(sid, arg, msgId) {
     let currentInList = sessions.some(s => s.id === currentSessionId);
     if (!currentInList && currentSessionId) {
       try {
-        const cur = await apiFetch(`/session/${encodeURIComponent(currentSessionId)}`).catch(() => null);
+        const cur = await apiFetch(`/api/session/${encodeURIComponent(currentSessionId)}`).catch(() => null);
         if (cur && cur.id) {
           if (!sessions.some(s => s.id === cur.id)) {
             sessions.unshift(cur);
@@ -263,7 +297,7 @@ async function listSessions(sid, arg, msgId) {
     const maxShow = isAll ? allLimit : 20;
     const show = sorted.slice(0, maxShow);
 
-    const statusMap = await apiFetch('/session/status').catch(() => ({}));
+    const statusMap = await apiFetch('/api/session/status').catch(() => ({}));
     const busyIds = new Set(
       Object.entries(statusMap)
         .filter(([, s]) => s.type === 'busy')
@@ -333,7 +367,7 @@ async function switchSession(sid, arg, msgId) {
 
   // Try as session ID directly
   try {
-    const data = await apiFetch(`/session/${encodeURIComponent(arg)}`);
+    const data = await apiFetch(`/api/session/${encodeURIComponent(arg)}`);
     currentSessionId = data.id || arg;
     saveSession(currentSessionId);
     reply(sid, `✅ 已切换到「${data.title || '(未命名)'}」`);
@@ -388,7 +422,7 @@ async function cancelCurrent(sid, msgId) {
     return;
   }
   try {
-    await fetch(`${SERVER}/session/${encodeURIComponent(target)}/abort`, {
+    await fetch(`${SERVER}/api/session/${encodeURIComponent(target)}/abort`, {
       method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000),
     });
     reply(sid, '⏹️ 已发送取消请求');
@@ -412,7 +446,7 @@ async function newSession(sid, title, msgId) {
   }
   try {
     const dir = getWorkspaceDir();
-    const data = await apiFetch('/session', {
+    const data = await apiFetch('/api/session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: title.trim(), directory: dir }),
@@ -431,6 +465,56 @@ async function switchAgent(sid, agent, msgId) {
   const labels = { plan: '📋', build: '🔧' };
   reply(sid, `${labels[agent] || '✅'} 已切换到 ${agent} 模式`);
   sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleFilterLevel(sid, arg, msgId) {
+  if (!arg) {
+    const lines = ['🔍 信息过滤级别'];
+    lines.push(`当前: ${levelLabel(filterLevel)}`);
+    lines.push('─'.repeat(14));
+    for (const lv of FILTER_LEVELS) {
+      const mark = lv === filterLevel ? ' ◀' : '';
+      lines.push(`${levelIcon(lv)} ${lv.toUpperCase()} — ${levelDesc(lv)}${mark}`);
+    }
+    lines.push('─'.repeat(14));
+    lines.push('/f (FULL) 全部显示  |  /pd (PAD) 摘要显示  |  /ph (PHONE) 极简显示');
+    reply(sid, lines.join('\n'));
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const level = arg.trim().toLowerCase();
+  if (!FILTER_LEVELS.includes(level)) {
+    reply(sid, `⚠️ 无效级别: ${level}，可选: ${FILTER_LEVELS.join(', ')}`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  await setFilterLevel(sid, level, msgId);
+}
+
+async function setFilterLevel(sid, level, msgId) {
+  filterLevel = level;
+  saveFilterLevel();
+  reply(sid, `${levelIcon(level)} 已切换到 ${level.toUpperCase()} 模式\n${levelDesc(level)}`);
+  if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+function levelIcon(lv) {
+  return { full: '📡', pad: '📱', phone: '📟' }[lv] || '🔍';
+}
+function levelDesc(lv) {
+  return {
+    full: '显示所有信息（工具调用、文件差异等全部转发）',
+    pad: '摘要显示，隐藏工具输出和文件细节',
+    phone: '极简模式，仅显示 AI 文本回复和错误',
+  }[lv] || '';
+}
+function levelLabel(lv) {
+  return { full: '📡 FULL 完整模式', pad: '📱 PAD 标准模式', phone: '📟 PHONE 极简模式' }[lv] || lv;
+}
+
+function summarizeText(text, maxLen) {
+  if (!text || text.length <= maxLen) return text;
+  return text.slice(0, maxLen) + `\n…（共${text.length}字符，截断显示）`;
 }
 
 async function listPermissions(sid, msgId) {
@@ -498,12 +582,16 @@ async function handlePermissionReply(sid, action, arg, msgId) {
 
   try {
     log(`[PERM] sending reply: action=${action} rid=${targetRid.slice(0,16)}...`);
-    await apiFetch(`/permission/${encodeURIComponent(targetRid)}/reply`, {
+    const info = pendingPermissions.get(targetRid);
+    const permSid = info?.sessionID;
+    if (!permSid) {
+      throw new Error('未知会话，无法提交权限回复');
+    }
+    await apiFetch(`/api/session/${encodeURIComponent(permSid)}/permission/${encodeURIComponent(targetRid)}/reply`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reply: action, message: `via wechat-adapter (sid=${sid.slice(0,12)})` }),
     });
-    const info = pendingPermissions.get(targetRid);
     const labels = { once: '✅ 已批准', always: '✅ 已信任', reject: '❌ 已拒绝' };
     const msg = `${labels[action]}: ${info?.permission || '权限请求'}`;
     log(`[PERM] reply success: ${msg}`);
@@ -520,7 +608,7 @@ async function handlePermissionReply(sid, action, arg, msgId) {
 async function syncPermissionsFromServer() {
   log(`[SYNC] start pendingPermissions.size=${pendingPermissions.size}`);
   try {
-    const list = await apiFetch(`/permission?directory=${encodeURIComponent(getWorkspaceDir())}`);
+    const list = await apiFetch(`/api/permission/request?location[directory]=${encodeURIComponent(getWorkspaceDir())}`);
     log(`[SYNC] server returned ${Array.isArray(list) ? list.length + ' items' : typeof list}`);
     if (!Array.isArray(list)) { log(`[SYNC] not an array, skipping`); return; }
     const serverIds = new Set(list.map(r => r.id));
@@ -541,7 +629,7 @@ async function syncPermissionsFromServer() {
 async function syncPendingFromServer() {
   const dir = getWorkspaceDir();
   try {
-    const permList = await apiFetch(`/permission?directory=${encodeURIComponent(dir)}`);
+    const permList = await apiFetch(`/api/permission/request?location[directory]=${encodeURIComponent(dir)}`);
     const serverPermIds = new Set((Array.isArray(permList) ? permList : []).map(r => r.id));
     for (const [rid] of pendingPermissions) {
       if (!serverPermIds.has(rid)) {
@@ -562,7 +650,7 @@ async function syncPendingFromServer() {
       if (!qsid || seen.has(qsid)) continue;
       seen.add(qsid);
       try {
-        const sessQs = await apiFetch(`/session/${encodeURIComponent(qsid)}/question`);
+        const sessQs = await apiFetch(`/api/session/${encodeURIComponent(qsid)}/question`);
         const validIds = new Set((sessQs?.data || []).map(r => r.id));
         for (const q2 of allQuestions) {
           if (q2.sessionID !== qsid) continue;
@@ -720,11 +808,11 @@ async function handleSyncDir(sid, msgId) {
       }
     } else {
       log('[SD] db returned no directories, trying HTTP API fallback...');
-      const projects = await apiFetch('/project').catch(() => null);
+      const projects = await apiFetch('/api/project').catch(() => null);
       if (Array.isArray(projects) && projects.length > 0) {
         for (const p of projects) {
           try {
-            const dirs = await apiFetch(`/project/${encodeURIComponent(p.id)}/directories`);
+            const dirs = await apiFetch(`/api/project/${encodeURIComponent(p.id)}/directories`);
             if (!Array.isArray(dirs)) continue;
             for (const d of dirs) {
               const dirPath = d.directory;
@@ -746,9 +834,10 @@ async function handleSyncDir(sid, msgId) {
 
       if (added.length === 0) {
         log('[SD] project API yielded no directories, trying session fallback...');
-        const sessions = await apiFetch('/session').catch(() => null);
-        if (Array.isArray(sessions)) {
-          const dirs = [...new Set(sessions.map(s => s.directory).filter(Boolean))];
+        const sessions = await apiFetch('/api/session?limit=100').catch(() => null);
+        const sessionsList = Array.isArray(sessions) ? sessions : (sessions?.data || []);
+        if (sessionsList.length > 0) {
+          const dirs = [...new Set(sessionsList.map(s => s.directory).filter(Boolean))];
           for (const dirPath of dirs) {
             if (isExisting(dirPath)) {
               skipped.push({ name: basename(dirPath), path: dirPath });
@@ -793,13 +882,13 @@ function makeWsName(dirPath, existing) {
 
 async function showTaskStatus(sid, msgId) {
   try {
-    const statusMap = await apiFetch('/session/status');
+    const statusMap = await apiFetch('/api/session/status');
     const lines = ['📊 任务状态', '─'.repeat(14)];
     let hasActive = false;
     for (const [id, st] of Object.entries(statusMap || {})) {
       if (st.type === 'busy') {
         hasActive = true;
-        const info = await apiFetch(`/session/${encodeURIComponent(id)}`).catch(() => null);
+        const info = await apiFetch(`/api/session/${encodeURIComponent(id)}`).catch(() => null);
         const name = info?.title || id.slice(0, 16);
         const isCurrent = id === currentSessionId ? ' ◀当前' : '';
         lines.push(`▶ ${name} — 运行中${isCurrent}`);
@@ -818,13 +907,19 @@ function showHelp(sid, msgId) {
     '🤖 微信远程编程助手',
     '─'.repeat(20),
     '── 会话管理 ──',
-    '/list (/l, /sessions)    查看会话列表；/l all [+数字] 返回全部会话前N条',
-    '/switch (/s) <编号|ID>   切换会话',
-    '/new (/create) <会话名>  新建会话并切换（当前工作区）',
+    '/list (/l, /ls, /sessions)    查看会话列表；/l all [+数字] 返回全部会话前N条',
+    '/switch (/s, /sw) <编号|ID>   切换会话',
+    '/new (/nl, /create) <会话名>  新建会话并切换（当前工作区）',
     '',
     '── 模式切换 ──',
     '/plan (/pl)              切换到 plan 模式',
     '/build (/bu)             切换到 build 模式',
+    '',
+    '── 信息过滤 ──',
+    `/level (/lvl) [级别]     查看/设置过滤级别 (当前: ${filterLevel.toUpperCase()})`,
+    '/f                       切换到 FULL 模式（全部显示）',
+    '/pd                      切换到 PAD 模式（摘要显示）',
+    '/ph                      切换到 PHONE 模式（极简显示）',
     '',
     '── 问题回答（通知中直接回复也可）──',
     '/answer (/ans) [编号] <内容>  回答AI提问，默认第1题',
@@ -1134,10 +1229,10 @@ async function answerQuestion(sid, answer, msgId) {
 async function answerViaQuestionApi(sid, targetId, answers, requestID) {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000);
+    const timeout = setTimeout(() => controller.abort(), SESSION_MESSAGE_TIMEOUT);
     let res;
     try {
-      res = await fetch(`${SERVER}/question/${requestID}/reply`, {
+      res = await fetch(`${SERVER}/api/session/${encodeURIComponent(targetId)}/question/${encodeURIComponent(requestID)}/reply`, {
         method: 'POST',
         headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
         body: JSON.stringify({ answers: answers.map(a => [a]) }),
@@ -1226,9 +1321,10 @@ async function skipQuestion(sid, arg, msgId) {
   }
 
   const requestID = qData?.requestID;
-  if (requestID) {
+  const qSessID = qData?.sessionID;
+  if (requestID && qSessID) {
     try {
-      await fetch(`${SERVER}/question/${requestID}/reject`, {
+      await fetch(`${SERVER}/api/session/${encodeURIComponent(qSessID)}/question/${encodeURIComponent(requestID)}/reject`, {
         method: 'POST',
         headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -1277,7 +1373,7 @@ function disarmWorkingNotice() {
 async function forwardToAIAsync(sid, targetId, text) {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000);
+    const timeout = setTimeout(() => controller.abort(), SESSION_MESSAGE_TIMEOUT);
     let res;
     try {
       res = await fetch(`${SERVER}/session/${encodeURIComponent(targetId)}/message`, {
@@ -1363,10 +1459,11 @@ async function handleNewSession(msg) {
     return;
   }
   try {
-    const res = await fetch(`${SERVER}/session`, {
+    const dir = getWorkspaceDir();
+    const res = await fetch(`${SERVER}/api/session`, {
       method: 'POST',
       headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'WeChat' }),
+      body: JSON.stringify({ title: 'WeChat', directory: dir }),
     });
     const data = res.ok ? await res.json() : {};
     currentSessionId = data.id || ('sess_' + Date.now());
@@ -1381,9 +1478,10 @@ async function handleNewSession(msg) {
 
 async function handleListSessions(msg) {
   try {
-    const res = await fetch(`${SERVER}/session`, { headers: { Authorization: AUTH } });
+    const res = await fetch(`${SERVER}/api/session?limit=100`, { headers: { Authorization: AUTH } });
     const list = res.ok ? await res.json() : [];
-    const sessions = (Array.isArray(list) ? list : []).map(s => ({
+    const arr = Array.isArray(list) ? list : (list?.data || []);
+    const sessions = arr.map(s => ({
       sessionId: s.id, cwd: s.directory || '', title: s.title || '',
       updatedAt: s.time?.updated ? new Date(s.time.updated).toISOString() : undefined,
     }));
@@ -1398,7 +1496,7 @@ async function handleLoadSession(msg) {
   const sessionId = msg.params?.sessionId;
   if (!sessionId) { sendResponse(msg.id, { _meta: { error: 'sessionId required' } }); return; }
   try {
-    const data = await apiFetch(`/session/${encodeURIComponent(sessionId)}`);
+    const data = await apiFetch(`/api/session/${encodeURIComponent(sessionId)}`);
     currentSessionId = data.id || sessionId;
     saveSession(currentSessionId);
     sendResponse(msg.id, { sessionId: currentSessionId, cwd: data.directory || '', title: data.title || '',
@@ -1411,7 +1509,7 @@ async function handleLoadSession(msg) {
 async function handleCancel(msg) {
   const cancelTargets = [msg.params?.sessionId, currentSessionId].filter(Boolean);
   for (const id of [...new Set(cancelTargets)]) {
-    try { await fetch(`${SERVER}/session/${encodeURIComponent(id)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
+    try { await fetch(`${SERVER}/api/session/${encodeURIComponent(id)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
   }
   disarmWorkingNotice();
   pendingReplyText = '';
@@ -1419,7 +1517,8 @@ async function handleCancel(msg) {
   responseForSession = null;
   lastPromptSessionId = null;
   lastPromptSid = null;
-  sendResponse(msg.id, {});
+  // ACP 规范: session/cancel 是通知 (JSON-RPC notification)，无 id 时不能发响应
+  if (msg.id != null) sendResponse(msg.id, {});
 }
 
 /* ───────── Workspace ───────── */
@@ -1597,6 +1696,7 @@ let recentNotifications = new Map(); // text → timestamp, dedup within 60s
 let perUserRecent = new Map(); // sid → { text → timestamp }
 let proactiveTimer = null;
 let recentEventIds = new Set(); // event ID → timestamp, dedup within 10s
+let lastNotifyPerSid = new Map(); // sid → timestamp, notification rate limiting
 let sseReader = null;          // current SSE reader (for restart on workspace change)
 
 const DEDUP_WINDOW = 60000;
@@ -1687,6 +1787,15 @@ async function drainPendingNotifications(forceFlush) {
     }
     log(`[DRAIN] grouped into ${grouped.size} unique sid(s)`);
     for (const [sid, texts] of grouped) {
+      // Rate limiting: ensure minimum interval between notifications to same user
+      const lastSent = lastNotifyPerSid.get(sid) || 0;
+      const elapsed = Date.now() - lastSent;
+      if (elapsed < NOTIFICATION_RATE_LIMIT_MS) {
+        const waitMs = NOTIFICATION_RATE_LIMIT_MS - elapsed;
+        log(`[DRAIN] rate limit: waiting ${waitMs}ms for sid=${sid.slice(0,12)}`);
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+      lastNotifyPerSid.set(sid, Date.now());
       const unique = [...new Set(texts)];
       log(`[DRAIN] sid=${sid.slice(0,12)}: ${texts.length} texts -> ${unique.length} unique`);
       if (unique.length > 1) {
@@ -1728,6 +1837,51 @@ function flushToWeChat() {
       status: 'completed',
     },
   });
+}
+
+// ───────── Realtime streaming helpers (FULL mode) ─────────
+
+function flushRealtime(sid) {
+  if (realtimeFlushTimer) {
+    clearTimeout(realtimeFlushTimer);
+    realtimeFlushTimer = null;
+  }
+  if (realtimeBuffer && sid) {
+    const text = realtimeBuffer;
+    realtimeBuffer = '';
+    reply(sid, text);
+  }
+}
+
+function scheduleRealtimeFlush(sid) {
+  if (realtimeFlushTimer) clearTimeout(realtimeFlushTimer);
+  realtimeFlushTimer = setTimeout(() => flushRealtime(sid), REALTIME_FLUSH_MS);
+  realtimeFlushTimer.unref?.();
+}
+
+function realtimeReply(sid, text) {
+  reply(sid, text);
+}
+
+function formatToolInput(input) {
+  if (!input) return '';
+  if (typeof input === 'string') return input.slice(0, 60);
+  if (typeof input === 'object') {
+    const v = Object.values(input).find(v => typeof v === 'string');
+    return v ? v.slice(0, 60) : Object.keys(input)[0] || '';
+  }
+  return '';
+}
+
+function formatDuration(startTime) {
+  if (!startTime) return '';
+  const dur = ((Date.now() - startTime) / 1000).toFixed(1);
+  return `${dur}s`;
+}
+
+function clearToolStates() {
+  toolStates.clear();
+  lastReasoningTime = 0;
 }
 
 function updateSessionState(id, updates) {
@@ -1902,37 +2056,40 @@ async function eventToNotification(type, props) {
         pendingQuestions = null;
       }
       pendingQuestionQueue = pendingQuestionQueue.filter(q => q.sessionID !== props.sessionID);
+      clearToolStates();
 
       if (props.sessionID && props.sessionID === lastPromptSessionId) {
+        if (isFull()) flushRealtime(lastPromptSid);
         const text = pendingReplyText.trim();
         pendingReplyText = '';
         if (text) {
           responseSent = true;
           responseForSession = props.sessionID;
           disarmWorkingNotice();
-          idleNotified.add(props.sessionID); // prevent "完成" from session.status(idle)
+          idleNotified.add(props.sessionID);
           log(`[IDLE] replying with text len=${text.length}`);
           reply(lastPromptSid, `🤖 ${text}`);
           flushToWeChat();
           return null;
         }
         if (!responseSent) {
-          // No text from SSE yet — forwardToAIAsync will deliver from HTTP response
-          // Don't set responseSent here; don't send "完成" notification
           log(`[IDLE] no text accumulated, deferring to forwardToAIAsync`);
           idleNotified.add(props.sessionID);
           return null;
         }
       }
+      // PHONE mode: suppress completion notifications
+      if (isPhone()) return null;
       return idleNotification(props);
     }
     case 'session.status': {
       const st = props.status;
       if (!st) return null;
       if (st.type === 'idle') {
+        clearToolStates();
         updateSessionState(props.sessionID, { retryCount: 0, busySince: undefined });
-        // Check accumulated text before falling through to idleNotification
         if (props.sessionID && props.sessionID === lastPromptSessionId) {
+          if (isFull()) flushRealtime(lastPromptSid);
           const text = pendingReplyText.trim();
           pendingReplyText = '';
           if (text) {
@@ -1946,9 +2103,11 @@ async function eventToNotification(type, props) {
             return null;
           }
         }
+        if (isPhone()) return null;
         return idleNotification(props);
       }
       if (st.type === 'retry') {
+        if (isPhone()) return null;
         const sid = props.sessionID;
         const state = updateSessionState(sid, { retryCount: (sessionStates.get(sid)?.retryCount || 0) + 1 });
         if (state.retryCount >= 3) return `🔄 AI重试${state.retryCount}次未恢复`;
@@ -1965,13 +2124,125 @@ async function eventToNotification(type, props) {
     case 'message.part.updated': {
       const psid = props.sessionID;
       if (psid) updateSessionState(psid, { lastActivity: Date.now() });
-      // Only accumulate text parts for the active session
-      const partType = props.field || props.partType;
-      const delta = props.delta || props.part?.text || '';
-      log(`[SSE] delta: type=${type} field="${partType}" delta_len=${delta.length} psid=${(psid||'?').slice(0,12)} lastSid=${(lastPromptSessionId||'?').slice(0,12)} pending_len=${pendingReplyText.length}`);
-      if (psid && psid === lastPromptSessionId && partType === 'text' && delta) {
-        pendingReplyText += delta;
+      if (!psid || psid !== lastPromptSessionId) return null;
+
+      const part = props.part || {};
+      const partType = props.field || props.partType || part.type || '';
+      const isDeltaEvent = type === 'message.part.delta';
+      // delta events carry incremental content; updated events carry full snapshots (only use explicit delta)
+      const delta = isDeltaEvent ? (props.delta || part.text || '') : (props.delta || '');
+      const toolName = part.tool || '';
+      const toolStatus = part.state?.status || '';
+      const toolOutput = part.state?.output || '';
+      const partId = part.id || '';
+      const reasonTime = part.time || {};
+
+      log(`[SSE] delta: type=${type} field="${partType}" tool="${toolName}" delta_len=${delta.length} psid=${(psid||'?').slice(0,12)}`);
+
+      if (isFull()) {
+        // ── FULL: real-time streaming ──
+        if (partType === 'text' && delta) {
+          realtimeBuffer += delta;
+          scheduleRealtimeFlush(lastPromptSid);
+          return null;
+        }
+        if (partType === 'reasoning') {
+          if (reasonTime.start && !toolStates.has(partId + '_reason')) {
+            toolStates.set(partId + '_reason', { startTime: Date.now() });
+            realtimeReply(lastPromptSid, '🤔 Thinking...');
+          }
+          if (delta) {
+            realtimeBuffer += '🤔 ' + delta;
+            scheduleRealtimeFlush(lastPromptSid);
+          }
+          if (reasonTime.end) {
+            const ts = toolStates.get(partId + '_reason');
+            const dur = ts ? formatDuration(ts.startTime) : '';
+            flushRealtime(lastPromptSid);
+            realtimeReply(lastPromptSid, `✅ Thinking complete${dur ? ' (' + dur + ')' : ''}`);
+            toolStates.delete(partId + '_reason');
+          }
+          return null;
+        }
+        if (toolName) {
+          if (toolStatus === 'running' || (!toolStatus && !toolStates.has(partId))) {
+            if (!toolStates.has(partId)) {
+              toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
+              const inp = formatToolInput(part.input);
+              realtimeReply(lastPromptSid, `🔧 ${toolName}${inp ? ' ' + inp : ''}`);
+            }
+          } else if (toolStatus === 'completed') {
+            clearToolStates();
+            const outBrief = toolOutput ? toolOutput.replace(/\n/g, ' ').slice(0, 120) : '';
+            if (outBrief) {
+              realtimeReply(lastPromptSid, `✅ ${toolName}\n${outBrief}`);
+            } else {
+              realtimeReply(lastPromptSid, `✅ ${toolName}`);
+            }
+          } else if (toolStatus === 'error') {
+            clearToolStates();
+            realtimeReply(lastPromptSid, `❌ ${toolName}: ${toolOutput || 'error'}`);
+          }
+          return null;
+        }
+        if (delta) {
+          realtimeBuffer += delta;
+          scheduleRealtimeFlush(lastPromptSid);
+        }
+        return null;
       }
+
+      if (isPhone()) {
+        // ── PHONE: text only ──
+        if (partType === 'text' && delta) {
+          if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
+            pendingReplyText += delta;
+          } else if (!pendingReplyText.endsWith('…（过长截断）')) {
+            pendingReplyText += '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+          }
+        }
+        return null;
+      }
+
+      // ── PAD (default): collapsed summaries ──
+      if (partType === 'text' && delta) {
+        if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
+          pendingReplyText += delta;
+        } else if (!pendingReplyText.endsWith('…（过长截断）')) {
+          pendingReplyText += '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+        }
+        return null;
+      }
+
+      if (partType === 'reasoning') {
+        if (reasonTime.start) {
+          lastReasoningTime = Date.now();
+        }
+        if (reasonTime.end && lastReasoningTime) {
+          const dur = formatDuration(lastReasoningTime);
+          lastReasoningTime = 0;
+          return `+ Thinking: ${dur}`;
+        }
+        return null;
+      }
+
+      if (toolName) {
+        if ((toolStatus === 'running' || !toolStatus) && !toolStates.has(partId)) {
+          toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
+          const inp = formatToolInput(part.input);
+          return `⚙${toolName}${inp ? ' ' + inp : ''}`;
+        }
+        if (toolStatus === 'completed') {
+          clearToolStates();
+          return `✅ ${toolName}`;
+        }
+        if (toolStatus === 'error') {
+          clearToolStates();
+          return `❌ ${toolName}: ${toolOutput || 'error'}`;
+        }
+        return null;
+      }
+
       return null;
     }
     default:
@@ -1982,7 +2253,7 @@ async function eventToNotification(type, props) {
 async function fetchSessionName(id) {
   if (!id || sessionNames.has(id)) return;
   try {
-    const data = await apiFetch(`/session/${encodeURIComponent(id)}`);
+    const data = await apiFetch(`/api/session/${encodeURIComponent(id)}`);
     if (data.title) sessionNames.set(id, data.title);
   } catch {}
 }
@@ -2186,7 +2457,7 @@ function startWatchdog() {
     } catch (e) {
       log(`[WATCHDOG] error: ${e.message}`);
     }
-  }, 30000);
+  }, 30000).unref();
 }
 
 // ── Startup ──
