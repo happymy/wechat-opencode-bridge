@@ -27,7 +27,7 @@ function loadFilterLevel() {
   } catch {}
   return 'pad';
 }
-function saveFilterLevel() { try { writeFileSync(FILTER_FILE, JSON.stringify({ level: filterLevel })); } catch {} }
+function saveFilterLevel() { try { writeFileSync(FILTER_FILE, JSON.stringify({ level: filterLevel })); } catch (e) { log(`[SAVE] filter level error: ${e.message}`); } }
 function isFull() { return filterLevel === 'full'; }
 function isPhone() { return filterLevel === 'phone'; }
 
@@ -69,14 +69,14 @@ let sseConnectionActive = false; // SSE 连接活跃标记
 const stdoutQueue = [];
 let stdoutDraining = false;
 const STDOUT_QUEUE_LIMIT = 200;
-let stdoutQueueWarned = false;
+const STDOUT_DROP_BATCH = 50;
 
 function writeStdout(msg) {
-  stdoutQueue.push(msg);
-  if (stdoutQueue.length > STDOUT_QUEUE_LIMIT && !stdoutQueueWarned) {
-    stdoutQueueWarned = true;
-    log(`[WARN] stdout queue ${stdoutQueue.length}, wechat-acp may be overloaded`);
+  if (stdoutQueue.length >= STDOUT_QUEUE_LIMIT + STDOUT_DROP_BATCH) {
+    const dropped = stdoutQueue.splice(0, stdoutQueue.length - STDOUT_QUEUE_LIMIT);
+    log(`[WARN] stdout queue overload: dropped ${dropped.length} oldest messages, queue=${stdoutQueue.length}`);
   }
+  stdoutQueue.push(msg);
   if (!stdoutDraining) processStdoutQueue();
 }
 
@@ -95,7 +95,6 @@ function processStdoutQueue() {
     stdoutQueue.shift();
   }
   stdoutDraining = false;
-  stdoutQueueWarned = false;
 }
 
 /* ───────── Logging ───────── */
@@ -166,9 +165,7 @@ async function handlePrompt(msg) {
 
     await drainPendingNotifications();
 
-    // If AI is waiting for an answer, route non-command text as answer
-    // Session check: only enforce if sessionID is known (some SSE events omit it)
-    if (pendingQuestions && !text.startsWith('/') && (!pendingQuestions.sessionID || pendingQuestions.sessionID === currentSessionId)) {
+    if (pendingQuestions && !text.startsWith('/')) {
       log(`[PROMPT] pending question, routing as answer`);
       await answerQuestion(sid, text, msg.id);
       return;
@@ -703,10 +700,10 @@ async function syncPendingFromServer() {
           if (q2.requestID && !validIds.has(q2.requestID)) {
             log(`[SYNC] removing local question rid=${q2.requestID.slice(0,16)}... (not on server)`);
             if (pendingQuestions?.requestID === q2.requestID) {
-              pendingQuestions = null;
+              clearCurrentQuestion();
             } else {
               const qIdx = pendingQuestionQueue.findIndex(q => q.requestID === q2.requestID);
-              if (qIdx >= 0) pendingQuestionQueue.splice(qIdx, 1);
+              if (qIdx >= 0) { clearQuestionTimer(pendingQuestionQueue[qIdx]); pendingQuestionQueue.splice(qIdx, 1); }
             }
           }
         }
@@ -1130,25 +1127,28 @@ async function selectQuestion(sid, arg, msgId) {
     return listCurrentQuestion(sid, msgId);
   }
   const queueIdx = pendingQuestions ? idx - 1 : idx;
-  const target = pendingQuestionQueue.splice(queueIdx, 1)[0];
+  const qArr = pendingQuestionQueue.splice(queueIdx, 1);
+  const target = qArr[0];
+  clearQuestionTimer(target);
   if (!target) {
     reply(sid, '⚠️ 该问题不存在');
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
-  // Push current back to queue head
+  // Push current back to queue head (clear its timer first)
   if (pendingQuestions) {
+    clearQuestionTimer(pendingQuestions);
     pendingQuestionQueue.unshift(pendingQuestions);
   }
   pendingQuestions = target;
-  // Auto-follow the question's session for cross-session answers
   if (target.sessionID) currentSessionId = target.sessionID;
-  // Reset auto-clear
   const ts = Date.now();
   target.askTimestamp = ts;
-  setTimeout(() => {
-    if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
-  },     QUESTION_AUTO_CLEAR_MS).unref?.();
+  const autoClear = setTimeout(() => {
+    if (pendingQuestions?.askTimestamp === ts) { clearCurrentQuestion(); dequeueNextQuestion(); }
+  }, QUESTION_AUTO_CLEAR_MS);
+  autoClear.unref?.();
+  target._autoClearTimer = autoClear;
   return listCurrentQuestion(sid, msgId);
 }
 
@@ -1196,9 +1196,11 @@ async function answerQuestion(sid, answer, msgId) {
     // Reset auto-clear timer
     const ts = Date.now();
     qData.askTimestamp = ts;
-    setTimeout(() => {
-      if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
-    },     QUESTION_AUTO_CLEAR_MS).unref?.();
+    const autoClear = setTimeout(() => {
+      if (pendingQuestions?.askTimestamp === ts) { clearCurrentQuestion(); dequeueNextQuestion(); }
+    }, QUESTION_AUTO_CLEAR_MS);
+    autoClear.unref?.();
+    qData._autoClearTimer = autoClear;
   }
 
   const targetId = currentSessionId;
@@ -1208,7 +1210,7 @@ async function answerQuestion(sid, answer, msgId) {
     if (!targetId) {
       reply(sid, '⚠️ 没有选中的会话，无法提交答案');
       if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
-      pendingQuestions = null;
+      clearCurrentQuestion();
       await dequeueNextQuestion();
       return;
     }
@@ -1254,7 +1256,7 @@ async function answerQuestion(sid, answer, msgId) {
   }
 
   const combined = answers.join(', ');
-  pendingQuestions = null;
+  clearCurrentQuestion();
   await dequeueNextQuestion();
   log(`[ANSWER] sid=${sid.slice(0,12)} answers=[${combined}]`);
   lastPromptSid = sid;
@@ -1314,6 +1316,14 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
   }
 }
 
+function clearQuestionTimer(q) {
+  if (q?._autoClearTimer) { clearTimeout(q._autoClearTimer); q._autoClearTimer = null; }
+}
+function clearCurrentQuestion() {
+  clearQuestionTimer(pendingQuestions);
+  pendingQuestions = null;
+}
+
 async function dequeueNextQuestion() {
   if (pendingQuestions) { log('[DEQUEUE] skip: already a pending question'); return; }
   while (pendingQuestionQueue.length > 0) {
@@ -1324,11 +1334,11 @@ async function dequeueNextQuestion() {
       if (pendingQuestions?.askTimestamp === next.askTimestamp) { pendingQuestions = null; dequeueNextQuestion(); }
     }, QUESTION_AUTO_CLEAR_MS);
     autoClear.unref?.();
-    // Generate notification for the next question
+    next._autoClearTimer = autoClear;
     await fetchSessionName(next.sessionID);
     const sesLabel = next.sessionID ? `[${getSessionName(next.sessionID)}] ` : '';
     const qi = next.questions?.[0];
-    if (!qi) { pendingQuestions = null; clearTimeout(autoClear); continue; }
+    if (!qi) { clearTimeout(autoClear); pendingQuestions = null; continue; }
     const multi = next.questions.length > 1;
     let text = (multi ? `📌 下一题（共${next.questions.length}题）` : `📌 下一题`);
     if (sesLabel) text = sesLabel + text;
@@ -1357,16 +1367,20 @@ async function skipQuestion(sid, arg, msgId) {
 
   // Get the target question
   let qData;
-  if (pendingQuestions) {
+    if (pendingQuestions) {
     if (qIdx === 0) {
       qData = pendingQuestions;
-      pendingQuestions = null;
+      clearCurrentQuestion();
       await dequeueNextQuestion();
     } else {
-      qData = pendingQuestionQueue.splice(qIdx - 1, 1)[0];
+      const arr = pendingQuestionQueue.splice(qIdx - 1, 1);
+      qData = arr[0];
+      clearQuestionTimer(qData);
     }
   } else {
-    qData = pendingQuestionQueue.splice(qIdx, 1)[0];
+    const arr = pendingQuestionQueue.splice(qIdx, 1);
+    qData = arr[0];
+    clearQuestionTimer(qData);
   }
 
   const requestID = qData?.requestID;
@@ -1458,12 +1472,18 @@ async function forwardToAIAsync(sid, targetId, text) {
     }
     responseSent = true;
     disarmWorkingNotice();
-    idleNotified.add(targetId); // prevent "完成" from session.status(idle)
-    pendingReplyText = ''; // clear any residual SSE deltas
-    const formatted = formatReply(data);
-    if (formatted) {
-      reply(sid, formatted);
+    idleNotified.add(targetId);
+    const accumulated = pendingReplyText.trim();
+    pendingReplyText = '';
+    if (accumulated) {
+      reply(sid, `🤖 ${accumulated}`);
       flushToWeChat();
+    } else {
+      const formatted = formatReply(data);
+      if (formatted) {
+        reply(sid, formatted);
+        flushToWeChat();
+      }
     }
   } catch (err) {
     disarmWorkingNotice();
@@ -1503,10 +1523,6 @@ function formatReply(data) {
 /* ───────── ACP Handlers ───────── */
 
 async function handleNewSession(msg) {
-  if (currentSessionId) {
-    sendResponse(msg.id, { sessionId: currentSessionId, configOptions: [], modes: null, models: null });
-    return;
-  }
   try {
     const dir = getWorkspaceDir();
     const res = await fetch(`${SERVER}/api/session`, {
@@ -1586,7 +1602,7 @@ function loadWorkspaces() {
       const data = JSON.parse(readFileSync(WORKSPACES_FILE, 'utf8'));
       if (Array.isArray(data) && data.length) return data;
     }
-  } catch {}
+  } catch (e) { log(`[LOAD] workspaces parse error: ${e.message}`); }
   return [{ name: '主项目', path: WORK_DIR }];
 }
 
@@ -1598,12 +1614,12 @@ function loadDefaultWorkspace() {
       const match = list.find(w => wsPathEqual(w.path, saved.path));
       if (match) return match;
     }
-  } catch {}
+  } catch (e) { log(`[LOAD] default workspace error: ${e.message}`); }
   return list[0];
 }
 
 function saveCurrentWorkspace() {
-  try { writeFileSync(WORKSPACE_CURRENT_FILE, JSON.stringify({ path: currentWorkspace.path })); } catch {}
+  try { writeFileSync(WORKSPACE_CURRENT_FILE, JSON.stringify({ path: currentWorkspace.path })); } catch (e) { log(`[SAVE] current workspace error: ${e.message}`); }
 }
 
 function getWorkspaceDir() {
@@ -1611,7 +1627,7 @@ function getWorkspaceDir() {
 }
 
 function saveWorkspaces(list) {
-  try { writeFileSync(WORKSPACES_FILE, JSON.stringify(list, null, 2)); } catch {}
+  try { writeFileSync(WORKSPACES_FILE, JSON.stringify(list, null, 2)); } catch (e) { log(`[SAVE] workspaces error: ${e.message}`); }
 }
 
 /* ───────── Session Persistence ───────── */
@@ -1626,17 +1642,17 @@ function loadSession() {
   return null;
 }
 function saveSession(id) {
-  try { writeFileSync(SESSION_FILE, JSON.stringify({ sessionId: id })); } catch {}
+  try { writeFileSync(SESSION_FILE, JSON.stringify({ sessionId: id })); } catch (e) { log(`[SAVE] session error: ${e.message}`); }
 }
 
 /* ───────── Subscribers ───────── */
 
 function loadSubscribers() {
-  try { if (existsSync(SUBSCRIBERS_FILE)) subscribers = JSON.parse(readFileSync(SUBSCRIBERS_FILE, 'utf8')); } catch {}
+  try { if (existsSync(SUBSCRIBERS_FILE)) subscribers = JSON.parse(readFileSync(SUBSCRIBERS_FILE, 'utf8')); } catch (e) { log(`[LOAD] subscribers parse error: ${e.message}`); }
   if (!Array.isArray(subscribers)) subscribers = [];
 }
 function saveSubscribers() {
-  try { writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(subscribers, null, 2)); } catch {}
+  try { writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(subscribers, null, 2)); } catch (e) { log(`[SAVE] subscribers error: ${e.message}`); }
 }
 function getOrCreateSubscriber(sid) {
   let s = subscribers.find(x => x.sid === sid);
@@ -1744,7 +1760,8 @@ async function apiFetch(path, opts = {}) {
    Notification System — SSE Event Monitor
    ═══════════════════════════════════════ */
 
-let sessionNames = new Map();
+let sessionNames = new Map(); // id -> { name, ts }
+const SESSION_NAME_TTL = 300000; // 5 min
 let idleNotified = new Set();
 let recentNotifications = new Map(); // text → timestamp, dedup within 60s
 let perUserRecent = new Map(); // sid → { text → timestamp }
@@ -1753,8 +1770,8 @@ let recentEventIds = new Set(); // event ID → timestamp, dedup within 10s
 let lastNotifyPerSid = new Map(); // sid → timestamp, notification rate limiting
 let sseReader = null;          // current SSE reader (for restart on workspace change)
 
-const DEDUP_WINDOW = 60000;
-const PER_USER_DEDUP_WINDOW = 60000;
+const DEDUP_WINDOW = 30000;
+const PER_USER_DEDUP_WINDOW = 30000;
 
 function broadcastNotification(text) {
   const now = Date.now();
@@ -1889,8 +1906,11 @@ async function drainPendingNotifications(forceFlush) {
 }
 
 function flushToWeChat() {
-  // Send a tool_call notification to trigger WeChatAcpClient.maybeFlushMessage()
-  const flushSid = lastPromptSid || (subscribers[0]?.sid) || currentSessionId;
+  let flushSid = lastPromptSid || currentSessionId;
+  if (!flushSid) {
+    const active = subscribers.filter(s => !s.muted);
+    flushSid = active[0]?.sid || subscribers[0]?.sid;
+  }
   if (!flushSid) { log(`[FLUSH] SKIP: no valid sessionId`); return; }
   sendNotification('session/update', {
     sessionId: flushSid,
@@ -1924,6 +1944,9 @@ function scheduleRealtimeFlush(sid) {
   realtimeFlushTimer.unref?.();
 }
 
+function realtimeNotify(sid, text) {
+  reply(sid, text, uuid());
+}
 function realtimeReply(sid, text) {
   reply(sid, text, currentTextMessageId);
 }
@@ -1957,7 +1980,9 @@ function updateSessionState(id, updates) {
 }
 
 function getSessionName(id) {
-  return sessionNames.get(id) || id?.slice(0, 12) || '?';
+  const entry = sessionNames.get(id);
+  if (entry && Date.now() - entry.ts < SESSION_NAME_TTL) return entry.name;
+  return id?.slice(0, 12) || '?';
 }
 
 async function idleNotification(props) {
@@ -1965,7 +1990,7 @@ async function idleNotification(props) {
   if (!sid || idleNotified.has(sid)) return null;
   idleNotified.add(sid);
   await fetchSessionName(sid);
-  const name = sessionNames.get(sid) || sid;
+  const name = getSessionName(sid);
   return `✅ ${name} · 完成`;
 }
 
@@ -2036,9 +2061,12 @@ async function eventToNotification(type, props) {
         return null; // notification will be generated by dequeueNextQuestion
       }
       pendingQuestions = qData;
-      setTimeout(() => {
-        if (pendingQuestions?.askTimestamp === ts) { pendingQuestions = null; dequeueNextQuestion(); }
-      },     QUESTION_AUTO_CLEAR_MS).unref?.();
+      if (props.sessionID) currentSessionId = props.sessionID;
+      const autoClear = setTimeout(() => {
+        if (pendingQuestions?.askTimestamp === ts) { clearCurrentQuestion(); dequeueNextQuestion(); }
+      }, QUESTION_AUTO_CLEAR_MS);
+      autoClear.unref?.();
+      qData._autoClearTimer = autoClear;
       log(`[EVENT] question.asked: stored ${questions.length} questions`);
       await fetchSessionName(props.sessionID);
       const sesLabel = props.sessionID ? `[${getSessionName(props.sessionID)}] ` : '';
@@ -2069,17 +2097,16 @@ async function eventToNotification(type, props) {
           log(`[TIMER] auto-clean rid=${rid.slice(0,16)}...`);
           pendingPermissions.delete(rid);
         },     QUESTION_AUTO_CLEAR_MS).unref?.();
-        // Same-session dedup: only suppress if this has NO path and session already has pending
-        // (approving one typically auto-approves related requests, but path info is critical)
-        if (!p) {
-          let sessionHasPending = false;
-          for (const [existingRid, info] of pendingPermissions) {
-            if (existingRid !== rid && info.sessionID === sesId) { sessionHasPending = true; break; }
-          }
-          if (sessionHasPending) {
-            log(`[EVENT] permission.asked: session ${sesId?.slice(0,12)} already has pending, no path to show, suppressing`);
-            return null;
-          }
+        // Dedup: suppress if same session has another pending with identical path (or both lack path)
+        let dup = false;
+        for (const [existingRid, info] of pendingPermissions) {
+          if (existingRid === rid || info.sessionID !== sesId) continue;
+          if (!p && !info.patterns) { dup = true; break; }
+          if (p && info.patterns === p) { dup = true; break; }
+        }
+        if (dup) {
+          log(`[EVENT] permission.asked: duplicate (same session+path), suppressing`);
+          return null;
         }
       }
       await fetchSessionName(sesId);
@@ -2104,10 +2131,13 @@ async function eventToNotification(type, props) {
       log(`[EVENT] question.replied/rejected rid=${(qrid||'?').slice(0,16)}`);
       if (qrid) {
         if (pendingQuestions && pendingQuestions.requestID === qrid) {
-          pendingQuestions = null;
+          clearCurrentQuestion();
           await dequeueNextQuestion();
         }
         const before = pendingQuestionQueue.length;
+        for (const q of pendingQuestionQueue) {
+          if (q.requestID === qrid) clearQuestionTimer(q);
+        }
         pendingQuestionQueue = pendingQuestionQueue.filter(q => q.requestID !== qrid);
         if (pendingQuestionQueue.length !== before) {
           log(`[EVENT] removed ${before - pendingQuestionQueue.length} from queue`);
@@ -2119,7 +2149,10 @@ async function eventToNotification(type, props) {
       // Clear stale pending questions only if no active interaction
       if (lastPromptSessionId !== props.sessionID) {
         if (pendingQuestions && pendingQuestions.sessionID === props.sessionID) {
-          pendingQuestions = null;
+          clearCurrentQuestion();
+        }
+        for (const q of pendingQuestionQueue) {
+          if (q.sessionID === props.sessionID) clearQuestionTimer(q);
         }
         pendingQuestionQueue = pendingQuestionQueue.filter(q => q.sessionID !== props.sessionID);
       }
@@ -2269,7 +2302,7 @@ async function eventToNotification(type, props) {
         if (partType === 'reasoning') {
           if (reasonTime.start && !toolStates.has(partId + '_reason')) {
             toolStates.set(partId + '_reason', { startTime: Date.now() });
-            if (lastPromptSid) realtimeReply(lastPromptSid, '🤔 Thinking...');
+            if (lastPromptSid) realtimeNotify(lastPromptSid, '🤔 Thinking...');
           }
           if (delta && lastPromptSid) {
             realtimeBuffer += delta;
@@ -2278,7 +2311,7 @@ async function eventToNotification(type, props) {
           if (reasonTime.end) {
             const ts = toolStates.get(partId + '_reason');
             const dur = ts ? formatDuration(ts.startTime) : '';
-            if (lastPromptSid) realtimeReply(lastPromptSid, `✅ Thinking complete${dur ? ' (' + dur + ')' : ''}`);
+            if (lastPromptSid) realtimeNotify(lastPromptSid, `✅ Thinking complete${dur ? ' (' + dur + ')' : ''}`);
             toolStates.delete(partId + '_reason');
           }
           return null;
@@ -2288,21 +2321,21 @@ async function eventToNotification(type, props) {
             if (!toolStates.has(partId)) {
               toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
               const inp = formatToolInput(part.input);
-              if (lastPromptSid) realtimeReply(lastPromptSid, `🔧 ${toolName}${inp ? ' ' + inp : ''}`);
+              if (lastPromptSid) realtimeNotify(lastPromptSid, `🔧 ${toolName}${inp ? ' ' + inp : ''}`);
             }
           } else if (toolStatus === 'completed') {
             clearToolStates();
             const outBrief = toolOutput ? toolOutput.replace(/\n/g, ' ').slice(0, 120) : '';
             if (lastPromptSid) {
               if (outBrief) {
-                realtimeReply(lastPromptSid, `✅ ${toolName}\n${outBrief}`);
+                realtimeNotify(lastPromptSid, `✅ ${toolName}\n${outBrief}`);
               } else {
-                realtimeReply(lastPromptSid, `✅ ${toolName}`);
+                realtimeNotify(lastPromptSid, `✅ ${toolName}`);
               }
             }
           } else if (toolStatus === 'error') {
             clearToolStates();
-            if (lastPromptSid) realtimeReply(lastPromptSid, `❌ ${toolName}: ${toolOutput || 'error'}`);
+            if (lastPromptSid) realtimeNotify(lastPromptSid, `❌ ${toolName}: ${toolOutput || 'error'}`);
           }
           return null;
         }
@@ -2372,12 +2405,14 @@ async function eventToNotification(type, props) {
 }
 
 async function fetchSessionName(id) {
-  if (!id || sessionNames.has(id)) return;
+  if (!id) return;
+  const entry = sessionNames.get(id);
+  if (entry && Date.now() - entry.ts < SESSION_NAME_TTL) return;
   try {
     const raw = await apiFetch(`/api/session/${encodeURIComponent(id)}`);
     const data = raw?.data || raw;
-    if (data?.title) sessionNames.set(id, data.title);
-  } catch {}
+    if (data?.title) sessionNames.set(id, { name: data.title, ts: Date.now() });
+  } catch { log(`[FETCH] session name failed for ${id?.slice(0,12)}`); }
 }
 
 function restartSSE() {
