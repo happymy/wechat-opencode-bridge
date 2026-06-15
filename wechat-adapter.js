@@ -53,7 +53,8 @@ const QUESTION_AUTO_CLEAR_MS = 86400000; // 24h safety net (server never auto-ex
 const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
 const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
 const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
-const REALTIME_FLUSH_MS = 400; // FULL 模式实时流式刷出间隔 (ms)
+const REALTIME_FLUSH_MS = 100; // FULL 模式实时流式刷出间隔 (ms)
+const REALTIME_MIN_FLUSH = 30; // FULL 模式最小累积字符数后立即刷出
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 let realtimeBuffer = '';       // FULL 模式实时文本缓冲
 let realtimeFlushTimer = null; // 实时刷出定时器
@@ -505,8 +506,8 @@ function levelIcon(lv) {
 }
 function levelDesc(lv) {
   return {
-    full: '显示所有信息（工具调用、文件差异等全部转发）',
-    pad: '摘要显示，隐藏工具输出和文件细节',
+    full: '实时流式输出，每个工具/文本增量即时发送',
+    pad: '折叠摘要（工具调用、推理时间折叠为单行），隐藏工具输出',
     phone: '极简模式，仅显示 AI 文本回复和错误',
   }[lv] || '';
 }
@@ -2145,25 +2146,37 @@ async function eventToNotification(type, props) {
       log(`[SSE] delta: type=${type} field="${partType}" tool="${toolName}" delta_len=${delta.length} psid=${(psid||'?').slice(0,12)}`);
 
       if (isFull()) {
-        // ── FULL: real-time streaming ──
+        // ── FULL: real-time streaming, every delta sent immediately ──
+        function markResponseSent() {
+          if (!responseSent && lastPromptSessionId) {
+            responseSent = true;
+            responseForSession = lastPromptSessionId;
+            disarmWorkingNotice();
+            idleNotified.add(lastPromptSessionId);
+          }
+        }
         if (partType === 'text' && delta) {
           realtimeBuffer += delta;
-          scheduleRealtimeFlush(lastPromptSid);
+          if (realtimeBuffer.length >= REALTIME_MIN_FLUSH || /[\n。！？.!?]/.test(delta)) {
+            const text = realtimeBuffer;
+            realtimeBuffer = '';
+            if (text.trim()) { realtimeReply(lastPromptSid, text); markResponseSent(); }
+          }
           return null;
         }
         if (partType === 'reasoning') {
           if (reasonTime.start && !toolStates.has(partId + '_reason')) {
             toolStates.set(partId + '_reason', { startTime: Date.now() });
             realtimeReply(lastPromptSid, '🤔 Thinking...');
+            markResponseSent();
           }
           if (delta) {
-            realtimeBuffer += '🤔 ' + delta;
-            scheduleRealtimeFlush(lastPromptSid);
+            realtimeReply(lastPromptSid, '🤔 ' + delta);
+            markResponseSent();
           }
           if (reasonTime.end) {
             const ts = toolStates.get(partId + '_reason');
             const dur = ts ? formatDuration(ts.startTime) : '';
-            flushRealtime(lastPromptSid);
             realtimeReply(lastPromptSid, `✅ Thinking complete${dur ? ' (' + dur + ')' : ''}`);
             toolStates.delete(partId + '_reason');
           }
@@ -2175,6 +2188,7 @@ async function eventToNotification(type, props) {
               toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
               const inp = formatToolInput(part.input);
               realtimeReply(lastPromptSid, `🔧 ${toolName}${inp ? ' ' + inp : ''}`);
+              markResponseSent();
             }
           } else if (toolStatus === 'completed') {
             clearToolStates();
@@ -2191,8 +2205,8 @@ async function eventToNotification(type, props) {
           return null;
         }
         if (delta) {
-          realtimeBuffer += delta;
-          scheduleRealtimeFlush(lastPromptSid);
+          realtimeReply(lastPromptSid, delta);
+          markResponseSent();
         }
         return null;
       }
@@ -2226,7 +2240,7 @@ async function eventToNotification(type, props) {
         if (reasonTime.end && lastReasoningTime) {
           const dur = formatDuration(lastReasoningTime);
           lastReasoningTime = 0;
-          return `+ Thinking: ${dur}`;
+          return `+ Thought: ${dur}`;
         }
         return null;
       }
