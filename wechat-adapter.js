@@ -367,7 +367,8 @@ async function switchSession(sid, arg, msgId) {
 
   // Try as session ID directly
   try {
-    const data = await apiFetch(`/api/session/${encodeURIComponent(arg)}`);
+    const raw = await apiFetch(`/api/session/${encodeURIComponent(arg)}`);
+    const data = raw?.data || raw;
     currentSessionId = data.id || arg;
     saveSession(currentSessionId);
     reply(sid, `✅ 已切换到「${data.title || '(未命名)'}」`);
@@ -451,7 +452,8 @@ async function newSession(sid, title, msgId) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: title.trim(), directory: dir }),
     });
-    currentSessionId = (data.id || 'sess_' + Date.now());
+    const session = data?.data || data;
+    currentSessionId = (session.id || 'sess_' + Date.now());
     saveSession(currentSessionId);
     reply(sid, `✅ 已创建并切换到「${title.trim()}」`);
   } catch (err) {
@@ -889,7 +891,8 @@ async function showTaskStatus(sid, msgId) {
       if (st.type === 'busy') {
         hasActive = true;
         const info = await apiFetch(`/api/session/${encodeURIComponent(id)}`).catch(() => null);
-        const name = info?.title || id.slice(0, 16);
+        const sessionInfo = info?.data || info;
+        const name = sessionInfo?.title || id.slice(0, 16);
         const isCurrent = id === currentSessionId ? ' ◀当前' : '';
         lines.push(`▶ ${name} — 运行中${isCurrent}`);
       }
@@ -1465,8 +1468,9 @@ async function handleNewSession(msg) {
       headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: 'WeChat', directory: dir }),
     });
-    const data = res.ok ? await res.json() : {};
-    currentSessionId = data.id || ('sess_' + Date.now());
+    const raw = res.ok ? await res.json() : {};
+    const session = raw?.data || raw;
+    currentSessionId = session.id || ('sess_' + Date.now());
     saveSession(currentSessionId);
     sendResponse(msg.id, { sessionId: currentSessionId, configOptions: [], modes: null, models: null });
   } catch {
@@ -1496,7 +1500,8 @@ async function handleLoadSession(msg) {
   const sessionId = msg.params?.sessionId;
   if (!sessionId) { sendResponse(msg.id, { _meta: { error: 'sessionId required' } }); return; }
   try {
-    const data = await apiFetch(`/api/session/${encodeURIComponent(sessionId)}`);
+    const raw = await apiFetch(`/api/session/${encodeURIComponent(sessionId)}`);
+    const data = raw?.data || raw;
     currentSessionId = data.id || sessionId;
     saveSession(currentSessionId);
     sendResponse(msg.id, { sessionId: currentSessionId, cwd: data.directory || '', title: data.title || '',
