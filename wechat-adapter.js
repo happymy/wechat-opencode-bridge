@@ -51,7 +51,7 @@ let responseSent = false;     // true after final reply is sent (prevents double
 let responseForSession = null; // session ID that the pending response is for
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
-const QUESTION_AUTO_CLEAR_MS = 86400000; // 24h safety net (server never auto-expires)
+const QUESTION_AUTO_CLEAR_MS = 7200000; // 2h auto-clear for unanswered questions
 const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
 const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
 const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
@@ -404,6 +404,8 @@ async function switchSession(sid, arg, msgId) {
   lastPromptSessionId = null;
   lastPromptSid = null;
   currentTextMessageId = null;
+  realtimeBuffer = '';
+  if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   if (!arg) {
     reply(sid, '用法: /switch <编号|会话ID>\n先用 /list 查看会话列表');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -486,6 +488,8 @@ async function cancelCurrent(sid, msgId) {
   lastPromptSessionId = null;
   lastPromptSid = null;
   currentTextMessageId = null;
+  realtimeBuffer = '';
+  if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   const target = currentSessionId;
   if (!target) {
     reply(sid, '⚠️ 没有选中的会话');
@@ -512,6 +516,8 @@ async function newSession(sid, title, msgId) {
   lastPromptSessionId = null;
   lastPromptSid = null;
   currentTextMessageId = null;
+  realtimeBuffer = '';
+  if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   if (!title) {
     reply(sid, '用法: /new <会话名>\n示例: /new 修复登录bug');
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -825,6 +831,8 @@ async function handleWorkspace(sid, arg, msgId) {
   lastPromptSessionId = null;
   lastPromptSid = null;
   currentTextMessageId = null;
+  realtimeBuffer = '';
+  if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   currentWorkspace = list[num - 1];
   saveCurrentWorkspace();
   restartSSE();
@@ -1297,6 +1305,9 @@ async function answerQuestion(sid, answer, msgId) {
   const multi = qData.questions?.length > 1;
 
   if (!answerText) {
+    if (pendingQuestions?.questions?.[0]) {
+      return listCurrentQuestion(sid, msgId);
+    }
     reply(sid, '⚠️ 答案不能为空。请回复内容或用编号选择选项');
     if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
     return;
@@ -1665,6 +1676,8 @@ async function handleCancel(msg) {
   lastPromptSessionId = null;
   lastPromptSid = null;
   currentTextMessageId = null;
+  realtimeBuffer = '';
+  if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   // ACP 规范: session/cancel 是通知 (JSON-RPC notification)，无 id 时不能发响应
   if (msg.id != null) sendResponse(msg.id, {});
 }
@@ -1986,12 +1999,8 @@ async function drainPendingNotifications(forceFlush) {
 }
 
 function flushToWeChat() {
-  let flushSid = lastPromptSid || currentSessionId;
-  if (!flushSid) {
-    const active = subscribers.filter(s => !s.muted);
-    flushSid = active[0]?.sid || subscribers[0]?.sid;
-  }
-  if (!flushSid) { log(`[FLUSH] SKIP: no valid sessionId`); return; }
+  if (!lastPromptSid) { log(`[FLUSH] SKIP: no lastPromptSid`); return; }
+  const flushSid = lastPromptSid;
   sendNotification('session/update', {
     sessionId: flushSid,
     update: {
@@ -2015,6 +2024,7 @@ function flushRealtime(sid) {
     const text = realtimeBuffer;
     realtimeBuffer = '';
     reply(sid, text, uuid());
+    flushToWeChat();
   }
 }
 
@@ -2080,27 +2090,16 @@ async function handleSseSideEffect(type, props) {
     case 'tui.session.select': {
       const sid = props.sessionID || props.id;
       if (!sid || sid === currentSessionId) return;
-      log(`[SSE] tui.session.select: local switched to ${sid.slice(0,12)}`);
-      const oldId = currentSessionId;
-      currentSessionId = sid;
-      saveSession(sid);
-      await fetchSessionName(sid);
-      if (oldId) {
-        broadcastNotification(`🔄 已跟随到会话「${getSessionName(sid)}」`);
-      }
+      log(`[SSE] tui.session.select: skip auto-follow from other clients`);
       return;
     }
     case 'session.created': {
       const sid = props.sessionID || props.id;
       if (!sid) return;
       log(`[SSE] session.created: ${sid.slice(0,12)}`);
-      // Optionally auto-follow new sessions (if they match current directory)
       const dir = props.directory;
       if (dir && normalizeDir(dir) === normalizeDir(getWorkspaceDir())) {
-        currentSessionId = sid;
-        saveSession(sid);
-        await fetchSessionName(sid);
-        broadcastNotification(`🆕 新会话已创建，已自动跟随`);
+        log(`[SSE] new session in current workspace: ${sid.slice(0,12)}`);
       }
       return;
     }
@@ -2170,16 +2169,10 @@ async function eventToNotification(type, props) {
           log(`[EVENT] permission.asked: duplicate rid, suppressing notification`);
           return null;
         }
-        log(`[EVENT] permission.asked: storing rid in pendingPermissions`);
-        pendingPermissions.set(rid, { sessionID: sesId, permission: t, patterns: p, ts: Date.now() });
-        setTimeout(() => {
-          log(`[TIMER] auto-clean rid=${rid.slice(0,16)}...`);
-          pendingPermissions.delete(rid);
-        },     QUESTION_AUTO_CLEAR_MS).unref?.();
         // Dedup: suppress if same session has another pending with identical path (or both lack path)
         let dup = false;
         for (const [existingRid, info] of pendingPermissions) {
-          if (existingRid === rid || info.sessionID !== sesId) continue;
+          if (info.sessionID !== sesId) continue;
           if (!p && !info.patterns) { dup = true; break; }
           if (p && info.patterns === p) { dup = true; break; }
         }
@@ -2187,6 +2180,12 @@ async function eventToNotification(type, props) {
           log(`[EVENT] permission.asked: duplicate (same session+path), suppressing`);
           return null;
         }
+        log(`[EVENT] permission.asked: storing rid in pendingPermissions`);
+        pendingPermissions.set(rid, { sessionID: sesId, permission: t, patterns: p, ts: Date.now() });
+        setTimeout(() => {
+          log(`[TIMER] auto-clean rid=${rid.slice(0,16)}...`);
+          pendingPermissions.delete(rid);
+        },     QUESTION_AUTO_CLEAR_MS).unref?.();
       }
       await fetchSessionName(sesId);
       const sesLabel = sesId ? `[${getSessionName(sesId)}] ` : '';
@@ -2277,9 +2276,8 @@ async function eventToNotification(type, props) {
         }
         return null;
       }
-      // PHONE mode: suppress completion notifications
-      if (isPhone()) return null;
-      return idleNotification(props);
+      // Not the current active session — don't notify
+      return null;
     }
     case 'session.status': {
       const st = props.status;
@@ -2327,8 +2325,7 @@ async function eventToNotification(type, props) {
           // Already sent by forwardToAIAsync, just suppress "完成"
           return null;
         }
-        if (isPhone()) return null;
-        return idleNotification(props);
+        return null;
       }
       if (st.type === 'retry') {
         if (isPhone()) return null;
@@ -2385,6 +2382,7 @@ async function eventToNotification(type, props) {
             realtimeBuffer = '';
             if (text.trim() && lastPromptSid) {
               reply(lastPromptSid, text, uuid());
+              flushToWeChat();
             }
           }
           return null;
@@ -2757,9 +2755,11 @@ function startWatchdog() {
         stdoutDropLogged.clear();
       }
 
-      // Warn if pendingReplyText is very large (wechat-acp chunks[] may be growing unbounded)
+      // Warn and truncate if pendingReplyText is very large
       if (pendingReplyText.length > 30000) {
-        log(`[WATCHDOG] WARN: pendingReplyText=${pendingReplyText.length} chars, wechat-acp chunks buffer may be large`);
+        log(`[WATCHDOG] WARN: pendingReplyText=${pendingReplyText.length} chars, truncating to 20000`);
+        pendingReplyText = pendingReplyText.slice(-20000);
+        pendingTruncated = true;
       }
     } catch (e) {
       log(`[WATCHDOG] error: ${e.message}`);
