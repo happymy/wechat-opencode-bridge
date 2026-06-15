@@ -50,6 +50,9 @@ let responseForSession = null; // session ID that the pending response is for
 let workingTimer = null;      // "still working" notice timer
 const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
 const QUESTION_AUTO_CLEAR_MS = 86400000; // 24h safety net (server never auto-expires)
+const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
+const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
+const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 
 /* ───────── Logging ───────── */
@@ -81,8 +84,11 @@ rl.on('line', (line) => {
         loadSession: true,
         promptCapabilities: { audio: false, embeddedContext: false, image: false },
         sessionCapabilities: { list: {} },
+        mcpCapabilities: { http: false, sse: false },
+        auth: {},
       },
       agentInfo: { name: 'opencode-wechat-bot', version: '4.0.0' },
+      authMethods: [],
     });
   } else if (m === 'session/new') {
     handleNewSession(msg).catch(e => log(`[ERR] session/new: ${e.message}`));
@@ -153,7 +159,7 @@ async function handlePrompt(msg) {
     forwardToAIAsync(sid, targetId, text).catch(e => log(`[ERR] fwd: ${e.message}`));
   } catch (err) {
     log(`[ERR] handlePrompt: ${err.message}`);
-    sendResponse(msg.id, { stopReason: 'error' });
+    sendResponse(msg.id, { stopReason: 'end_turn', _meta: { error: err.message } });
   }
 }
 
@@ -570,12 +576,16 @@ async function handlePermissionReply(sid, action, arg, msgId) {
 
   try {
     log(`[PERM] sending reply: action=${action} rid=${targetRid.slice(0,16)}...`);
-    await apiFetch(`/permission/${encodeURIComponent(targetRid)}/reply`, {
+    const info = pendingPermissions.get(targetRid);
+    const permSid = info?.sessionID;
+    if (!permSid) {
+      throw new Error('未知会话，无法提交权限回复');
+    }
+    await apiFetch(`/api/session/${encodeURIComponent(permSid)}/permission/${encodeURIComponent(targetRid)}/reply`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reply: action, message: `via wechat-adapter (sid=${sid.slice(0,12)})` }),
     });
-    const info = pendingPermissions.get(targetRid);
     const labels = { once: '✅ 已批准', always: '✅ 已信任', reject: '❌ 已拒绝' };
     const msg = `${labels[action]}: ${info?.permission || '权限请求'}`;
     log(`[PERM] reply success: ${msg}`);
@@ -592,7 +602,7 @@ async function handlePermissionReply(sid, action, arg, msgId) {
 async function syncPermissionsFromServer() {
   log(`[SYNC] start pendingPermissions.size=${pendingPermissions.size}`);
   try {
-    const list = await apiFetch(`/permission?directory=${encodeURIComponent(getWorkspaceDir())}`);
+    const list = await apiFetch(`/api/permission/request?location[directory]=${encodeURIComponent(getWorkspaceDir())}`);
     log(`[SYNC] server returned ${Array.isArray(list) ? list.length + ' items' : typeof list}`);
     if (!Array.isArray(list)) { log(`[SYNC] not an array, skipping`); return; }
     const serverIds = new Set(list.map(r => r.id));
@@ -613,7 +623,7 @@ async function syncPermissionsFromServer() {
 async function syncPendingFromServer() {
   const dir = getWorkspaceDir();
   try {
-    const permList = await apiFetch(`/permission?directory=${encodeURIComponent(dir)}`);
+    const permList = await apiFetch(`/api/permission/request?location[directory]=${encodeURIComponent(dir)}`);
     const serverPermIds = new Set((Array.isArray(permList) ? permList : []).map(r => r.id));
     for (const [rid] of pendingPermissions) {
       if (!serverPermIds.has(rid)) {
@@ -634,7 +644,7 @@ async function syncPendingFromServer() {
       if (!qsid || seen.has(qsid)) continue;
       seen.add(qsid);
       try {
-        const sessQs = await apiFetch(`/session/${encodeURIComponent(qsid)}/question`);
+        const sessQs = await apiFetch(`/api/session/${encodeURIComponent(qsid)}/question`);
         const validIds = new Set((sessQs?.data || []).map(r => r.id));
         for (const q2 of allQuestions) {
           if (q2.sessionID !== qsid) continue;
@@ -1212,10 +1222,10 @@ async function answerQuestion(sid, answer, msgId) {
 async function answerViaQuestionApi(sid, targetId, answers, requestID) {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000);
+    const timeout = setTimeout(() => controller.abort(), SESSION_MESSAGE_TIMEOUT);
     let res;
     try {
-      res = await fetch(`${SERVER}/question/${requestID}/reply`, {
+      res = await fetch(`${SERVER}/api/session/${encodeURIComponent(targetId)}/question/${encodeURIComponent(requestID)}/reply`, {
         method: 'POST',
         headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
         body: JSON.stringify({ answers: answers.map(a => [a]) }),
@@ -1304,9 +1314,10 @@ async function skipQuestion(sid, arg, msgId) {
   }
 
   const requestID = qData?.requestID;
-  if (requestID) {
+  const qSessID = qData?.sessionID;
+  if (requestID && qSessID) {
     try {
-      await fetch(`${SERVER}/question/${requestID}/reject`, {
+      await fetch(`${SERVER}/api/session/${encodeURIComponent(qSessID)}/question/${encodeURIComponent(requestID)}/reject`, {
         method: 'POST',
         headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -1355,7 +1366,7 @@ function disarmWorkingNotice() {
 async function forwardToAIAsync(sid, targetId, text) {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000);
+    const timeout = setTimeout(() => controller.abort(), SESSION_MESSAGE_TIMEOUT);
     let res;
     try {
       res = await fetch(`${SERVER}/session/${encodeURIComponent(targetId)}/message`, {
@@ -1497,7 +1508,8 @@ async function handleCancel(msg) {
   responseForSession = null;
   lastPromptSessionId = null;
   lastPromptSid = null;
-  sendResponse(msg.id, {});
+  // ACP 规范: session/cancel 是通知 (JSON-RPC notification)，无 id 时不能发响应
+  if (msg.id != null) sendResponse(msg.id, {});
 }
 
 /* ───────── Workspace ───────── */
@@ -1675,6 +1687,7 @@ let recentNotifications = new Map(); // text → timestamp, dedup within 60s
 let perUserRecent = new Map(); // sid → { text → timestamp }
 let proactiveTimer = null;
 let recentEventIds = new Set(); // event ID → timestamp, dedup within 10s
+let lastNotifyPerSid = new Map(); // sid → timestamp, notification rate limiting
 let sseReader = null;          // current SSE reader (for restart on workspace change)
 
 const DEDUP_WINDOW = 60000;
@@ -1765,6 +1778,15 @@ async function drainPendingNotifications(forceFlush) {
     }
     log(`[DRAIN] grouped into ${grouped.size} unique sid(s)`);
     for (const [sid, texts] of grouped) {
+      // Rate limiting: ensure minimum interval between notifications to same user
+      const lastSent = lastNotifyPerSid.get(sid) || 0;
+      const elapsed = Date.now() - lastSent;
+      if (elapsed < NOTIFICATION_RATE_LIMIT_MS) {
+        const waitMs = NOTIFICATION_RATE_LIMIT_MS - elapsed;
+        log(`[DRAIN] rate limit: waiting ${waitMs}ms for sid=${sid.slice(0,12)}`);
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+      lastNotifyPerSid.set(sid, Date.now());
       const unique = [...new Set(texts)];
       log(`[DRAIN] sid=${sid.slice(0,12)}: ${texts.length} texts -> ${unique.length} unique`);
       if (unique.length > 1) {
@@ -2049,7 +2071,11 @@ async function eventToNotification(type, props) {
       const delta = props.delta || props.part?.text || '';
       log(`[SSE] delta: type=${type} field="${partType}" delta_len=${delta.length} psid=${(psid||'?').slice(0,12)} lastSid=${(lastPromptSessionId||'?').slice(0,12)} pending_len=${pendingReplyText.length}`);
       if (psid && psid === lastPromptSessionId && partType === 'text' && delta) {
-        pendingReplyText += delta;
+        if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
+          pendingReplyText += delta;
+        } else if (!pendingReplyText.endsWith('…（过长截断）')) {
+          pendingReplyText += '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+        }
       }
       return null;
     }
@@ -2265,7 +2291,7 @@ function startWatchdog() {
     } catch (e) {
       log(`[WATCHDOG] error: ${e.message}`);
     }
-  }, 30000);
+  }, 30000).unref();
 }
 
 // ── Startup ──
