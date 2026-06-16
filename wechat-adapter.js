@@ -2372,7 +2372,8 @@ async function eventToNotification(type, props) {
 
       if (props.sessionID && props.sessionID === lastPromptSessionId) {
         if (isFull()) {
-          // FULL mode: flush remaining buffer with persistent messageId, don't send "完成"
+          // FULL mode: flush remaining buffer with persistent messageId
+          const hadOverflow = pendingTruncated;
           if (realtimeBuffer && lastPromptSid) {
             let text = realtimeBuffer;
             if (text.length > MAX_REALTIME_BUFFER) {
@@ -2396,6 +2397,10 @@ async function eventToNotification(type, props) {
             disarmWorkingNotice();
             idleNotified.add(props.sessionID);
             log(`[IDLE] FULL mode: flushed and marked sent`);
+            flushToWeChat();
+          }
+          if (hadOverflow && quotaMode !== 'continue') {
+            reply(lastPromptSid, '⚠️ 回复过长已截断，完整内容请在 OpenCode 界面查看');
             flushToWeChat();
           }
           if (pendingContinuation) {
@@ -2451,6 +2456,7 @@ async function eventToNotification(type, props) {
         if (props.sessionID && props.sessionID === lastPromptSessionId) {
           if (isFull()) {
             // FULL mode: flush buffer with persistent messageId
+            const hadOverflow = pendingTruncated;
             if (realtimeBuffer && lastPromptSid) {
               let text = realtimeBuffer;
               if (text.length > MAX_REALTIME_BUFFER) {
@@ -2473,6 +2479,10 @@ async function eventToNotification(type, props) {
               responseForSession = props.sessionID;
               disarmWorkingNotice();
               idleNotified.add(props.sessionID);
+              flushToWeChat();
+            }
+            if (hadOverflow && quotaMode !== 'continue') {
+              reply(lastPromptSid, '⚠️ 回复过长已截断，完整内容请在 OpenCode 界面查看');
               flushToWeChat();
             }
             if (pendingContinuation) {
@@ -2559,6 +2569,8 @@ async function eventToNotification(type, props) {
         if (partType === 'text' && delta) {
           if (fullQuotaUsed < FULL_QUOTA_LIMIT || realtimeBuffer.length < MAX_REALTIME_BUFFER) {
             realtimeBuffer += delta;
+          } else if (!pendingTruncated) {
+            pendingTruncated = true;
           }
           scheduleRealtimeFlush(lastPromptSid);
           if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
