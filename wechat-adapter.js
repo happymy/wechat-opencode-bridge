@@ -50,8 +50,8 @@ let lastPromptText = '';      // last prompt text
 let pendingReplyText = '';    // accumulated text parts for question API responses
 let responseSent = false;     // true after final reply is sent (prevents double-reply)
 let responseForSession = null; // session ID that the pending response is for
-let heartbeats = [];           // 心跳定时器 ID 列表（PAD/PHONE 渐进式，FULL 单次）
-const HEARTBEAT_DELAYS = [10000, 25000, 45000]; // progressive heartbeat intervals (ms)
+let heartbeats = [];           // 心跳定时器 ID 列表
+const HEARTBEAT_DELAY_MS = 30000; // 心跳延迟（仅长任务触发）
 const QUESTION_AUTO_CLEAR_MS = 7200000; // 2h auto-clear for unanswered questions
 const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
 const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
@@ -1512,43 +1512,20 @@ async function skipQuestion(sid, arg, msgId) {
 
 /* ───────── Heartbeat ───────── */
 
-const HEARTBEAT_MSGS = {
-  full: ['⏳ AI正在处理中…'],
-  pad: [
-    '⏳ AI正在处理中… 请稍候',
-    '⏳ 仍在处理中… 完成后自动发送回复',
-    '⏳ 长时间处理中… 复杂任务可能需要更多时间',
-  ],
-  phone: [
-    '⏳ AI正在思考…',
-    '⏳ 仍在思考…',
-    '⏳ 长时间思考中…',
-  ],
-};
-
 function armHeartbeat(sid) {
   disarmWorkingNotice();
-  if (isFull()) {
-    // FULL: one notice at 20s (existing behavior)
-    const t = setTimeout(() => {
-      if (responseSent) return;
-      reply(sid, '⏳ AI正在处理中…');
-      flushToWeChat();
-    }, 20000);
-    t.unref?.();
-    heartbeats = [t];
-    return;
-  }
-  const msgs = isPhone() ? HEARTBEAT_MSGS.phone : HEARTBEAT_MSGS.pad;
-  const timers = HEARTBEAT_DELAYS.map((delay, i) => {
-    return setTimeout(() => {
-      if (responseSent) return;
-      reply(sid, msgs[i] || msgs[msgs.length - 1]);
-      flushToWeChat();
-    }, delay);
-  });
-  timers.forEach(t => t.unref?.());
-  heartbeats = timers;
+  const msg = isFull()
+    ? '⏳ AI正在处理中…'
+    : isPhone()
+      ? '⏳ AI正在思考…'
+      : '⏳ AI正在处理中…';
+  const t = setTimeout(() => {
+    if (responseSent) return;
+    reply(sid, msg);
+    flushToWeChat();
+  }, HEARTBEAT_DELAY_MS);
+  t.unref?.();
+  heartbeats = [t];
 }
 
 function disarmWorkingNotice() {
