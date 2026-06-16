@@ -525,12 +525,12 @@ async function newSession(sid, title, msgId) {
   }
   try {
     const dir = getWorkspaceDir();
-    const data = await apiFetch('/api/session', {
+    const qs = new URLSearchParams({ directory: dir }).toString();
+    const session = await apiFetch(`/session?${qs}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: title.trim(), directory: dir }),
+      body: JSON.stringify({ title: title.trim() }),
     });
-    const session = data?.data || data;
     currentSessionId = (session.id || 'sess_' + Date.now());
     saveSession(currentSessionId);
     reply(sid, `✅ 已创建并切换到「${title.trim()}」`);
