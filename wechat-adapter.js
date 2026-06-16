@@ -539,6 +539,7 @@ async function newSession(sid, title, msgId) {
   disarmWorkingNotice();
   pendingReplyText = '';
   pendingTruncated = false;
+  processingNotified = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -901,6 +902,7 @@ async function handleWorkspace(sid, arg, msgId) {
   disarmWorkingNotice();
   pendingReplyText = '';
   pendingTruncated = false;
+  processingNotified = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -1469,6 +1471,8 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
       responseForSession = null;
       pendingReplyText = '';
       pendingTruncated = false;
+      processingNotified = false;
+      pendingContinuation = null;
       const errText = await res.text();
       reply(sid, `⚠️ 回答提交失败 (${res.status}): ${errText.slice(0, 100)}`);
       await drainPendingNotifications();
@@ -1483,6 +1487,8 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
     responseForSession = null;
     pendingReplyText = '';
     pendingTruncated = false;
+    processingNotified = false;
+    pendingContinuation = null;
     reply(sid, `❌ 回答提交失败: ${err.message}`);
     await drainPendingNotifications();
     flushToWeChat();
@@ -1713,6 +1719,7 @@ async function forwardToAIAsync(sid, targetId, text) {
       pendingReplyText = '';
       pendingTruncated = false;
       processingNotified = false;
+      pendingContinuation = null;
       responseSent = true;
       responseForSession = null;
       lastPromptSessionId = null;
@@ -1732,6 +1739,7 @@ async function forwardToAIAsync(sid, targetId, text) {
       pendingReplyText = '';
       pendingTruncated = false;
       processingNotified = false;
+      pendingContinuation = null;
       responseSent = true;
       responseForSession = null;
       lastPromptSessionId = null;
