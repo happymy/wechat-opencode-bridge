@@ -562,9 +562,9 @@ async function handleFilterLevel(sid, arg, msgId) {
     lines.push('─'.repeat(14));
     lines.push('/f (FULL) 流式输出  |  /pd (PAD) 标准模式  |  /ph (PHONE) 极简模式');
     lines.push('');
-    lines.push('⚠️ FULL 模式通过微信实时推送每个文本增量，');
-    lines.push('   长文本时微信 API 限流或网络波动可能导致部分消息丢失。');
-    lines.push('   推荐使用 PAD 模式处理长响应，或通过 OpenCode Web UI');
+    lines.push('⚠️ FULL 模式：实时推送每个文本/工具增量，每次推送消耗一次 iLink API 调用。');
+    lines.push('   长文本时调用频繁，触发微信限流后后续消息静默丢失（用户无法感知回复不完整）。');
+    lines.push('   推荐使用 PAD 模式（默认），或通过 OpenCode Web UI');
     lines.push('   (http://localhost:4096) 查看完整输出。');
     reply(sid, lines.join('\n'));
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -584,7 +584,7 @@ async function setFilterLevel(sid, level, msgId) {
   saveFilterLevel();
   let msg = `${levelIcon(level)} 已切换到 ${level.toUpperCase()} 模式\n${levelDesc(level)}`;
   if (level === 'full') {
-    msg += '\n\n⚠️ FULL 模式通过微信实时推送每个文本增量，长文本时微信 API 限流或网络波动可能导致部分消息丢失。推荐使用 PAD 模式，或通过 OpenCode Web UI (http://localhost:4096) 查看完整输出。';
+    msg += '\n\n⚠️ FULL 模式：实时推送每个文本/工具增量，每次推送消耗一次 iLink API 调用。长文本时调用频繁，触发微信限流后后续消息静默丢失（用户无法感知回复不完整）。推荐使用 PAD 模式（默认），或通过 OpenCode Web UI (http://localhost:4096) 查看完整输出。';
   }
   reply(sid, msg);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
@@ -595,7 +595,7 @@ function levelIcon(lv) {
 }
 function levelDesc(lv) {
   return {
-    full: '实时流式输出 ⚠️ 长文本可能丢消息，推荐在 Web UI 使用',
+    full: '实时流式输出 ⚠️ 高频推送触发限流时后半段静默丢失，不推荐日常使用',
     pad: '处理中显示等待提示，仅发送 AI 文本回复',
     phone: '极简模式，仅显示 AI 文本回复和错误',
   }[lv] || '';
@@ -1087,10 +1087,11 @@ function showHelp(sid, msgId) {
     '💡 通知消息中可直接回复答案或权限审批，无需输入命令',
     '💡 未识别的消息将转发给当前选中的 AI 会话',
     '',
-    '⚠️ FULL 模式 ( /f )：实时推送每个文本/工具增量到微信',
-    '   长文本时微信 API 限流或网络波动可能导致消息丢失。',
-    '   推荐使用 PAD 模式 ( /pd )，确保完整输出。',
-    '   完整输出也可在 OpenCode Web UI (http://localhost:4096) 查看。',
+    '⚠️ FULL 模式 ( /f )：实时推送每个文本/工具增量到微信，',
+    '   每次推送消耗一次 iLink API 调用。长文本时调用频繁',
+    '   会触发微信限流，**限流后后续消息静默丢失**（用户无法',
+    '   感知回复不完整）。推荐使用 PAD 模式 ( /pd )，或通过',
+    '   OpenCode Web UI (http://localhost:4096) 查看完整输出。',
   ];
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
