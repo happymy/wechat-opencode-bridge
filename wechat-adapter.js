@@ -56,8 +56,8 @@ const QUESTION_AUTO_CLEAR_MS = 7200000; // 2h auto-clear for unanswered question
 const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
 const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
 const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
-const REALTIME_FLUSH_MS = 1200; // FULL 模式实时流式刷出间隔 (ms)
-const REALTIME_MIN_FLUSH = 600; // FULL 模式最小累积字符数后立即刷出
+const REALTIME_FLUSH_MS = 3000; // FULL 模式实时流式刷出间隔 (ms)
+const REALTIME_MIN_FLUSH = 2500; // FULL 模式最小累积字符数后立即刷出
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 let realtimeBuffer = '';       // FULL 模式实时文本缓冲
 let realtimeFlushTimer = null; // 实时刷出定时器
@@ -2394,7 +2394,7 @@ async function eventToNotification(type, props) {
             pendingTruncated = true;
             pendingReplyText += '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
           }
-          if (realtimeBuffer.length >= REALTIME_MIN_FLUSH || /[\n。！？.!?]/.test(delta)) {
+          if (realtimeBuffer.length >= REALTIME_MIN_FLUSH || (realtimeBuffer.length > 500 && /[\n。！？.!?]/.test(delta))) {
             if (realtimeFlushTimer) {
               clearTimeout(realtimeFlushTimer);
               realtimeFlushTimer = null;
