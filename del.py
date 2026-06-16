@@ -1,5 +1,5 @@
 import os
-path = r"\\?\c:\Users\GAME\Desktop\work\nul"
+path = r"nul"
 try:
     os.remove(path)
     print("Successfully deleted nul file")
