@@ -14,8 +14,8 @@ work/
 ├── restart-wechat.bat       # 重启微信机器人（修改 wechat-adapter.js 后使用）
 ├── wechat-bridge.bat        # 启动 wechat-acp 守护进程
 ├── setup.bat                # 环境安装与修复脚本
-├── run.bat                  # 运行任务
-├── del.py                   # 临时清理工具
+├── run_del_nul.bat           # 运行任务（删除 nul 文件后执行）
+├── del.py                   # 删除当前目录下的 nul 文件
 ├── dev.db                   # OpenCode 开发数据库
 ├── sqlite_mcp_server.db     # SQLite MCP 数据库
 ├── .wechat-session.json     # 当前选中的 OpenCode 会话 ID
