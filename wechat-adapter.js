@@ -72,7 +72,6 @@ let processingNotified = false; // PAD/PHONE 是否已发送首个处理通知
 let currentTextMessageId = null; // 当前回复的持久 messageId，所有文本块合并为一条微信消息
 let fullQuotaUsed = 0;          // FULL 模式当前 turn 已使用的 sendmessage 调用次数
 let pendingContinuation = null; // { sid, text } - continue 模式的超长回复剩余文本
-let pendingOverflowBuf = '';    // continue 模式累积截断文本
 const FULL_QUOTA_LIMIT = 4;     // 每 context_token 最多 5 次，预留 1 次给结束 flush
 const MAX_REALTIME_BUFFER = 3000; // FULL 模式实时缓冲上限，确保 end-of-turn 最多 1 段 (TEXT_CHUNK_LIMIT=4000)
 let sseReadTimer = null;       // SSE 读取超时定时器
@@ -1636,14 +1635,16 @@ async function forwardToAIAsync(sid, targetId, text) {
     pendingReplyText = '';
     pendingTruncated = false;
     // FULL mode: flush remaining buffered text, then flush to wechat
+    // Note: in practice forwardToAIAsync returns early in FULL mode
+    // because session.idle fires first and sets responseSent.
+    // This block is a fallback for edge cases.
     if (isFull()) {
       if (realtimeBuffer && lastPromptSid) {
         let text = realtimeBuffer;
         if (text.length > MAX_REALTIME_BUFFER) {
           if (quotaMode === 'continue') {
-            const overflow = text.slice(MAX_REALTIME_BUFFER);
+            pendingContinuation = { sid: lastPromptSid, text: text.slice(MAX_REALTIME_BUFFER) };
             text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发送任意消息继续获取）';
-            pendingContinuation = { sid: lastPromptSid, text: overflow };
           } else if (quotaMode === 'notify') {
             text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
           } else {
@@ -1656,22 +1657,24 @@ async function forwardToAIAsync(sid, targetId, text) {
       }
       flushToWeChat();
       if (pendingContinuation) {
-        reply(pendingContinuation.sid, '📬 回复内容过长，已保存剩余部分。发送任意消息即可继续接收');
+        reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
         flushToWeChat();
       }
       fullQuotaUsed = 0;
     } else if (accumulated) {
-      if (quotaMode === 'continue' && pendingOverflowBuf) {
-        pendingContinuation = { sid, text: pendingOverflowBuf };
-        pendingOverflowBuf = '';
-        reply(sid, `🤖 ${accumulated}\n\n…（剩余内容请发送任意消息继续获取）`);
-        flushToWeChat();
-        if (pendingContinuation) {
-          reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
-          flushToWeChat();
-        }
-      } else {
-        reply(sid, `🤖 ${accumulated}`);
+      let text = accumulated;
+      if (quotaMode === 'continue' && text.length > MAX_REALTIME_BUFFER) {
+        pendingContinuation = { sid, text: text.slice(MAX_REALTIME_BUFFER) };
+        text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发送任意消息继续获取）';
+      } else if (quotaMode === 'notify' && text.length > MAX_REALTIME_BUFFER) {
+        text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+      } else if (text.length > MAX_REALTIME_BUFFER) {
+        text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+      }
+      reply(sid, `🤖 ${text}`);
+      flushToWeChat();
+      if (pendingContinuation) {
+        reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
         flushToWeChat();
       }
     } else {
@@ -2350,7 +2353,18 @@ async function eventToNotification(type, props) {
         if (isFull()) {
           // FULL mode: flush remaining buffer with persistent messageId, don't send "完成"
           if (realtimeBuffer && lastPromptSid) {
-            reply(lastPromptSid, '🤖 ' + realtimeBuffer, currentTextMessageId);
+            let text = realtimeBuffer;
+            if (text.length > MAX_REALTIME_BUFFER) {
+              if (quotaMode === 'continue') {
+                pendingContinuation = { sid: lastPromptSid, text: text.slice(MAX_REALTIME_BUFFER) };
+                text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发送任意消息继续获取）';
+              } else if (quotaMode === 'notify') {
+                text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+              } else {
+                text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+              }
+            }
+            reply(lastPromptSid, '🤖 ' + text, currentTextMessageId);
             realtimeBuffer = '';
           }
           pendingReplyText = '';
@@ -2361,6 +2375,10 @@ async function eventToNotification(type, props) {
             disarmWorkingNotice();
             idleNotified.add(props.sessionID);
             log(`[IDLE] FULL mode: flushed and marked sent`);
+            flushToWeChat();
+          }
+          if (pendingContinuation) {
+            reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
             flushToWeChat();
           }
           return null;
@@ -2399,7 +2417,18 @@ async function eventToNotification(type, props) {
           if (isFull()) {
             // FULL mode: flush buffer with persistent messageId
             if (realtimeBuffer && lastPromptSid) {
-              reply(lastPromptSid, '🤖 ' + realtimeBuffer, currentTextMessageId);
+              let text = realtimeBuffer;
+              if (text.length > MAX_REALTIME_BUFFER) {
+                if (quotaMode === 'continue') {
+                  pendingContinuation = { sid: lastPromptSid, text: text.slice(MAX_REALTIME_BUFFER) };
+                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发送任意消息继续获取）';
+                } else if (quotaMode === 'notify') {
+                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+                } else {
+                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+                }
+              }
+              reply(lastPromptSid, '🤖 ' + text, currentTextMessageId);
               realtimeBuffer = '';
             }
             pendingReplyText = '';
@@ -2409,6 +2438,10 @@ async function eventToNotification(type, props) {
               responseForSession = props.sessionID;
               disarmWorkingNotice();
               idleNotified.add(props.sessionID);
+              flushToWeChat();
+            }
+            if (pendingContinuation) {
+              reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
               flushToWeChat();
             }
             return null;
