@@ -1155,11 +1155,9 @@ function showHelp(sid, msgId) {
     '💡 通知消息中可直接回复答案或权限审批，无需输入命令',
     '💡 未识别的消息将转发给当前选中的 AI 会话',
     '',
-    '⚠️ FULL 模式 ( /f )：实时推送每个文本/工具增量到微信，',
-    '   每次推送消耗一次 iLink API 调用。长文本时调用频繁',
-    '   会触发微信限流，**限流后后续消息静默丢失**（用户无法',
-    '   感知回复不完整）。推荐使用 PAD 模式 ( /pd )，或通过',
-    '   OpenCode Web UI (http://localhost:4096) 查看完整输出。',
+    '⚠️ FULL 模式 ( /f ) 实时推送增量，每个 context_token 约 5 次调用上限。',
+    '   超限时自动截断+通知，详见 docs/rate-limiting.md。',
+    '   推荐 PAD 模式 ( /pd ) 或 OpenCode Web UI (http://localhost:4096)。',
   ];
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
@@ -1710,6 +1708,10 @@ async function forwardToAIAsync(sid, targetId, text) {
         flushToWeChat();
       }
     }
+    // Broadcast session completion notification
+    await fetchSessionName(targetId);
+    const compName = getSessionName(targetId);
+    broadcastNotification(`✅ ${compName} · 完成`);
   } catch (err) {
     disarmWorkingNotice();
     if (responseForSession !== targetId) return; // superseded by newer prompt
@@ -2403,7 +2405,6 @@ async function eventToNotification(type, props) {
             responseSent = true;
             responseForSession = props.sessionID;
             disarmWorkingNotice();
-            idleNotified.add(props.sessionID);
             log(`[IDLE] FULL mode: flushed and marked sent`);
             flushToWeChat();
           }
@@ -2416,7 +2417,7 @@ async function eventToNotification(type, props) {
             flushToWeChat();
             pendingContinuation = null;
           }
-          return null;
+          return await idleNotification(props);
         }
         // PAD/PHONE mode: send accumulated text as one message
         let text = pendingReplyText.trim();
@@ -2434,7 +2435,6 @@ async function eventToNotification(type, props) {
           responseSent = true;
           responseForSession = props.sessionID;
           disarmWorkingNotice();
-          idleNotified.add(props.sessionID);
           log(`[IDLE] replying with text len=${text.length}`);
           reply(lastPromptSid, `🤖 ${text}`);
           flushToWeChat();
@@ -2443,7 +2443,7 @@ async function eventToNotification(type, props) {
             flushToWeChat();
             pendingContinuation = null;
           }
-          return null;
+          return await idleNotification(props);
         }
         if (!responseSent) {
           log(`[IDLE] no text accumulated, deferring to forwardToAIAsync`);
@@ -2486,7 +2486,6 @@ async function eventToNotification(type, props) {
               responseSent = true;
               responseForSession = props.sessionID;
               disarmWorkingNotice();
-              idleNotified.add(props.sessionID);
               flushToWeChat();
             }
             if (hadOverflow && quotaMode !== 'continue') {
@@ -2498,7 +2497,7 @@ async function eventToNotification(type, props) {
               flushToWeChat();
               pendingContinuation = null;
             }
-            return null;
+            return await idleNotification(props);
           }
           // PAD/PHONE mode: send accumulated text as one message
           let text = pendingReplyText.trim();
@@ -2516,7 +2515,6 @@ async function eventToNotification(type, props) {
             responseSent = true;
             responseForSession = props.sessionID;
             disarmWorkingNotice();
-            idleNotified.add(props.sessionID);
             log(`[STATUS.IDLE] replying with text len=${text.length}`);
             reply(lastPromptSid, `🤖 ${text}`);
             flushToWeChat();
@@ -2525,7 +2523,7 @@ async function eventToNotification(type, props) {
               flushToWeChat();
               pendingContinuation = null;
             }
-            return null;
+            return await idleNotification(props);
           }
           // If no text accumulated and response not sent, defer to forwardToAIAsync
           if (!responseSent) {
