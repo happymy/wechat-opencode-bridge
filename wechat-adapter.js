@@ -1641,23 +1641,7 @@ function formatReply(data) {
 /* ───────── ACP Handlers ───────── */
 
 async function handleNewSession(msg) {
-  try {
-    const dir = getWorkspaceDir();
-    const res = await fetch(`${SERVER}/api/session`, {
-      method: 'POST',
-      headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'WeChat', directory: dir }),
-    });
-    const raw = res.ok ? await res.json() : {};
-    const session = raw?.data || raw;
-    currentSessionId = session.id || ('sess_' + Date.now());
-    saveSession(currentSessionId);
-    sendResponse(msg.id, { sessionId: currentSessionId, configOptions: [], modes: null, models: null });
-  } catch {
-    currentSessionId = 'sess_' + Date.now();
-    saveSession(currentSessionId);
-    sendResponse(msg.id, { sessionId: currentSessionId, configOptions: [], modes: null, models: null });
-  }
+  sendResponse(msg.id, { sessionId: 'acp_' + uuid(), configOptions: [], modes: null, models: null });
 }
 
 async function handleListSessions(msg) {
