@@ -1647,7 +1647,23 @@ async function forwardToAIAsync(sid, targetId, text) {
       return;
     }
     if (responseForSession !== targetId) {
-      log(`[FWD] stale response for session ${targetId?.slice(0,12)}, expected ${responseForSession?.slice(0,12)}, skipping`);
+      log(`[FWD] stale response for session ${targetId?.slice(0,12)}, expected ${responseForSession?.slice(0,12)}, sending completion only`);
+      if (!idleNotified.has(targetId)) {
+        idleNotified.add(targetId);
+        await fetchSessionName(targetId);
+        const compName = getSessionName(targetId);
+        reply(targetId, `✅ ${compName} · 完成`);
+        sendNotification('session/update', {
+          sessionId: targetId,
+          update: {
+            sessionUpdate: 'tool_call',
+            title: 'notification',
+            toolCallId: uuid(),
+            kind: 'other',
+            status: 'completed',
+          },
+        });
+      }
       return;
     }
     responseSent = true;
@@ -1708,10 +1724,23 @@ async function forwardToAIAsync(sid, targetId, text) {
         flushToWeChat();
       }
     }
-    // Broadcast session completion notification
-    await fetchSessionName(targetId);
-    const compName = getSessionName(targetId);
-    broadcastNotification(`✅ ${compName} · 完成`);
+    // Send session completion notification immediately
+    if (!idleNotified.has(targetId)) {
+      await fetchSessionName(targetId);
+      const compName = getSessionName(targetId);
+      idleNotified.add(targetId);
+      reply(targetId, `✅ ${compName} · 完成`);
+      sendNotification('session/update', {
+        sessionId: targetId,
+        update: {
+          sessionUpdate: 'tool_call',
+          title: 'notification',
+          toolCallId: uuid(),
+          kind: 'other',
+          status: 'completed',
+        },
+      });
+    }
   } catch (err) {
     disarmWorkingNotice();
     if (responseForSession !== targetId) return; // superseded by newer prompt
@@ -1934,7 +1963,7 @@ async function handleAutoClean(sid, arg, msgId) {
 
 /* ───────── I/O Helpers ───────── */
 
-const MAX_REPLY_LENGTH = 2000;
+const MAX_REPLY_LENGTH = 4000;
 
 function reply(sid, text, msgId) {
   if (!sid) { log(`[REPLY] SKIP: null sid`); return; }
@@ -2225,7 +2254,20 @@ async function idleNotification(props) {
   idleNotified.add(sid);
   await fetchSessionName(sid);
   const name = getSessionName(sid);
-  return `✅ ${name} · 完成`;
+  const text = `✅ ${name} · 完成`;
+  log(`[IDLE] immediate completion for ${sid.slice(0,12)}: "${text}"`);
+  reply(sid, text);
+  sendNotification('session/update', {
+    sessionId: sid,
+    update: {
+      sessionUpdate: 'tool_call',
+      title: 'notification',
+      toolCallId: uuid(),
+      kind: 'other',
+      status: 'completed',
+    },
+  });
+  return null;
 }
 
 // Handle side-effects for SSE events (session tracking, etc.)
