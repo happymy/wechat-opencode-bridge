@@ -19,15 +19,21 @@ let currentSessionId = loadSession();
 let currentWorkspace = loadDefaultWorkspace();
 let currentAgent = 'build';
 let filterLevel = 'pad';
+let quotaMode = 'truncate'; // truncate | notify | continue
 const FILTER_LEVELS = ['full', 'pad', 'phone'];
+const QUOTA_MODES = ['truncate', 'notify', 'continue'];
 const FILTER_FILE = join(WORK_DIR, '.wechat-filter.json');
 function loadFilterLevel() {
   try {
-    if (existsSync(FILTER_FILE)) return JSON.parse(readFileSync(FILTER_FILE, 'utf8')).level || 'pad';
+    if (existsSync(FILTER_FILE)) {
+      const data = JSON.parse(readFileSync(FILTER_FILE, 'utf8'));
+      quotaMode = data.quota || 'truncate';
+      return data.level || 'pad';
+    }
   } catch {}
   return 'pad';
 }
-function saveFilterLevel() { try { writeFileSync(FILTER_FILE, JSON.stringify({ level: filterLevel })); } catch (e) { log(`[SAVE] filter level error: ${e.message}`); } }
+function saveFilterLevel() { try { writeFileSync(FILTER_FILE, JSON.stringify({ level: filterLevel, quota: quotaMode })); } catch (e) { log(`[SAVE] filter level error: ${e.message}`); } }
 function isFull() { return filterLevel === 'full'; }
 function isPad() { return filterLevel === 'pad'; }
 function isPhone() { return filterLevel === 'phone'; }
@@ -65,6 +71,8 @@ let toolStates = new Map();    // partId -> { tool, input, startTime } 工具状
 let processingNotified = false; // PAD/PHONE 是否已发送首个处理通知
 let currentTextMessageId = null; // 当前回复的持久 messageId，所有文本块合并为一条微信消息
 let fullQuotaUsed = 0;          // FULL 模式当前 turn 已使用的 sendmessage 调用次数
+let pendingContinuation = null; // { sid, text } - continue 模式的超长回复剩余文本
+let pendingOverflowBuf = '';    // continue 模式累积截断文本
 const FULL_QUOTA_LIMIT = 4;     // 每 context_token 最多 5 次，预留 1 次给结束 flush
 const MAX_REALTIME_BUFFER = 3000; // FULL 模式实时缓冲上限，确保 end-of-turn 最多 1 段 (TEXT_CHUNK_LIMIT=4000)
 let sseReadTimer = null;       // SSE 读取超时定时器
@@ -266,6 +274,8 @@ async function handleCommand(sid, text, msgId) {
       return switchSession(sid, arg, msgId);
     case '/level': case '/lvl':
       return handleFilterLevel(sid, arg, msgId);
+    case '/quota': case '/q':
+      return handleQuotaMode(sid, arg, msgId);
     case '/f':
       return setFilterLevel(sid, 'full', msgId);
     case '/pd':
@@ -607,6 +617,43 @@ function levelDesc(lv) {
 }
 function levelLabel(lv) {
   return { full: '📡 FULL 完整模式', pad: '📱 PAD 标准模式', phone: '📟 PHONE 极简模式' }[lv] || lv;
+}
+
+const QUOTA_LABELS = {
+  truncate: '🔇 静默截断 — 超限部分直接丢弃，不通知用户',
+  notify: '🔔 截断通知 — 超限时通知用户回复被截断',
+  continue: '📬 继续模式 — 保存超限文本，用户发任意消息自动续发',
+};
+function quotaModeLabel(m) { return QUOTA_LABELS[m] || m; }
+
+async function handleQuotaMode(sid, arg, msgId) {
+  if (!arg) {
+    const lines = ['🔢 超长回复策略'];
+    lines.push(`当前: ${quotaModeLabel(quotaMode)}`);
+    lines.push('─'.repeat(14));
+    for (const m of QUOTA_MODES) {
+      const mark = m === quotaMode ? ' ◀' : '';
+      lines.push(`${quotaModeLabel(m)}${mark}`);
+    }
+    lines.push('─'.repeat(14));
+    lines.push('/quota (/q) [truncate|notify|continue]  设置策略');
+    lines.push('');
+    lines.push('由于 iLink API 每次 context_token 仅有约 5 次 sendmessage 调用配额，');
+    lines.push('长回复会自动截断。continue 模式让用户发任意消息刷新 token 后继续接收剩余内容。');
+    reply(sid, lines.join('\n'));
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const mode = arg.trim().toLowerCase();
+  if (!QUOTA_MODES.includes(mode)) {
+    reply(sid, `⚠️ 无效策略: ${mode}，可选: ${QUOTA_MODES.join(', ')}`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  quotaMode = mode;
+  saveFilterLevel();
+  reply(sid, `✅ 已切换超长回复策略: ${quotaModeLabel(mode)}`);
+  if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
 function summarizeText(text, maxLen) {
@@ -1063,6 +1110,7 @@ function showHelp(sid, msgId) {
     '/f                       切换到 FULL 模式（全部显示）',
     '/pd                      切换到 PAD 模式（摘要显示）',
     '/ph                      切换到 PHONE 模式（极简显示）',
+    '/quota (/q) [策略]        查看/设置超长回复策略 (truncate|notify|continue)',
     '',
     '── 问题回答（通知中直接回复也可）──',
     '/answer (/ans) [编号] <内容>  回答AI提问，默认第1题',
@@ -1592,17 +1640,40 @@ async function forwardToAIAsync(sid, targetId, text) {
       if (realtimeBuffer && lastPromptSid) {
         let text = realtimeBuffer;
         if (text.length > MAX_REALTIME_BUFFER) {
-          text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+          if (quotaMode === 'continue') {
+            const overflow = text.slice(MAX_REALTIME_BUFFER);
+            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发送任意消息继续获取）';
+            pendingContinuation = { sid: lastPromptSid, text: overflow };
+          } else if (quotaMode === 'notify') {
+            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+          } else {
+            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+          }
         }
         realtimeBuffer = '';
         fullQuotaUsed++;
         reply(lastPromptSid, text, currentTextMessageId);
       }
       flushToWeChat();
+      if (pendingContinuation) {
+        reply(pendingContinuation.sid, '📬 回复内容过长，已保存剩余部分。发送任意消息即可继续接收');
+        flushToWeChat();
+      }
       fullQuotaUsed = 0;
     } else if (accumulated) {
-      reply(sid, `🤖 ${accumulated}`);
-      flushToWeChat();
+      if (quotaMode === 'continue' && pendingOverflowBuf) {
+        pendingContinuation = { sid, text: pendingOverflowBuf };
+        pendingOverflowBuf = '';
+        reply(sid, `🤖 ${accumulated}\n\n…（剩余内容请发送任意消息继续获取）`);
+        flushToWeChat();
+        if (pendingContinuation) {
+          reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
+          flushToWeChat();
+        }
+      } else {
+        reply(sid, `🤖 ${accumulated}`);
+        flushToWeChat();
+      }
     } else {
       const formatted = formatReply(data);
       if (formatted) {
