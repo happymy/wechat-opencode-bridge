@@ -29,6 +29,7 @@ function loadFilterLevel() {
 }
 function saveFilterLevel() { try { writeFileSync(FILTER_FILE, JSON.stringify({ level: filterLevel })); } catch (e) { log(`[SAVE] filter level error: ${e.message}`); } }
 function isFull() { return filterLevel === 'full'; }
+function isPad() { return filterLevel === 'pad'; }
 function isPhone() { return filterLevel === 'phone'; }
 
 filterLevel = loadFilterLevel();
@@ -61,7 +62,7 @@ let pendingQuestionQueue = []; // queue for question.asked events that arrive wh
 let realtimeBuffer = '';       // FULL 模式实时文本缓冲
 let realtimeFlushTimer = null; // 实时刷出定时器
 let toolStates = new Map();    // partId -> { tool, input, startTime } 工具状态跟踪
-let lastReasoningTime = 0;     // 推理开始时间戳（PAD 模式显示时长用）
+let padProcessingNotified = false; // PAD 模式是否已发送"处理中"通知
 let currentTextMessageId = null; // 当前回复的持久 messageId，所有文本块合并为一条微信消息
 let sseReadTimer = null;       // SSE 读取超时定时器
 let sseConnectionActive = false; // SSE 连接活跃标记
@@ -219,6 +220,7 @@ async function handlePrompt(msg) {
     lastPromptText = text;
     pendingReplyText = '';
     pendingTruncated = false;
+    padProcessingNotified = false;
     responseSent = false;
     responseForSession = targetId;
     currentTextMessageId = uuid();
@@ -399,6 +401,7 @@ async function switchSession(sid, arg, msgId) {
   disarmWorkingNotice();
   pendingReplyText = '';
   pendingTruncated = false;
+  padProcessingNotified = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -557,13 +560,12 @@ async function handleFilterLevel(sid, arg, msgId) {
       lines.push(`${levelIcon(lv)} ${lv.toUpperCase()} — ${levelDesc(lv)}${mark}`);
     }
     lines.push('─'.repeat(14));
-    lines.push('/f (FULL) 全部显示  |  /pd (PAD) 摘要显示  |  /ph (PHONE) 极简显示');
+    lines.push('/f (FULL) 流式输出  |  /pd (PAD) 标准模式  |  /ph (PHONE) 极简模式');
     lines.push('');
     lines.push('⚠️ FULL 模式通过微信实时推送每个文本增量，');
     lines.push('   长文本时微信 API 限流或网络波动可能导致部分消息丢失。');
-    lines.push('   如需完整响应，建议使用 PAD 模式的折叠摘要，');
-    lines.push('   或通过 OpenCode Web UI (http://localhost:4096) 查看完整输出。');
-    lines.push('   推荐使用 PAD 模式（默认）。');
+    lines.push('   推荐使用 PAD 模式处理长响应，或通过 OpenCode Web UI');
+    lines.push('   (http://localhost:4096) 查看完整输出。');
     reply(sid, lines.join('\n'));
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
@@ -594,7 +596,7 @@ function levelIcon(lv) {
 function levelDesc(lv) {
   return {
     full: '实时流式输出 ⚠️ 长文本可能丢消息，推荐在 Web UI 使用',
-    pad: '折叠摘要（工具调用、推理时间折叠为单行），隐藏工具输出',
+    pad: '处理中显示等待提示，仅发送 AI 文本回复',
     phone: '极简模式，仅显示 AI 文本回复和错误',
   }[lv] || '';
 }
@@ -1511,12 +1513,17 @@ async function skipQuestion(sid, arg, msgId) {
 
 function armWorkingNotice(sid) {
   disarmWorkingNotice();
+  const msg = isFull()
+    ? `⏳ AI正在处理中…`
+    : isPhone()
+      ? `⏳ AI正在思考…`
+      : `⏳ AI正在处理中… 完成后将自动发送回复`;
   workingTimer = setTimeout(() => {
     workingTimer = null;
     if (responseSent) return;
     log(`[WORKING] sending working notice to ${sid.slice(0,12)}`);
     try {
-      reply(sid, `⏳ 仍在处理中...\n「${lastPromptText.slice(0, 60)}」`);
+      reply(sid, msg);
       flushToWeChat();
     } catch (e) {
       log(`[WORKING] error: ${e.message}`);
@@ -1598,6 +1605,7 @@ async function forwardToAIAsync(sid, targetId, text) {
       log(`[FWD] timeout: lastSid=${(lastPromptSessionId||'?').slice(0,12)} targetId=${(targetId||'?').slice(0,12)} text_len=${text.length} pending_len=${pendingReplyText.length} accumulated_len=${accumulated.length}`);
       pendingReplyText = '';
       pendingTruncated = false;
+      padProcessingNotified = false;
       responseSent = true;
       responseForSession = null;
       lastPromptSessionId = null;
@@ -1615,6 +1623,7 @@ async function forwardToAIAsync(sid, targetId, text) {
     } else {
       pendingReplyText = '';
       pendingTruncated = false;
+      padProcessingNotified = false;
       responseSent = true;
       responseForSession = null;
       lastPromptSessionId = null;
@@ -1683,6 +1692,7 @@ async function handleCancel(msg) {
   disarmWorkingNotice();
   pendingReplyText = '';
   pendingTruncated = false;
+  padProcessingNotified = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -2071,7 +2081,6 @@ function formatDuration(startTime) {
 
 function clearToolStates() {
   toolStates.clear();
-  lastReasoningTime = 0;
 }
 
 function updateSessionState(id, updates) {
@@ -2459,7 +2468,7 @@ async function eventToNotification(type, props) {
         return null;
       }
 
-      // ── PAD (default): collapsed summaries ──
+      // ── PAD (default): batch text, suppress tool/reasoning broadcasts ──
       if (partType === 'text' && delta) {
         if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
           pendingReplyText += delta;
@@ -2471,13 +2480,9 @@ async function eventToNotification(type, props) {
       }
 
       if (partType === 'reasoning') {
-        if (reasonTime.start) {
-          lastReasoningTime = Date.now();
-        }
-        if (reasonTime.end && lastReasoningTime) {
-          const dur = formatDuration(lastReasoningTime);
-          lastReasoningTime = 0;
-          return `+ Thought: ${dur}`;
+        if (reasonTime.start && !padProcessingNotified) {
+          padProcessingNotified = true;
+          broadcastNotification('🤔 AI正在处理...');
         }
         return null;
       }
@@ -2485,16 +2490,16 @@ async function eventToNotification(type, props) {
       if (toolName) {
         if ((toolStatus === 'running' || !toolStatus) && !toolStates.has(partId)) {
           toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
-          const inp = formatToolInput(part.input);
-          return `⚙ ${toolName}${inp ? ' ' + inp : ''}`;
+          if (!padProcessingNotified) {
+            padProcessingNotified = true;
+            broadcastNotification('🤔 AI正在处理...');
+          }
         }
         if (toolStatus === 'completed') {
           clearToolStates();
-          return `✅ ${toolName}`;
         }
         if (toolStatus === 'error') {
           clearToolStates();
-          return `❌ ${toolName}: ${toolOutput || 'error'}`;
         }
         return null;
       }
