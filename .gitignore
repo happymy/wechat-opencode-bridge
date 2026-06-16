@@ -36,5 +36,8 @@ __pycache__/
 # Logs
 *.log
 
+# Temporary files
+*.tmp
+
 # Subprojects (have their own git)
 pk-opencode-webui/
