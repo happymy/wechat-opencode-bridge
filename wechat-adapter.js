@@ -508,6 +508,7 @@ async function cancelCurrent(sid, msgId) {
   disarmWorkingNotice();
   pendingReplyText = '';
   pendingTruncated = false;
+  processingNotified = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -1432,8 +1433,11 @@ async function answerQuestion(sid, answer, msgId) {
   disarmWorkingNotice();
   pendingReplyText = '';
   pendingTruncated = false;
+  processingNotified = false;
+  pendingContinuation = null;
   responseSent = false;
   responseForSession = qData.sessionID || targetId;
+  idleNotified.delete(qData.sessionID || targetId);
   armHeartbeat(sid);
   reply(sid, `⏳ 已提交回答`);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
@@ -1806,6 +1810,7 @@ async function handleCancel(msg) {
   currentTextMessageId = null;
   realtimeBuffer = '';
   fullQuotaUsed = 0;
+  pendingContinuation = null;
   if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   // ACP 规范: session/cancel 是通知 (JSON-RPC notification)，无 id 时不能发响应
   if (msg.id != null) sendResponse(msg.id, {});
