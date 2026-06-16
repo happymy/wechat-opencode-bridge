@@ -66,6 +66,7 @@ let processingNotified = false; // PAD/PHONE 是否已发送首个处理通知
 let currentTextMessageId = null; // 当前回复的持久 messageId，所有文本块合并为一条微信消息
 let fullQuotaUsed = 0;          // FULL 模式当前 turn 已使用的 sendmessage 调用次数
 const FULL_QUOTA_LIMIT = 4;     // 每 context_token 最多 5 次，预留 1 次给结束 flush
+const MAX_REALTIME_BUFFER = 3000; // FULL 模式实时缓冲上限，确保 end-of-turn 最多 1 段 (TEXT_CHUNK_LIMIT=4000)
 let sseReadTimer = null;       // SSE 读取超时定时器
 let sseConnectionActive = false; // SSE 连接活跃标记
 
@@ -1588,11 +1589,14 @@ async function forwardToAIAsync(sid, targetId, text) {
     pendingTruncated = false;
     // FULL mode: flush remaining buffered text, then flush to wechat
     if (isFull()) {
-      if (realtimeBuffer && lastPromptSid && fullQuotaUsed < FULL_QUOTA_LIMIT) {
-        const text = realtimeBuffer;
+      if (realtimeBuffer && lastPromptSid) {
+        let text = realtimeBuffer;
+        if (text.length > MAX_REALTIME_BUFFER) {
+          text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+        }
         realtimeBuffer = '';
         fullQuotaUsed++;
-        reply(lastPromptSid, text, uuid());
+        reply(lastPromptSid, text, currentTextMessageId);
       }
       flushToWeChat();
       fullQuotaUsed = 0;
@@ -2400,7 +2404,9 @@ async function eventToNotification(type, props) {
         // All text chunks use currentTextMessageId → wechat-acp merges into one message
         // reasoning/tool notifications get separate messageIds (new uuid) → separate messages
         if (partType === 'text' && delta) {
-          realtimeBuffer += delta;
+          if (fullQuotaUsed < FULL_QUOTA_LIMIT || realtimeBuffer.length < MAX_REALTIME_BUFFER) {
+            realtimeBuffer += delta;
+          }
           scheduleRealtimeFlush(lastPromptSid);
           if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
             pendingReplyText += delta;
@@ -2464,7 +2470,9 @@ async function eventToNotification(type, props) {
           return null;
         }
         if (delta && lastPromptSid) {
-          realtimeBuffer += delta;
+          if (fullQuotaUsed < FULL_QUOTA_LIMIT || realtimeBuffer.length < MAX_REALTIME_BUFFER) {
+            realtimeBuffer += delta;
+          }
           pendingReplyText += delta;
         }
         return null;
@@ -2474,14 +2482,14 @@ async function eventToNotification(type, props) {
         // ── PHONE: text only, one 🤔 on first activity ──
         if (partType === 'reasoning' && reasonTime.start && !processingNotified) {
           processingNotified = true;
-          broadcastNotification('🤔');
+          if (lastPromptSid) { reply(lastPromptSid, '🤔', currentTextMessageId); flushToWeChat(); }
           return null;
         }
         if (toolName && (toolStatus === 'running' || !toolStatus) && !toolStates.has(partId)) {
           toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
           if (!processingNotified) {
             processingNotified = true;
-            broadcastNotification('🤔');
+            if (lastPromptSid) { reply(lastPromptSid, '🤔', currentTextMessageId); flushToWeChat(); }
           }
           return null;
         }
@@ -2510,7 +2518,7 @@ async function eventToNotification(type, props) {
       if (partType === 'reasoning') {
         if (reasonTime.start && !processingNotified) {
           processingNotified = true;
-          broadcastNotification('🤔 AI正在处理...');
+          if (lastPromptSid) { reply(lastPromptSid, '🤔 AI正在处理...', currentTextMessageId); flushToWeChat(); }
         }
         return null;
       }
@@ -2520,7 +2528,7 @@ async function eventToNotification(type, props) {
           toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
           if (!processingNotified) {
             processingNotified = true;
-            broadcastNotification('🤔 AI正在处理...');
+            if (lastPromptSid) { reply(lastPromptSid, '🤔 AI正在处理...', currentTextMessageId); flushToWeChat(); }
           }
         }
         if (toolStatus === 'completed') {
