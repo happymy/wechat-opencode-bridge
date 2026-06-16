@@ -205,6 +205,13 @@ async function handlePrompt(msg) {
 
     await drainPendingNotifications();
 
+    if (pendingContinuation) {
+      const cont = pendingContinuation;
+      pendingContinuation = null;
+      reply(cont.sid, `🤖 ${cont.text}`);
+      flushToWeChat();
+    }
+
     if (pendingQuestions && !text.startsWith('/')) {
       log(`[PROMPT] pending question, routing as answer`);
       await answerQuestion(sid, text, msg.id);
@@ -230,6 +237,7 @@ async function handlePrompt(msg) {
     lastPromptText = text;
     pendingReplyText = '';
     pendingTruncated = false;
+    pendingContinuation = null;
     processingNotified = false;
     responseSent = false;
     responseForSession = targetId;
@@ -421,6 +429,7 @@ async function switchSession(sid, arg, msgId) {
   currentTextMessageId = null;
   realtimeBuffer = '';
   fullQuotaUsed = 0;
+  pendingContinuation = null;
   if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   if (!arg) {
     reply(sid, '用法: /switch <编号|会话ID>\n先用 /list 查看会话列表');
@@ -506,6 +515,7 @@ async function cancelCurrent(sid, msgId) {
   currentTextMessageId = null;
   realtimeBuffer = '';
   fullQuotaUsed = 0;
+  pendingContinuation = null;
   if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   const target = currentSessionId;
   if (!target) {
@@ -534,6 +544,7 @@ async function newSession(sid, title, msgId) {
   lastPromptSid = null;
   currentTextMessageId = null;
   realtimeBuffer = '';
+  pendingContinuation = null;
   if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   if (!title) {
     reply(sid, '用法: /new <会话名>\n示例: /new 修复登录bug');
@@ -896,6 +907,7 @@ async function handleWorkspace(sid, arg, msgId) {
   currentTextMessageId = null;
   realtimeBuffer = '';
   fullQuotaUsed = 0;
+  pendingContinuation = null;
   if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
   currentWorkspace = list[num - 1];
   saveCurrentWorkspace();
@@ -1620,6 +1632,8 @@ async function forwardToAIAsync(sid, targetId, text) {
 
     const data = await res.json();
     await drainPendingNotifications();
+    // Notifications need a flush to reach WeChat even if forwardToAIAsync returns early (FULL mode)
+    flushToWeChat();
     if (responseSent && responseForSession === targetId) {
       log(`[FWD] response already sent for ${sid.slice(0,12)}, skipping`);
       return;
@@ -1659,6 +1673,7 @@ async function forwardToAIAsync(sid, targetId, text) {
       if (pendingContinuation) {
         reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
         flushToWeChat();
+        pendingContinuation = null;
       }
       fullQuotaUsed = 0;
     } else if (accumulated) {
@@ -1676,6 +1691,7 @@ async function forwardToAIAsync(sid, targetId, text) {
       if (pendingContinuation) {
         reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
         flushToWeChat();
+        pendingContinuation = null;
       }
     } else {
       const formatted = formatReply(data);
@@ -2380,14 +2396,23 @@ async function eventToNotification(type, props) {
           if (pendingContinuation) {
             reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
             flushToWeChat();
+            pendingContinuation = null;
           }
           return null;
         }
         // PAD/PHONE mode: send accumulated text as one message
-        const text = pendingReplyText.trim();
+        let text = pendingReplyText.trim();
         pendingReplyText = '';
         if (text) {
           if (responseSent) return null; // forwardToAIAsync already sent
+          if (quotaMode === 'continue' && text.length > MAX_REALTIME_BUFFER) {
+            pendingContinuation = { sid: lastPromptSid, text: text.slice(MAX_REALTIME_BUFFER) };
+            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发送任意消息继续获取）';
+          } else if (quotaMode === 'notify' && text.length > MAX_REALTIME_BUFFER) {
+            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+          } else if (text.length > MAX_REALTIME_BUFFER) {
+            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+          }
           responseSent = true;
           responseForSession = props.sessionID;
           disarmWorkingNotice();
@@ -2395,6 +2420,11 @@ async function eventToNotification(type, props) {
           log(`[IDLE] replying with text len=${text.length}`);
           reply(lastPromptSid, `🤖 ${text}`);
           flushToWeChat();
+          if (pendingContinuation) {
+            reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
+            flushToWeChat();
+            pendingContinuation = null;
+          }
           return null;
         }
         if (!responseSent) {
@@ -2443,14 +2473,23 @@ async function eventToNotification(type, props) {
             if (pendingContinuation) {
               reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
               flushToWeChat();
+              pendingContinuation = null;
             }
             return null;
           }
           // PAD/PHONE mode: send accumulated text as one message
-          const text = pendingReplyText.trim();
+          let text = pendingReplyText.trim();
           pendingReplyText = '';
           if (text) {
             if (responseSent) return null;
+            if (quotaMode === 'continue' && text.length > MAX_REALTIME_BUFFER) {
+              pendingContinuation = { sid: lastPromptSid, text: text.slice(MAX_REALTIME_BUFFER) };
+              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发送任意消息继续获取）';
+            } else if (quotaMode === 'notify' && text.length > MAX_REALTIME_BUFFER) {
+              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+            } else if (text.length > MAX_REALTIME_BUFFER) {
+              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+            }
             responseSent = true;
             responseForSession = props.sessionID;
             disarmWorkingNotice();
@@ -2458,6 +2497,11 @@ async function eventToNotification(type, props) {
             log(`[STATUS.IDLE] replying with text len=${text.length}`);
             reply(lastPromptSid, `🤖 ${text}`);
             flushToWeChat();
+            if (pendingContinuation) {
+              reply(pendingContinuation.sid, '📬 回复过长已保存，发任意消息继续接收');
+              flushToWeChat();
+              pendingContinuation = null;
+            }
             return null;
           }
           // If no text accumulated and response not sent, defer to forwardToAIAsync
