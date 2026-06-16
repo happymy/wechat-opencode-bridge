@@ -50,8 +50,8 @@ let lastPromptText = '';      // last prompt text
 let pendingReplyText = '';    // accumulated text parts for question API responses
 let responseSent = false;     // true after final reply is sent (prevents double-reply)
 let responseForSession = null; // session ID that the pending response is for
-let workingTimer = null;      // "still working" notice timer
-const WORKING_NOTICE_DELAY = 20000; // 20s before sending "still working"
+let heartbeats = [];           // 心跳定时器 ID 列表（PAD/PHONE 渐进式，FULL 单次）
+const HEARTBEAT_DELAYS = [10000, 25000, 45000]; // progressive heartbeat intervals (ms)
 const QUESTION_AUTO_CLEAR_MS = 7200000; // 2h auto-clear for unanswered questions
 const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
 const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
@@ -62,7 +62,7 @@ let pendingQuestionQueue = []; // queue for question.asked events that arrive wh
 let realtimeBuffer = '';       // FULL 模式实时文本缓冲
 let realtimeFlushTimer = null; // 实时刷出定时器
 let toolStates = new Map();    // partId -> { tool, input, startTime } 工具状态跟踪
-let padProcessingNotified = false; // PAD 模式是否已发送"处理中"通知
+let processingNotified = false; // PAD/PHONE 是否已发送首个处理通知
 let currentTextMessageId = null; // 当前回复的持久 messageId，所有文本块合并为一条微信消息
 let sseReadTimer = null;       // SSE 读取超时定时器
 let sseConnectionActive = false; // SSE 连接活跃标记
@@ -220,12 +220,12 @@ async function handlePrompt(msg) {
     lastPromptText = text;
     pendingReplyText = '';
     pendingTruncated = false;
-    padProcessingNotified = false;
+    processingNotified = false;
     responseSent = false;
     responseForSession = targetId;
     currentTextMessageId = uuid();
     idleNotified.delete(targetId); // allow fresh idle events for this session
-    armWorkingNotice(sid);
+    armHeartbeat(sid);
 
     reply(sid, '⏳ 思考中...');
     sendResponse(msg.id, { stopReason: 'end_turn' });
@@ -401,7 +401,7 @@ async function switchSession(sid, arg, msgId) {
   disarmWorkingNotice();
   pendingReplyText = '';
   pendingTruncated = false;
-  padProcessingNotified = false;
+  processingNotified = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -597,7 +597,7 @@ function levelDesc(lv) {
   return {
     full: '实时流式输出 ⚠️ 高频推送触发限流时后半段静默丢失，不推荐日常使用',
     pad: '处理中显示等待提示，仅发送 AI 文本回复',
-    phone: '极简模式，仅显示 AI 文本回复和错误',
+    phone: '极简模式，仅显示 AI 文本回复和 🤔 处理提示',
   }[lv] || '';
 }
 function levelLabel(lv) {
@@ -1369,7 +1369,7 @@ async function answerQuestion(sid, answer, msgId) {
   pendingTruncated = false;
   responseSent = false;
   responseForSession = qData.sessionID || targetId;
-  armWorkingNotice(sid);
+  armHeartbeat(sid);
   reply(sid, `⏳ 已提交回答`);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
   if (qData.requestID) {
@@ -1510,34 +1510,52 @@ async function skipQuestion(sid, arg, msgId) {
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
-/* ───────── Working Notice ───────── */
+/* ───────── Heartbeat ───────── */
 
-function armWorkingNotice(sid) {
+const HEARTBEAT_MSGS = {
+  full: ['⏳ AI正在处理中…'],
+  pad: [
+    '⏳ AI正在处理中… 请稍候',
+    '⏳ 仍在处理中… 完成后自动发送回复',
+    '⏳ 长时间处理中… 复杂任务可能需要更多时间',
+  ],
+  phone: [
+    '⏳ AI正在思考…',
+    '⏳ 仍在思考…',
+    '⏳ 长时间思考中…',
+  ],
+};
+
+function armHeartbeat(sid) {
   disarmWorkingNotice();
-  const msg = isFull()
-    ? `⏳ AI正在处理中…`
-    : isPhone()
-      ? `⏳ AI正在思考…`
-      : `⏳ AI正在处理中… 完成后将自动发送回复`;
-  workingTimer = setTimeout(() => {
-    workingTimer = null;
-    if (responseSent) return;
-    log(`[WORKING] sending working notice to ${sid.slice(0,12)}`);
-    try {
-      reply(sid, msg);
+  if (isFull()) {
+    // FULL: one notice at 20s (existing behavior)
+    const t = setTimeout(() => {
+      if (responseSent) return;
+      reply(sid, '⏳ AI正在处理中…');
       flushToWeChat();
-    } catch (e) {
-      log(`[WORKING] error: ${e.message}`);
-    }
-  }, WORKING_NOTICE_DELAY);
-  workingTimer.unref?.();
+    }, 20000);
+    t.unref?.();
+    heartbeats = [t];
+    return;
+  }
+  const msgs = isPhone() ? HEARTBEAT_MSGS.phone : HEARTBEAT_MSGS.pad;
+  const timers = HEARTBEAT_DELAYS.map((delay, i) => {
+    return setTimeout(() => {
+      if (responseSent) return;
+      reply(sid, msgs[i] || msgs[msgs.length - 1]);
+      flushToWeChat();
+    }, delay);
+  });
+  timers.forEach(t => t.unref?.());
+  heartbeats = timers;
 }
 
 function disarmWorkingNotice() {
-  if (workingTimer) {
-    clearTimeout(workingTimer);
-    workingTimer = null;
+  for (const t of heartbeats) {
+    clearTimeout(t);
   }
+  heartbeats = [];
 }
 
 /* ───────── AI Prompt Forwarding ───────── */
@@ -1606,7 +1624,7 @@ async function forwardToAIAsync(sid, targetId, text) {
       log(`[FWD] timeout: lastSid=${(lastPromptSessionId||'?').slice(0,12)} targetId=${(targetId||'?').slice(0,12)} text_len=${text.length} pending_len=${pendingReplyText.length} accumulated_len=${accumulated.length}`);
       pendingReplyText = '';
       pendingTruncated = false;
-      padProcessingNotified = false;
+      processingNotified = false;
       responseSent = true;
       responseForSession = null;
       lastPromptSessionId = null;
@@ -1624,7 +1642,7 @@ async function forwardToAIAsync(sid, targetId, text) {
     } else {
       pendingReplyText = '';
       pendingTruncated = false;
-      padProcessingNotified = false;
+      processingNotified = false;
       responseSent = true;
       responseForSession = null;
       lastPromptSessionId = null;
@@ -1693,7 +1711,7 @@ async function handleCancel(msg) {
   disarmWorkingNotice();
   pendingReplyText = '';
   pendingTruncated = false;
-  padProcessingNotified = false;
+  processingNotified = false;
   responseSent = true;
   responseForSession = null;
   lastPromptSessionId = null;
@@ -2457,7 +2475,20 @@ async function eventToNotification(type, props) {
       }
 
       if (isPhone()) {
-        // ── PHONE: text only ──
+        // ── PHONE: text only, one 🤔 on first activity ──
+        if (partType === 'reasoning' && reasonTime.start && !processingNotified) {
+          processingNotified = true;
+          broadcastNotification('🤔');
+          return null;
+        }
+        if (toolName && (toolStatus === 'running' || !toolStatus) && !toolStates.has(partId)) {
+          toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
+          if (!processingNotified) {
+            processingNotified = true;
+            broadcastNotification('🤔');
+          }
+          return null;
+        }
         if (partType === 'text' && delta) {
           if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
             pendingReplyText += delta;
@@ -2481,8 +2512,8 @@ async function eventToNotification(type, props) {
       }
 
       if (partType === 'reasoning') {
-        if (reasonTime.start && !padProcessingNotified) {
-          padProcessingNotified = true;
+        if (reasonTime.start && !processingNotified) {
+          processingNotified = true;
           broadcastNotification('🤔 AI正在处理...');
         }
         return null;
@@ -2491,8 +2522,8 @@ async function eventToNotification(type, props) {
       if (toolName) {
         if ((toolStatus === 'running' || !toolStatus) && !toolStates.has(partId)) {
           toolStates.set(partId, { tool: toolName, input: part.input, startTime: Date.now() });
-          if (!padProcessingNotified) {
-            padProcessingNotified = true;
+          if (!processingNotified) {
+            processingNotified = true;
             broadcastNotification('🤔 AI正在处理...');
           }
         }
