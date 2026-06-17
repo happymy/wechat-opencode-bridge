@@ -81,6 +81,8 @@ let processingNotified = false; // PAD/PHONE 是否已发送首个处理通知
 let currentTextMessageId = null; // 当前回复的持久 messageId，所有文本块合并为一条微信消息
 let fullQuotaUsed = 0;          // FULL 模式当前 turn 已使用的 sendmessage 调用次数
 let pendingContinuation = null; // { sid, messages[], total } - continue 模式消息队列
+let continuationNotified = false; // 防止「回复过长已保存」在多个处理器中重复发送
+let idleHandled = false; // 防止 session.idle 和 session.status.idle 双重处理
 const FULL_QUOTA_LIMIT = 4;     // 每 context_token 最多 5 次，预留 1 次给结束 flush
 const MAX_REALTIME_BUFFER = 3000; // FULL 模式实时缓冲上限，确保 end-of-turn 最多 1 段 (TEXT_CHUNK_LIMIT=4000)
 const MIN_CONTINUATION_LENGTH = 10; // 续存文本最小长度，低于此值跳过续存直接截断
@@ -251,6 +253,8 @@ async function handlePrompt(msg) {
     reply(sid, '⏳ 思考中...');
     sendResponse(msg.id, { stopReason: 'end_turn' });
     pendingContinuation = null; // clear only when actually sending to AI, not for /g /x
+    continuationNotified = false;
+    idleHandled = false;
     forwardToAIAsync(sid, targetId, text).catch(e => log(`[ERR] fwd: ${e.message}`));
   } catch (err) {
     log(`[ERR] handlePrompt: ${err.message}`);
@@ -1659,6 +1663,7 @@ async function forwardToAIAsync(sid, targetId, text) {
         const accumulated = pendingReplyText.trim();
         pendingReplyText = '';
         pendingTruncated = false;
+        fullQuotaUsed = 0;
         processingNotified = false;
         pendingContinuation = null;
         responseSent = true;
@@ -1744,7 +1749,8 @@ async function forwardToAIAsync(sid, targetId, text) {
         reply(lastPromptSid, text, currentTextMessageId);
       }
       flushToWeChat();
-      if (pendingContinuation) {
+      if (pendingContinuation && !continuationNotified) {
+        continuationNotified = true;
         reply(pendingContinuation.sid, `📬 回复过长已保存，发 /g 继续接收（共 ${pendingContinuation.total} 条）`);
         flushToWeChat();
       }
@@ -1765,7 +1771,8 @@ async function forwardToAIAsync(sid, targetId, text) {
       }
       reply(sid, `🤖 ${text}`);
       flushToWeChat();
-      if (pendingContinuation) {
+      if (pendingContinuation && !continuationNotified) {
+        continuationNotified = true;
         reply(pendingContinuation.sid, `📬 回复过长已保存，发 /g 继续接收（共 ${pendingContinuation.total} 条）`);
         flushToWeChat();
       }
@@ -2467,6 +2474,8 @@ async function eventToNotification(type, props) {
       clearToolStates();
 
       if (props.sessionID && props.sessionID === lastPromptSessionId) {
+        if (idleHandled) return null;
+        idleHandled = true;
         if (isFull()) {
           // FULL mode: flush remaining buffer with persistent messageId
           const hadOverflow = pendingTruncated;
@@ -2486,7 +2495,7 @@ async function eventToNotification(type, props) {
                 text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
               }
             }
-            reply(lastPromptSid, '🤖 ' + text, currentTextMessageId);
+            reply(lastPromptSid, text, currentTextMessageId);
             realtimeBuffer = '';
           }
           pendingReplyText = '';
@@ -2502,7 +2511,8 @@ async function eventToNotification(type, props) {
             reply(lastPromptSid, '⚠️ 回复过长已截断，完整内容请在 OpenCode 界面查看');
             flushToWeChat();
           }
-          if (!responseSent && pendingContinuation) {
+          if (pendingContinuation && !continuationNotified) {
+            continuationNotified = true;
             reply(pendingContinuation.sid, `📬 回复过长已保存，发 /g 继续接收（共 ${pendingContinuation.total} 条）`);
             flushToWeChat();
           }
@@ -2531,7 +2541,8 @@ async function eventToNotification(type, props) {
           log(`[IDLE] replying with text len=${text.length}`);
           reply(lastPromptSid, `🤖 ${text}`);
           flushToWeChat();
-          if (pendingContinuation) {
+          if (pendingContinuation && !continuationNotified) {
+            continuationNotified = true;
             reply(pendingContinuation.sid, `📬 回复过长已保存，发 /g 继续接收（共 ${pendingContinuation.total} 条）`);
             flushToWeChat();
           }
@@ -2553,6 +2564,8 @@ async function eventToNotification(type, props) {
         clearToolStates();
         updateSessionState(props.sessionID, { retryCount: 0, busySince: undefined });
         if (props.sessionID && props.sessionID === lastPromptSessionId) {
+          if (idleHandled) return null;
+          idleHandled = true;
           if (isFull()) {
             // FULL mode: flush buffer with persistent messageId
             const hadOverflow = pendingTruncated;
@@ -2572,7 +2585,7 @@ async function eventToNotification(type, props) {
                   text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
                 }
               }
-              reply(lastPromptSid, '🤖 ' + text, currentTextMessageId);
+              reply(lastPromptSid, text, currentTextMessageId);
               realtimeBuffer = '';
             }
             pendingReplyText = '';
@@ -2587,7 +2600,8 @@ async function eventToNotification(type, props) {
               reply(lastPromptSid, '⚠️ 回复过长已截断，完整内容请在 OpenCode 界面查看');
               flushToWeChat();
             }
-            if (!responseSent && pendingContinuation) {
+            if (!continuationNotified && pendingContinuation) {
+              continuationNotified = true;
               reply(pendingContinuation.sid, `📬 回复过长已保存，发 /g 继续接收（共 ${pendingContinuation.total} 条）`);
               flushToWeChat();
             }
@@ -2616,7 +2630,8 @@ async function eventToNotification(type, props) {
             log(`[STATUS.IDLE] replying with text len=${text.length}`);
             reply(lastPromptSid, `🤖 ${text}`);
             flushToWeChat();
-            if (pendingContinuation) {
+            if (!continuationNotified && pendingContinuation) {
+              continuationNotified = true;
               reply(pendingContinuation.sid, `📬 回复过长已保存，发 /g 继续接收（共 ${pendingContinuation.total} 条）`);
               flushToWeChat();
             }
@@ -2665,7 +2680,7 @@ async function eventToNotification(type, props) {
 
       if (isFull()) {
         // ── FULL: real-time streaming with persistent messageId ──
-        // All text chunks use currentTextMessageId → wechat-acp merges into one message
+        // All text chunks use currentTextMessageId; wechat-acp buffers chunks by session
         // reasoning/tool notifications get separate messageIds (new uuid) → separate messages
         if (partType === 'text' && delta) {
           if (fullQuotaUsed < FULL_QUOTA_LIMIT || realtimeBuffer.length < MAX_REALTIME_BUFFER) {
@@ -2701,8 +2716,12 @@ async function eventToNotification(type, props) {
             if (lastPromptSid) realtimeNotify(lastPromptSid, '🤔 Thinking...');
           }
           if (delta && lastPromptSid) {
-            realtimeBuffer += delta;
-            pendingReplyText += delta;
+            if (fullQuotaUsed < FULL_QUOTA_LIMIT || realtimeBuffer.length < MAX_REALTIME_BUFFER) {
+              realtimeBuffer += delta;
+            }
+            if (pendingReplyText.length < MAX_ACCUMULATED_TEXT || quotaMode === 'continue') {
+              pendingReplyText += delta;
+            }
           }
           if (reasonTime.end) {
             const ts = toolStates.get(partId + '_reason');
@@ -2739,7 +2758,9 @@ async function eventToNotification(type, props) {
           if (fullQuotaUsed < FULL_QUOTA_LIMIT || realtimeBuffer.length < MAX_REALTIME_BUFFER) {
             realtimeBuffer += delta;
           }
-          pendingReplyText += delta;
+          if (pendingReplyText.length < MAX_ACCUMULATED_TEXT || quotaMode === 'continue') {
+            pendingReplyText += delta;
+          }
         }
         return null;
       }
@@ -2838,7 +2859,13 @@ async function connectSSE() {
   const maxDelay = 30000;
 
   while (true) {
+    if (sseRestarting) {
+      log(`[SSE] Skip retry: sseRestarting is true (watchdog already handling)`);
+      await new Promise(r => setTimeout(r, 5000));
+      continue;
+    }
     try {
+      sseRestarting = true;
       log(`[SSE] Connecting... (retryDelay=${retryDelay}ms)`);
       const eventUrl = `${SERVER}/global/event?directory=${encodeURIComponent(getWorkspaceDir())}`;
       log(`[SSE] URL: ${eventUrl}`);
@@ -2966,6 +2993,7 @@ async function connectSSE() {
     } finally {
       sseReader = null;
       sseConnectionActive = false;
+      sseRestarting = false;
     }
 
     await new Promise(r => setTimeout(r, retryDelay));
