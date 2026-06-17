@@ -80,9 +80,10 @@ let toolStates = new Map();    // partId -> { tool, input, startTime } 工具状
 let processingNotified = false; // PAD/PHONE 是否已发送首个处理通知
 let currentTextMessageId = null; // 当前回复的持久 messageId，所有文本块合并为一条微信消息
 let fullQuotaUsed = 0;          // FULL 模式当前 turn 已使用的 sendmessage 调用次数
-let pendingContinuation = null; // { sid, text } - continue 模式的超长回复剩余文本
+let pendingContinuation = null; // { sid, messages[], total } - continue 模式消息队列
 const FULL_QUOTA_LIMIT = 4;     // 每 context_token 最多 5 次，预留 1 次给结束 flush
 const MAX_REALTIME_BUFFER = 3000; // FULL 模式实时缓冲上限，确保 end-of-turn 最多 1 段 (TEXT_CHUNK_LIMIT=4000)
+const MIN_CONTINUATION_LENGTH = 10; // 续存文本最小长度，低于此值跳过续存直接截断
 let sseReadTimer = null;       // SSE 读取超时定时器
 let sseConnectionActive = false; // SSE 连接活跃标记
 let sseRestarting = false;       // 防止并发重启 SSE
@@ -1726,8 +1727,12 @@ async function forwardToAIAsync(sid, targetId, text) {
         let text = realtimeBuffer;
         if (text.length > MAX_REALTIME_BUFFER) {
           if (quotaMode === 'continue') {
-            pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
-            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+            if (text.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
+              pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
+              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+            } else {
+              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+            }
           } else if (quotaMode === 'notify') {
             text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
           } else {
@@ -1747,8 +1752,12 @@ async function forwardToAIAsync(sid, targetId, text) {
     } else if (accumulated) {
       let text = accumulated;
       if (quotaMode === 'continue' && text.length > MAX_REALTIME_BUFFER) {
-        pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), sid);
-        text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+        if (text.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
+          pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), sid);
+          text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+        } else {
+          text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+        }
       } else if (quotaMode === 'notify' && text.length > MAX_REALTIME_BUFFER) {
         text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
       } else if (text.length > MAX_REALTIME_BUFFER) {
@@ -2465,8 +2474,12 @@ async function eventToNotification(type, props) {
             let text = realtimeBuffer;
             if (text.length > MAX_REALTIME_BUFFER) {
               if (quotaMode === 'continue') {
-                pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
-                text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+                if (text.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
+                  pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
+                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+                } else {
+                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+                }
               } else if (quotaMode === 'notify') {
                 text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
               } else {
@@ -2489,7 +2502,7 @@ async function eventToNotification(type, props) {
             reply(lastPromptSid, '⚠️ 回复过长已截断，完整内容请在 OpenCode 界面查看');
             flushToWeChat();
           }
-          if (pendingContinuation) {
+          if (!responseSent && pendingContinuation) {
             reply(pendingContinuation.sid, `📬 回复过长已保存，发 /g 继续接收（共 ${pendingContinuation.total} 条）`);
             flushToWeChat();
           }
@@ -2501,8 +2514,12 @@ async function eventToNotification(type, props) {
         if (text) {
           if (responseSent) return null; // forwardToAIAsync already sent
           if (quotaMode === 'continue' && text.length > MAX_REALTIME_BUFFER) {
-            pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
-            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+            if (text.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
+              pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
+              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+            } else {
+              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+            }
           } else if (quotaMode === 'notify' && text.length > MAX_REALTIME_BUFFER) {
             text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
           } else if (text.length > MAX_REALTIME_BUFFER) {
@@ -2543,8 +2560,12 @@ async function eventToNotification(type, props) {
               let text = realtimeBuffer;
               if (text.length > MAX_REALTIME_BUFFER) {
                 if (quotaMode === 'continue') {
-                  pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
-                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+                  if (text.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
+                    pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
+                    text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+                  } else {
+                    text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+                  }
                 } else if (quotaMode === 'notify') {
                   text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
                 } else {
@@ -2566,7 +2587,7 @@ async function eventToNotification(type, props) {
               reply(lastPromptSid, '⚠️ 回复过长已截断，完整内容请在 OpenCode 界面查看');
               flushToWeChat();
             }
-            if (pendingContinuation) {
+            if (!responseSent && pendingContinuation) {
               reply(pendingContinuation.sid, `📬 回复过长已保存，发 /g 继续接收（共 ${pendingContinuation.total} 条）`);
               flushToWeChat();
             }
@@ -2578,8 +2599,12 @@ async function eventToNotification(type, props) {
           if (text) {
             if (responseSent) return null;
             if (quotaMode === 'continue' && text.length > MAX_REALTIME_BUFFER) {
-              pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
-              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+              if (text.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
+                pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
+                text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+              } else {
+                text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+              }
             } else if (quotaMode === 'notify' && text.length > MAX_REALTIME_BUFFER) {
               text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
             } else if (text.length > MAX_REALTIME_BUFFER) {
