@@ -104,9 +104,12 @@ function writeStdout(msg) {
   if (stdoutQueue.length >= STDOUT_QUEUE_LIMIT + STDOUT_DROP_BATCH) {
     const dropped = stdoutQueue.splice(0, stdoutQueue.length - STDOUT_QUEUE_LIMIT);
     const isResponse = /"jsonrpc"\s*:\s*"2\.0"\s*,\s*"id"\s*:/.test(msg);
-    if (isResponse) {
+    const isToolCall = msg.includes('"tool_call"');
+    if (isResponse || isToolCall) {
       stdoutQueue.push(msg);
-      log(`[WARN] stdout queue overflow, preserved response, dropped ${dropped.length} notifications`);
+      const label = isResponse ? 'response' : 'tool_call';
+      const toolCallsDropped = dropped.filter(m => m.includes('"tool_call"')).length;
+      log(`[WARN] stdout queue overflow, preserved ${label}${toolCallsDropped ? ` (${toolCallsDropped} tool_call dropped)` : ''}, dropped ${dropped.length} oldest messages`);
       if (!stdoutDraining) processStdoutQueue();
       return;
     }
@@ -657,6 +660,7 @@ async function handleQuotaMode(sid, arg, msgId) {
     lines.push('由于 iLink API 每次 context_token 仅有约 5 次 sendmessage 调用配额，');
     lines.push('长回复会自动截断。continue 模式让用户发 /g 继续接收剩余内容。');
     reply(sid, lines.join('\n'));
+    flushToWeChat(sid);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
@@ -664,12 +668,14 @@ async function handleQuotaMode(sid, arg, msgId) {
   const resolved = QUOTA_ALIASES[mode] || mode;
   if (!QUOTA_MODES.includes(resolved)) {
     reply(sid, `⚠️ 无效策略: ${mode}，可选: ${QUOTA_MODES.join(', ')}, 别名: t/trunc, n/notif, c/cont`);
+    flushToWeChat(sid);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
   quotaMode = resolved;
   saveFilterLevel();
-  reply(sid, `✅ 已切换超长回复策略: ${quotaModeLabel(mode)}`);
+  reply(sid, `✅ 已切换超长回复策略: ${resolved}`);
+  flushToWeChat(sid);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
@@ -1098,6 +1104,7 @@ async function showTaskStatus(sid, msgId) {
 async function handleContinue(sid, msgId) {
   if (!pendingContinuation || !pendingContinuation.messages?.length) {
     reply(sid, '📭 没有待续发的内容');
+    flushToWeChat(sid);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
@@ -1105,6 +1112,7 @@ async function handleContinue(sid, msgId) {
   if (!cont.sid) {
     pendingContinuation = null;
     reply(sid, '⚠️ 续发内容无效，已清除');
+    flushToWeChat(sid);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
@@ -1141,12 +1149,15 @@ function splitContinuationMessages(text, sid) {
 async function handleClearContinue(sid, msgId) {
   if (!pendingContinuation) {
     reply(sid, '📭 没有待续发的内容');
+    flushToWeChat(sid);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
   log(`[CONT] cleared ${pendingContinuation.total} messages (${pendingContinuation.messages.reduce((s, m) => s + m.length, 0)} chars)`);
   pendingContinuation = null;
+  continuationNotified = false;
   reply(sid, '🗑️ 已清除待续发内容');
+  flushToWeChat(sid);
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
@@ -1728,23 +1739,27 @@ async function forwardToAIAsync(sid, targetId, text) {
     // because session.idle fires first and sets responseSent.
     // This block is a fallback for edge cases.
     if (isFull()) {
+      let text = '';
       if (realtimeBuffer && lastPromptSid) {
-        let text = realtimeBuffer;
-        if (text.length > MAX_REALTIME_BUFFER) {
-          if (quotaMode === 'continue') {
-            if (text.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
-              pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
-              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
-            } else {
-              text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
-            }
-          } else if (quotaMode === 'notify') {
-            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
-          } else {
-            text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
-          }
-        }
+        text = realtimeBuffer;
         realtimeBuffer = '';
+      }
+      const fullText = accumulated || pendingReplyText.trim();
+      if (fullText.length > MAX_REALTIME_BUFFER) {
+        if (quotaMode === 'continue') {
+          if (fullText.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
+            pendingContinuation = splitContinuationMessages(fullText.slice(MAX_REALTIME_BUFFER), lastPromptSid);
+            text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+          } else {
+            text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+          }
+        } else if (quotaMode === 'notify') {
+          text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+        } else {
+          text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+        }
+      }
+      if (text && lastPromptSid) {
         fullQuotaUsed++;
         reply(lastPromptSid, text, currentTextMessageId);
       }
@@ -2479,24 +2494,28 @@ async function eventToNotification(type, props) {
         if (isFull()) {
           // FULL mode: flush remaining buffer with persistent messageId
           const hadOverflow = pendingTruncated;
+          let text = '';
           if (realtimeBuffer && lastPromptSid) {
-            let text = realtimeBuffer;
-            if (text.length > MAX_REALTIME_BUFFER) {
-              if (quotaMode === 'continue') {
-                if (text.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
-                  pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
-                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
-                } else {
-                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
-                }
-              } else if (quotaMode === 'notify') {
-                text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
-              } else {
-                text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
-              }
-            }
-            reply(lastPromptSid, text, currentTextMessageId);
+            text = realtimeBuffer;
             realtimeBuffer = '';
+          }
+          const fullText = pendingReplyText.trim();
+          if (fullText.length > MAX_REALTIME_BUFFER) {
+            if (quotaMode === 'continue') {
+              if (fullText.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
+                pendingContinuation = splitContinuationMessages(fullText.slice(MAX_REALTIME_BUFFER), lastPromptSid);
+                text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+              } else {
+                text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+              }
+            } else if (quotaMode === 'notify') {
+              text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+            } else {
+              text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+            }
+          }
+          if (text && lastPromptSid) {
+            reply(lastPromptSid, text, currentTextMessageId);
           }
           pendingReplyText = '';
           pendingTruncated = false;
@@ -2569,24 +2588,28 @@ async function eventToNotification(type, props) {
           if (isFull()) {
             // FULL mode: flush buffer with persistent messageId
             const hadOverflow = pendingTruncated;
+            let text = '';
             if (realtimeBuffer && lastPromptSid) {
-              let text = realtimeBuffer;
-              if (text.length > MAX_REALTIME_BUFFER) {
-                if (quotaMode === 'continue') {
-                  if (text.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
-                    pendingContinuation = splitContinuationMessages(text.slice(MAX_REALTIME_BUFFER), lastPromptSid);
-                    text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
-                  } else {
-                    text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
-                  }
-                } else if (quotaMode === 'notify') {
-                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
-                } else {
-                  text = text.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
-                }
-              }
-              reply(lastPromptSid, text, currentTextMessageId);
+              text = realtimeBuffer;
               realtimeBuffer = '';
+            }
+            const fullText = pendingReplyText.trim();
+            if (fullText.length > MAX_REALTIME_BUFFER) {
+              if (quotaMode === 'continue') {
+                if (fullText.slice(MAX_REALTIME_BUFFER).length >= MIN_CONTINUATION_LENGTH) {
+                  pendingContinuation = splitContinuationMessages(fullText.slice(MAX_REALTIME_BUFFER), lastPromptSid);
+                  text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（剩余内容请发 /g 继续获取）';
+                } else {
+                  text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+                }
+              } else if (quotaMode === 'notify') {
+                text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（回复已截断，超出上限）';
+              } else {
+                text = fullText.slice(0, MAX_REALTIME_BUFFER) + '\n\n…（内容过长，请在 OpenCode 界面查看完整输出）';
+              }
+            }
+            if (text && lastPromptSid) {
+              reply(lastPromptSid, text, currentTextMessageId);
             }
             pendingReplyText = '';
             pendingTruncated = false;
