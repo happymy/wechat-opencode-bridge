@@ -4,10 +4,17 @@ import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execSync, exec } from 'node:child_process';
+import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
 
 const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
 const AUTH = 'Basic ' + Buffer.from(process.env.OPENCODE_AUTH || 'opencode:opencode').toString('base64');
 const WORK_DIR = dirname(fileURLToPath(import.meta.url));
+
+let sdkClient = createOpencodeClient({
+  baseUrl: SERVER,
+  headers: { Authorization: AUTH },
+  directory: WORK_DIR,
+});
 const SESSION_FILE = join(WORK_DIR, '.wechat-session.json');
 const SUBSCRIBERS_FILE = join(WORK_DIR, '.wechat-subscribers.json');
 const WORKSPACES_FILE = join(WORK_DIR, '.wechat-workspaces.json');
@@ -334,14 +341,13 @@ async function getWorkspaceSessions() {
     if (!candidates.some(c => c.toLowerCase() === subDir.toLowerCase())) candidates.push(subDir);
   }
   for (const d of candidates) {
-    const qs = new URLSearchParams({ directory: d, limit: '100' }).toString();
-    const res = await apiFetch(`/api/session?${qs}`).catch(() => null);
-    if (res?.data && Array.isArray(res.data) && res.data.length > 0) {
-      return res.data;
+    const { data } = await sdkClient.session.list({ directory: d, limit: 100 }).catch(() => ({ data: null }));
+    if (data && Array.isArray(data) && data.length > 0) {
+      return data;
     }
   }
-  const fallback = await apiFetch('/api/session?limit=100').catch(() => null);
-  const list = Array.isArray(fallback) ? fallback : (fallback?.data || []);
+  const { data: fallback } = await sdkClient.session.list({ limit: 100 }).catch(() => ({ data: [] }));
+  const list = Array.isArray(fallback) ? fallback : [];
   if (list.length > 0) {
     const dirLower = dir.toLowerCase();
     return list.filter(s => s.directory && s.directory.toLowerCase().startsWith(dirLower));
@@ -356,8 +362,8 @@ async function listSessions(sid, arg, msgId) {
     const isAll = !!allMatch;
     const allLimit = allMatch?.[1] ? parseInt(allMatch[1], 10) : 50;
     if (isAll) {
-      const raw = await apiFetch('/api/session?limit=100').catch(() => null);
-      sessions = Array.isArray(raw) ? raw : (raw?.data || []);
+      const { data } = await sdkClient.session.list({ limit: 100 }).catch(() => ({ data: [] }));
+      sessions = Array.isArray(data) ? data : [];
     } else {
       sessions = await getWorkspaceSessions();
       if (!Array.isArray(sessions)) sessions = [];
@@ -366,7 +372,7 @@ async function listSessions(sid, arg, msgId) {
     let currentInList = sessions.some(s => s.id === currentSessionId);
     if (!currentInList && currentSessionId) {
       try {
-        const cur = await apiFetch(`/api/session/${encodeURIComponent(currentSessionId)}`).catch(() => null);
+        const { data: cur } = await sdkClient.session.get({ sessionID: currentSessionId }).catch(() => ({ data: null }));
         if (cur && cur.id) {
           if (!sessions.some(s => s.id === cur.id)) {
             sessions.unshift(cur);
@@ -385,9 +391,9 @@ async function listSessions(sid, arg, msgId) {
     const maxShow = isAll ? allLimit : 20;
     const show = sorted.slice(0, maxShow);
 
-    const statusMap = await apiFetch('/session/status').catch(() => ({}));
+    const { data: statusMap } = await sdkClient.session.status().catch(() => ({ data: {} }));
     const busyIds = new Set(
-      Object.entries(statusMap)
+      Object.entries(statusMap || {})
         .filter(([, s]) => s.type === 'busy')
         .map(([id]) => id)
     );
@@ -462,9 +468,8 @@ async function switchSession(sid, arg, msgId) {
 
   // Try as session ID directly
   try {
-    const raw = await apiFetch(`/api/session/${encodeURIComponent(arg)}`);
-    const data = raw?.data || raw;
-    currentSessionId = data.id || arg;
+    const { data } = await sdkClient.session.get({ sessionID: arg });
+    currentSessionId = data?.id || arg;
     saveSession(currentSessionId);
     reply(sid, `✅ 已切换到「${data.title || '(未命名)'}」`);
   } catch {
@@ -525,9 +530,7 @@ async function cancelCurrent(sid, msgId) {
     return;
   }
   try {
-    await fetch(`${SERVER}/session/${encodeURIComponent(target)}/abort`, {
-      method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000),
-    });
+    await sdkClient.session.abort({ sessionID: target });
     reply(sid, '⏹️ 已发送取消请求');
   } catch {
     reply(sid, '⚠️ 取消失败');
@@ -555,13 +558,8 @@ async function newSession(sid, title, msgId) {
   }
   try {
     const dir = getWorkspaceDir();
-    const qs = new URLSearchParams({ directory: dir }).toString();
-    const session = await apiFetch(`/session?${qs}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: title.trim() }),
-    });
-    currentSessionId = (session.id || 'sess_' + Date.now());
+    const { data: session } = await sdkClient.session.create({ directory: dir, title: title.trim() });
+    currentSessionId = (session?.id || 'sess_' + Date.now());
     saveSession(currentSessionId);
     reply(sid, `✅ 已创建并切换到「${title.trim()}」`);
   } catch (err) {
@@ -744,11 +742,7 @@ async function handlePermissionReply(sid, action, arg, msgId) {
     if (!permSid) {
       throw new Error('未知会话，无法提交权限回复');
     }
-    await apiFetch(`/permission/${encodeURIComponent(targetRid)}/reply`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reply: action, message: `via wechat-adapter (sid=${sid.slice(0,12)})` }),
-    });
+    await sdkClient.permission.reply({ requestID: targetRid, reply: action, message: `via wechat-adapter (sid=${sid.slice(0,12)})` });
     const labels = { once: '✅ 已批准', always: '✅ 已信任', reject: '❌ 已拒绝' };
     const msg = `${labels[action]}: ${info?.permission || '权限请求'}`;
     log(`[PERM] reply success: ${msg}`);
@@ -765,9 +759,9 @@ async function handlePermissionReply(sid, action, arg, msgId) {
 async function syncPermissionsFromServer() {
   log(`[SYNC] start pendingPermissions.size=${pendingPermissions.size}`);
   try {
-    const raw = await apiFetch(`/permission`);
-    const list = Array.isArray(raw) ? raw : (raw?.data || []);
-    log(`[SYNC] server returned ${Array.isArray(list) ? list.length + ' items' : typeof list}`);
+    const { data: raw } = await sdkClient.permission.list();
+    const list = Array.isArray(raw) ? raw : [];
+    log(`[SYNC] server returned ${list.length} items`);
     if (!Array.isArray(list)) { log(`[SYNC] not an array, skipping`); return; }
     const serverIds = new Set(list.map(r => r.id));
     log(`[SYNC] server IDs: [${[...serverIds].map(i=>i.slice(0,12)).join(', ')}]`);
@@ -786,9 +780,9 @@ async function syncPermissionsFromServer() {
 
 async function syncPendingFromServer() {
   try {
-    const raw = await apiFetch(`/permission`);
-    const permList = Array.isArray(raw) ? raw : (raw?.data || []);
-    const serverPermIds = new Set((Array.isArray(permList) ? permList : []).map(r => r.id));
+    const { data: permRaw } = await sdkClient.permission.list();
+    const permList = Array.isArray(permRaw) ? permRaw : [];
+    const serverPermIds = new Set(permList.map(r => r.id));
     for (const [rid] of pendingPermissions) {
       if (!serverPermIds.has(rid)) {
         log(`[SYNC] removing local perm rid=${rid.slice(0,16)}... (not on server)`);
@@ -802,29 +796,18 @@ async function syncPendingFromServer() {
   try {
     const allQuestions = getAllQuestions();
     if (allQuestions.length === 0) return;
-    const seen = new Set();
-    for (const q of allQuestions) {
-      const qsid = q.sessionID;
-      if (!qsid || seen.has(qsid)) continue;
-      seen.add(qsid);
-      try {
-        const rawQs = await apiFetch(`/question?sessionID=${encodeURIComponent(qsid)}`);
-        const sessQs = Array.isArray(rawQs) ? rawQs : (rawQs?.data || []);
-        const validIds = new Set((sessQs || []).map(r => r.id));
-        for (const q2 of allQuestions) {
-          if (q2.sessionID !== qsid) continue;
-          if (q2.requestID && !validIds.has(q2.requestID)) {
-            log(`[SYNC] removing local question rid=${q2.requestID.slice(0,16)}... (not on server)`);
-            if (pendingQuestions?.requestID === q2.requestID) {
-              clearCurrentQuestion();
-            } else {
-              const qIdx = pendingQuestionQueue.findIndex(q => q.requestID === q2.requestID);
-              if (qIdx >= 0) { clearQuestionTimer(pendingQuestionQueue[qIdx]); pendingQuestionQueue.splice(qIdx, 1); }
-            }
-          }
+    const { data: qAll } = await sdkClient.question.list();
+    const qList = Array.isArray(qAll) ? qAll : [];
+    const validIds = new Set(qList.map(r => r.id));
+    for (const q2 of allQuestions) {
+      if (q2.requestID && !validIds.has(q2.requestID)) {
+        log(`[SYNC] removing local question rid=${q2.requestID.slice(0,16)}... (not on server)`);
+        if (pendingQuestions?.requestID === q2.requestID) {
+          clearCurrentQuestion();
+        } else {
+          const qIdx = pendingQuestionQueue.findIndex(q => q.requestID === q2.requestID);
+          if (qIdx >= 0) { clearQuestionTimer(pendingQuestionQueue[qIdx]); pendingQuestionQueue.splice(qIdx, 1); }
         }
-      } catch (e) {
-        log(`[SYNC] session ${qsid.slice(0,12)} question sync failed: ${e.message}`);
       }
     }
     log(`[SYNC] questions synced: ${getAllQuestions().length} remaining`);
@@ -1011,11 +994,11 @@ async function handleSyncDir(sid, msgId) {
       }
     } else {
       log('[SD] db returned no directories, trying HTTP API fallback...');
-      const projects = await apiFetch('/api/project').catch(() => null);
+      const { data: projects } = await sdkClient.project.list().catch(() => ({ data: [] }));
       if (Array.isArray(projects) && projects.length > 0) {
         for (const p of projects) {
           try {
-            const dirs = await apiFetch(`/api/project/${encodeURIComponent(p.id)}/directories`);
+            const { data: dirs } = await sdkClient.project.directories({ projectID: p.id });
             if (!Array.isArray(dirs)) continue;
             for (const d of dirs) {
               const dirPath = d.directory;
@@ -1037,8 +1020,8 @@ async function handleSyncDir(sid, msgId) {
 
       if (added.length === 0) {
         log('[SD] project API yielded no directories, trying session fallback...');
-        const sessions = await apiFetch('/api/session?limit=100').catch(() => null);
-        const sessionsList = Array.isArray(sessions) ? sessions : (sessions?.data || []);
+        const { data: sessions } = await sdkClient.session.list({ limit: 100 }).catch(() => ({ data: [] }));
+        const sessionsList = Array.isArray(sessions) ? sessions : [];
         if (sessionsList.length > 0) {
           const dirs = [...new Set(sessionsList.map(s => s.directory).filter(Boolean))];
           for (const dirPath of dirs) {
@@ -1085,14 +1068,13 @@ function makeWsName(dirPath, existing) {
 
 async function showTaskStatus(sid, msgId) {
   try {
-    const statusMap = await apiFetch('/session/status');
+    const { data: statusMap } = await sdkClient.session.status();
     const lines = ['📊 任务状态', '─'.repeat(14)];
     let hasActive = false;
     for (const [id, st] of Object.entries(statusMap || {})) {
       if (st.type === 'busy') {
         hasActive = true;
-        const info = await apiFetch(`/api/session/${encodeURIComponent(id)}`).catch(() => null);
-        const sessionInfo = info?.data || info;
+        const { data: sessionInfo } = await sdkClient.session.get({ sessionID: id }).catch(() => ({ data: null }));
         const name = sessionInfo?.title || id.slice(0, 16);
         const isCurrent = id === currentSessionId ? ' ◀当前' : '';
         lines.push(`▶ ${name} — 运行中${isCurrent}`);
@@ -1450,20 +1432,8 @@ async function answerQuestion(sid, answer, msgId) {
 
 async function answerViaQuestionApi(sid, targetId, answers, requestID) {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), SESSION_MESSAGE_TIMEOUT);
-    let res;
-    try {
-      res = await fetch(`${SERVER}/question/${encodeURIComponent(requestID)}/reply`, {
-        method: 'POST',
-        headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ answers: answers.map(a => [a]) }),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
-    if (!res.ok) {
+    const result = await sdkClient.question.reply({ requestID, answers: answers.map(a => [a]) });
+    if (result.error) {
       disarmWorkingNotice();
       responseSent = true;
       responseForSession = null;
@@ -1471,13 +1441,11 @@ async function answerViaQuestionApi(sid, targetId, answers, requestID) {
       pendingTruncated = false;
       processingNotified = false;
       pendingContinuation = null;
-      const errText = await res.text();
-      reply(sid, `⚠️ 回答提交失败 (${res.status}): ${errText.slice(0, 100)}`);
+      reply(sid, `⚠️ 回答提交失败: ${(result.error?.data?.message || result.error?.message || 'unknown').slice(0, 100)}`);
       await drainPendingNotifications();
       flushToWeChat();
       return;
     }
-    await res.text();
     log(`[ANSWER] reply sent via question API, waiting for SSE response...`);
   } catch (err) {
     disarmWorkingNotice();
@@ -1564,11 +1532,7 @@ async function skipQuestion(sid, arg, msgId) {
   const qSessID = qData?.sessionID;
   if (requestID && qSessID) {
     try {
-      await fetch(`${SERVER}/question/${encodeURIComponent(requestID)}/reject`, {
-        method: 'POST',
-        headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
+      await sdkClient.question.reject({ requestID });
       log(`[SKIP] rejected question ${requestID.slice(0,16)}`);
     } catch (err) {
       log(`[SKIP] reject error: ${err.message}`);
@@ -1615,30 +1579,29 @@ async function forwardToAIAsync(sid, targetId, text) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), SESSION_MESSAGE_TIMEOUT);
-    let res;
+    let promptResult;
     try {
-      res = await fetch(`${SERVER}/session/${encodeURIComponent(targetId)}/message`, {
-        method: 'POST',
-        headers: { Authorization: AUTH, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ parts: [{ type: 'text', text }], agent: currentAgent }),
-        signal: controller.signal,
-      });
+      promptResult = await sdkClient.session.prompt({
+        sessionID: targetId,
+        parts: [{ type: 'text', text }],
+        agent: currentAgent,
+      }, { signal: controller.signal });
     } finally {
       clearTimeout(timeout);
     }
 
-    if (!res.ok) {
+    if (promptResult.error) {
       disarmWorkingNotice();
       responseSent = true;
       responseForSession = targetId;
-      const errText = await res.text();
-      reply(sid, `⚠️ 服务器错误 (${res.status}): ${errText.slice(0, 100)}`);
+      const errMsg = promptResult.error?.message || promptResult.error?.data?.message || '请求失败';
+      reply(sid, `⚠️ 服务器错误: ${errMsg.slice(0, 100)}`);
       await drainPendingNotifications();
       flushToWeChat();
       return;
     }
 
-    const data = await res.json();
+    const data = promptResult.data;
     await drainPendingNotifications();
     // Notifications need a flush to reach WeChat even if forwardToAIAsync returns early (FULL mode)
     flushToWeChat();
@@ -1804,9 +1767,8 @@ async function handleNewSession(msg) {
 
 async function handleListSessions(msg) {
   try {
-    const res = await fetch(`${SERVER}/api/session?limit=100`, { headers: { Authorization: AUTH } });
-    const list = res.ok ? await res.json() : [];
-    const arr = Array.isArray(list) ? list : (list?.data || []);
+    const { data: list } = await sdkClient.session.list({ limit: 100 });
+    const arr = Array.isArray(list) ? list : [];
     const sessions = arr.map(s => ({
       sessionId: s.id, cwd: s.directory || '', title: s.title || '',
       updatedAt: s.time?.updated ? new Date(s.time.updated).toISOString() : undefined,
@@ -1822,9 +1784,8 @@ async function handleLoadSession(msg) {
   const sessionId = msg.params?.sessionId;
   if (!sessionId) { sendResponse(msg.id, { _meta: { error: 'sessionId required' } }); return; }
   try {
-    const raw = await apiFetch(`/api/session/${encodeURIComponent(sessionId)}`);
-    const data = raw?.data || raw;
-    currentSessionId = data.id || sessionId;
+    const { data } = await sdkClient.session.get({ sessionID: sessionId });
+    currentSessionId = data?.id || sessionId;
     saveSession(currentSessionId);
     sendResponse(msg.id, { sessionId: currentSessionId, cwd: data.directory || '', title: data.title || '',
       updatedAt: data.time?.updated ? new Date(data.time.updated).toISOString() : undefined });
@@ -1836,7 +1797,7 @@ async function handleLoadSession(msg) {
 async function handleCancel(msg) {
   const cancelTargets = [msg.params?.sessionId, currentSessionId].filter(Boolean);
   for (const id of [...new Set(cancelTargets)]) {
-    try { await fetch(`${SERVER}/session/${encodeURIComponent(id)}/abort`, { method: 'POST', headers: { Authorization: AUTH }, signal: AbortSignal.timeout(5000) }); } catch {}
+    try { await sdkClient.session.abort({ sessionID: id }); } catch {}
   }
   disarmWorkingNotice();
   pendingReplyText = '';
@@ -1890,6 +1851,15 @@ function saveCurrentWorkspace() {
 
 function getWorkspaceDir() {
   return currentWorkspace?.path || WORK_DIR;
+}
+function updateClientDirectory() {
+  try {
+    sdkClient.client.setConfig({
+      headers: Object.assign(sdkClient.client.getConfig().headers || {}, {
+        'x-opencode-directory': encodeURIComponent(getWorkspaceDir()),
+      }),
+    });
+  } catch (e) { log(`[SDK] updateClientDirectory error: ${e.message}`); }
 }
 
 function saveWorkspaces(list) {
@@ -1995,31 +1965,6 @@ function sendNotification(method, params) {
   const msg = JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n';
   writeStdout(msg);
   log(`→ notify ${method} ${params.sessionId ? 'sid='+params.sessionId.slice(0,12) : ''} ${params.update?.sessionUpdate || ''} ${params.update?.content?.type || ''}`);
-}
-
-async function apiFetch(path, opts = {}) {
-  const { headers: extraHeaders, timeout = 15000, ...rest } = opts;
-  const method = rest.method || 'GET';
-  log(`[API] ${method} ${path}`);
-  const res = await fetch(`${SERVER}${path}`, {
-    headers: { Authorization: AUTH, ...extraHeaders },
-    signal: AbortSignal.timeout(timeout),
-    ...rest,
-  });
-  log(`[API] => ${res.status} ${method} ${path}`);
-  if (!res.ok) {
-    let errText;
-    try { errText = await res.text(); } catch { errText = res.statusText; }
-    log(`[API] => ERR ${res.status}: ${errText.slice(0, 150)}`);
-    throw new Error(`${res.status}: ${errText.slice(0, 200)}`);
-  }
-  if (opts.method === 'DELETE' || res.status === 204) {
-    log(`[API] => ${res.status} no body`);
-    return {};
-  }
-  const text = await res.text();
-  log(`[API] => body=${text.slice(0, 200)}`);
-  try { return JSON.parse(text); } catch { log(`[API] => non-JSON body, returning {}`); return {}; }
 }
 
 /* ═══════════════════════════════════════
@@ -2765,8 +2710,7 @@ async function fetchSessionName(id) {
   const entry = sessionNames.get(id);
   if (entry && Date.now() - entry.ts < SESSION_NAME_TTL) return;
   try {
-    const raw = await apiFetch(`/api/session/${encodeURIComponent(id)}`);
-    const data = raw?.data || raw;
+    const { data } = await sdkClient.session.get({ sessionID: id });
     if (data?.title) sessionNames.set(id, { name: data.title, ts: Date.now() });
   } catch { log(`[FETCH] session name failed for ${id?.slice(0,12)}`); }
 }
