@@ -68,7 +68,7 @@ let responseForSession = null; // session ID that the pending response is for
 let heartbeats = [];           // 心跳定时器 ID 列表
 const HEARTBEAT_DELAY_MS = 30000; // 心跳延迟（仅长任务触发）
 const QUESTION_AUTO_CLEAR_MS = 7200000; // 2h auto-clear for unanswered questions
-const MAX_ACCUMULATED_TEXT = 8000; // SSE 累积最大字符数，超限后截断
+const MAX_ACCUMULATED_TEXT = 100000; // SSE 累积最大字符数，超限后截断（需远大于 continuation 截断点 3000）
 const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
 const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
 const REALTIME_FLUSH_MS = 3000; // FULL 模式实时流式刷出间隔 (ms)
@@ -1097,16 +1097,31 @@ async function handleContinue(sid, msgId) {
     return;
   }
   const cont = pendingContinuation;
-  pendingContinuation = null;
   if (!cont.text || !cont.sid) {
+    pendingContinuation = null;
     reply(sid, '⚠️ 续发内容无效，已清除');
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
-  log(`[CONT] sending ${cont.text.length} chars via ${cont.sid.slice(0,12)}`);
-  reply(cont.sid, `🤖 ${cont.text}`);
-  flushToWeChat(cont.sid);
-  if (sid !== cont.sid) { reply(sid, '✅ 已续发，请查看原对话'); flushToWeChat(sid); }
+  const chunk = cont.text.slice(0, MAX_REPLY_LENGTH);
+  const remaining = cont.text.slice(MAX_REPLY_LENGTH);
+  if (remaining) {
+    pendingContinuation = { sid: cont.sid, text: remaining };
+    log(`[CONT] sent ${chunk.length} chars, ${remaining.length} chars remaining`);
+    reply(cont.sid, chunk);
+    flushToWeChat(cont.sid);
+    const progress = sid === cont.sid
+      ? `📬 发 /g 继续接收（剩余 ${remaining.length} 字符）`
+      : `📬 请查看原对话并发 /g 继续接收（剩余 ${remaining.length} 字符）`;
+    reply(sid, progress);
+    flushToWeChat(sid);
+  } else {
+    pendingContinuation = null;
+    log(`[CONT] all done: sent final ${chunk.length} chars`);
+    reply(cont.sid, chunk);
+    flushToWeChat(cont.sid);
+    if (sid !== cont.sid) { reply(sid, '✅ 已续发完毕'); flushToWeChat(sid); }
+  }
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
@@ -2626,7 +2641,7 @@ async function eventToNotification(type, props) {
             pendingTruncated = true;
           }
           scheduleRealtimeFlush(lastPromptSid);
-          if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
+          if (pendingReplyText.length < MAX_ACCUMULATED_TEXT || quotaMode === 'continue') {
             pendingReplyText += delta;
           } else if (!pendingTruncated) {
             pendingTruncated = true;
@@ -2712,7 +2727,7 @@ async function eventToNotification(type, props) {
           return null;
         }
         if (partType === 'text' && delta) {
-          if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
+          if (pendingReplyText.length < MAX_ACCUMULATED_TEXT || quotaMode === 'continue') {
             pendingReplyText += delta;
           } else if (!pendingTruncated) {
             pendingTruncated = true;
@@ -2724,7 +2739,7 @@ async function eventToNotification(type, props) {
 
       // ── PAD (default): batch text, suppress tool/reasoning broadcasts ──
       if (partType === 'text' && delta) {
-        if (pendingReplyText.length < MAX_ACCUMULATED_TEXT) {
+        if (pendingReplyText.length < MAX_ACCUMULATED_TEXT || quotaMode === 'continue') {
           pendingReplyText += delta;
         } else if (!pendingTruncated) {
           pendingTruncated = true;
@@ -3029,10 +3044,10 @@ function startWatchdog() {
         stdoutDropLogged.clear();
       }
 
-      // Warn and truncate if pendingReplyText is very large
-      if (pendingReplyText.length > 30000) {
+      // Warn and truncate if pendingReplyText is very large (skip in continue mode — needs all text)
+      if (quotaMode !== 'continue' && pendingReplyText.length > 30000) {
         log(`[WATCHDOG] WARN: pendingReplyText=${pendingReplyText.length} chars, truncating to 20000`);
-        pendingReplyText = pendingReplyText.slice(-20000);
+        pendingReplyText = pendingReplyText.slice(0, 20000);
         pendingTruncated = true;
       }
     } catch (e) {
