@@ -64,16 +64,16 @@ fullQuotaUsed  →  flushRealtime() 每次 +1
 | `MAX_ACCUMULATED_TEXT` | 8000 | PAD/PHONE 模式累积文本上限 |
 | `REALTIME_MIN_FLUSH` | 3500 | FULL 模式累积到该值后立即刷出 |
 | `REALTIME_FLUSH_MS` | 3000 | FULL 模式流式刷出间隔（ms） |
-| `MAX_REPLY_LENGTH` | 2000 | `reply()` 单次发送的最大字符数 |
+| `MAX_REPLY_LENGTH` | 4000 | `reply()` 单次发送的最大字符数 |
 
-### 机制三：超长回复策略（`/quota`）
+### 机制三：超长回复策略（`/quota` 别名 `t`/`trunc`, `n`/`notif`, `c`/`cont`）
 
 三种模式，全局生效，通过 `.wechat-filter.json` 持久化：
 
 ```
-truncate  → 静默截断，直接丢弃超限部分，不通知
-notify    → 截断并发通知："回复已截断，超出上限"
-continue  → 保存超限文本，用户发任意消息后自动续发
+truncate (t/trunc)  → 静默截断，直接丢弃超限部分，不通知
+notify   (n/notif)  → 截断并发通知："回复已截断，超出上限"
+continue (c/cont)   → 保存超限文本，用户发任意消息后自动续发
 ```
 
 会话结束时若发生过截断，发送提示：`⚠️ 回复过长已截断，完整内容请在 OpenCode 界面查看`

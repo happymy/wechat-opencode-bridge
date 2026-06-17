@@ -29,6 +29,8 @@ let filterLevel = 'pad';
 let quotaMode = 'truncate'; // truncate | notify | continue
 const FILTER_LEVELS = ['full', 'pad', 'phone'];
 const QUOTA_MODES = ['truncate', 'notify', 'continue'];
+const QUOTA_ALIASES = { t: 'truncate', trunc: 'truncate', n: 'notify', notif: 'notify', c: 'continue', cont: 'continue' };
+const FILTER_ALIASES = { f: 'full', p: 'pad', pd: 'pad', ph: 'phone' };
 const FILTER_FILE = join(WORK_DIR, '.wechat-filter.json');
 function loadFilterLevel() {
   try {
@@ -83,6 +85,7 @@ const FULL_QUOTA_LIMIT = 4;     // 每 context_token 最多 5 次，预留 1 次
 const MAX_REALTIME_BUFFER = 3000; // FULL 模式实时缓冲上限，确保 end-of-turn 最多 1 段 (TEXT_CHUNK_LIMIT=4000)
 let sseReadTimer = null;       // SSE 读取超时定时器
 let sseConnectionActive = false; // SSE 连接活跃标记
+let sseRestarting = false;       // 防止并发重启 SSE
 
 /* ───────── Stdout Write Queue (backpressure-safe) ───────── */
 
@@ -168,7 +171,7 @@ function uuid() { return randomUUID() || 'msg_' + Date.now() + '_' + Math.random
 
   if (m === 'initialize' && msg.id != null) {
     sendResponse(msg.id, {
-      protocolVersion: 1,
+        protocolVersion: "1",
       agentCapabilities: {
         loadSession: true,
         promptCapabilities: { audio: false, embeddedContext: false, image: false },
@@ -585,7 +588,7 @@ async function handleFilterLevel(sid, arg, msgId) {
       lines.push(`${levelIcon(lv)} ${lv.toUpperCase()} — ${levelDesc(lv)}${mark}`);
     }
     lines.push('─'.repeat(14));
-    lines.push('/f (FULL) 流式输出  |  /pd (PAD) 标准模式  |  /ph (PHONE) 极简模式');
+    lines.push('/level (/lvl) [f|p|ph]  设置级别，/f /pd /ph 快捷切换');
     lines.push('');
     lines.push('⚠️ FULL 模式：实时推送每个文本/工具增量，每次推送消耗一次 iLink API 调用。');
     lines.push('   长文本时调用频繁，触发微信限流后后续消息静默丢失（用户无法感知回复不完整）。');
@@ -596,12 +599,13 @@ async function handleFilterLevel(sid, arg, msgId) {
     return;
   }
   const level = arg.trim().toLowerCase();
-  if (!FILTER_LEVELS.includes(level)) {
-    reply(sid, `⚠️ 无效级别: ${level}，可选: ${FILTER_LEVELS.join(', ')}`);
+  const resolved = FILTER_ALIASES[level] || level;
+  if (!FILTER_LEVELS.includes(resolved)) {
+    reply(sid, `⚠️ 无效级别: ${level}，可选: ${FILTER_LEVELS.join(', ')}, 别名: f, p/pd, ph`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
-  await setFilterLevel(sid, level, msgId);
+  await setFilterLevel(sid, resolved, msgId);
 }
 
 async function setFilterLevel(sid, level, msgId) {
@@ -646,7 +650,7 @@ async function handleQuotaMode(sid, arg, msgId) {
       lines.push(`${quotaModeLabel(m)}${mark}`);
     }
     lines.push('─'.repeat(14));
-    lines.push('/quota (/q) [truncate|notify|continue]  设置策略');
+    lines.push('/quota (/q) [策略]  设置策略: truncate/notify/continue, 别名: t/trunc, n/notif, c/cont');
     lines.push('');
     lines.push('由于 iLink API 每次 context_token 仅有约 5 次 sendmessage 调用配额，');
     lines.push('长回复会自动截断。continue 模式让用户发任意消息刷新 token 后继续接收剩余内容。');
@@ -655,12 +659,13 @@ async function handleQuotaMode(sid, arg, msgId) {
     return;
   }
   const mode = arg.trim().toLowerCase();
-  if (!QUOTA_MODES.includes(mode)) {
-    reply(sid, `⚠️ 无效策略: ${mode}，可选: ${QUOTA_MODES.join(', ')}`);
+  const resolved = QUOTA_ALIASES[mode] || mode;
+  if (!QUOTA_MODES.includes(resolved)) {
+    reply(sid, `⚠️ 无效策略: ${mode}，可选: ${QUOTA_MODES.join(', ')}, 别名: t/trunc, n/notif, c/cont`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
-  quotaMode = mode;
+  quotaMode = resolved;
   saveFilterLevel();
   reply(sid, `✅ 已切换超长回复策略: ${quotaModeLabel(mode)}`);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
@@ -1102,11 +1107,11 @@ function showHelp(sid, msgId) {
     '/build (/bu)             切换到 build 模式',
     '',
     '── 信息过滤 ──',
-    `/level (/lvl) [级别]     查看/设置过滤级别 (当前: ${filterLevel.toUpperCase()})`,
+    `/level (/lvl) [f|p|ph]  查看/设置过滤级别 (当前: ${filterLevel.toUpperCase()})`,
     '/f                       切换到 FULL 模式（全部显示）',
     '/pd                      切换到 PAD 模式（摘要显示）',
     '/ph                      切换到 PHONE 模式（极简显示）',
-    '/quota (/q) [策略]        查看/设置超长回复策略 (truncate|notify|continue)',
+    '/quota (/q) [t|n|c]      查看/设置超长回复策略 (t:截断 n:通知 c:续传)',
     '',
     '── 问题回答（通知中直接回复也可）──',
     '/answer (/ans) [编号] <内容>  回答AI提问，默认第1题',
@@ -1610,28 +1615,31 @@ async function forwardToAIAsync(sid, targetId, text) {
       return;
     }
     if (responseForSession !== targetId) {
+      disarmWorkingNotice();
       log(`[FWD] stale response for session ${targetId?.slice(0,12)}, expected ${responseForSession?.slice(0,12)}, sending completion only`);
       if (!idleNotified.has(targetId)) {
         idleNotified.add(targetId);
         await fetchSessionName(targetId);
         const compName = getSessionName(targetId);
-        reply(targetId, `✅ ${compName} · 完成`);
-        sendNotification('session/update', {
-          sessionId: targetId,
-          update: {
-            sessionUpdate: 'tool_call',
-            title: 'notification',
-            toolCallId: uuid(),
-            kind: 'other',
-            status: 'completed',
-          },
-        });
+        const sendSid = lastPromptSid || sid;
+        if (sendSid) {
+          reply(sendSid, `✅ ${compName} · 完成`);
+          sendNotification('session/update', {
+            sessionId: sendSid,
+            update: {
+              sessionUpdate: 'tool_call',
+              title: 'notification',
+              toolCallId: uuid(),
+              kind: 'other',
+              status: 'completed',
+            },
+          });
+        }
       }
       return;
     }
     responseSent = true;
     disarmWorkingNotice();
-    idleNotified.add(targetId);
     const accumulated = pendingReplyText.trim();
     pendingReplyText = '';
     pendingTruncated = false;
@@ -1692,22 +1700,26 @@ async function forwardToAIAsync(sid, targetId, text) {
       await fetchSessionName(targetId);
       const compName = getSessionName(targetId);
       idleNotified.add(targetId);
-      reply(targetId, `✅ ${compName} · 完成`);
-      sendNotification('session/update', {
-        sessionId: targetId,
-        update: {
-          sessionUpdate: 'tool_call',
-          title: 'notification',
-          toolCallId: uuid(),
-          kind: 'other',
-          status: 'completed',
-        },
-      });
+      const sendSid = lastPromptSid || sid;
+      if (sendSid) {
+        reply(sendSid, `✅ ${compName} · 完成`);
+        sendNotification('session/update', {
+          sessionId: sendSid,
+          update: {
+            sessionUpdate: 'tool_call',
+            title: 'notification',
+            toolCallId: uuid(),
+            kind: 'other',
+            status: 'completed',
+          },
+        });
+      }
     }
   } catch (err) {
     disarmWorkingNotice();
     if (responseForSession !== targetId) return; // superseded by newer prompt
     if (err.name === 'AbortError') {
+      if (responseSent) return; // session.idle already sent text, avoid duplicate
       const accumulated = pendingReplyText.trim();
       log(`[FWD] timeout: lastSid=${(lastPromptSessionId||'?').slice(0,12)} targetId=${(targetId||'?').slice(0,12)} text_len=${text.length} pending_len=${pendingReplyText.length} accumulated_len=${accumulated.length}`);
       pendingReplyText = '';
@@ -2193,17 +2205,19 @@ function getSessionName(id) {
   return id?.slice(0, 12) || '?';
 }
 
-async function idleNotification(props) {
+async function idleNotification(props, sendSid) {
   const sid = props.sessionID;
   if (!sid || idleNotified.has(sid)) return null;
-  idleNotified.add(sid);
   await fetchSessionName(sid);
   const name = getSessionName(sid);
   const text = `✅ ${name} · 完成`;
-  log(`[IDLE] immediate completion for ${sid.slice(0,12)}: "${text}"`);
-  reply(sid, text);
+  const target = sendSid || lastPromptSid;
+  if (!target) return null;
+  idleNotified.add(sid);
+  log(`[IDLE] immediate completion sid=${sid.slice(0,12)} via target=${target.slice(0,12)}: "${text}"`);
+  reply(target, text);
   sendNotification('session/update', {
-    sessionId: sid,
+    sessionId: target,
     update: {
       sessionUpdate: 'tool_call',
       title: 'notification',
@@ -2404,7 +2418,7 @@ async function eventToNotification(type, props) {
             flushToWeChat();
             pendingContinuation = null;
           }
-          return await idleNotification(props);
+          return await idleNotification(props, lastPromptSid);
         }
         // PAD/PHONE mode: send accumulated text as one message
         let text = pendingReplyText.trim();
@@ -2430,7 +2444,7 @@ async function eventToNotification(type, props) {
             flushToWeChat();
             pendingContinuation = null;
           }
-          return await idleNotification(props);
+          return await idleNotification(props, lastPromptSid);
         }
         if (!responseSent) {
           log(`[IDLE] no text accumulated, deferring to forwardToAIAsync`);
@@ -2483,7 +2497,7 @@ async function eventToNotification(type, props) {
               flushToWeChat();
               pendingContinuation = null;
             }
-            return await idleNotification(props);
+            return await idleNotification(props, lastPromptSid);
           }
           // PAD/PHONE mode: send accumulated text as one message
           let text = pendingReplyText.trim();
@@ -2509,7 +2523,7 @@ async function eventToNotification(type, props) {
               flushToWeChat();
               pendingContinuation = null;
             }
-            return await idleNotification(props);
+            return await idleNotification(props, lastPromptSid);
           }
           if (!responseSent) {
             return null;
@@ -2877,11 +2891,15 @@ function startWatchdog() {
     try {
       const now = Date.now();
 
-      // SSE 连接健康检查
+      // SSE 连接健康检查 + 自动重连
       if (!sseConnectionActive && sseReader === null) {
         if (now - lastSseHealthWarn > 60000) {
           lastSseHealthWarn = now;
-          log(`[WATCHDOG] SSE connection is down (reader=null), connectSSE() should be reconnecting...`);
+          if (!sseRestarting) {
+            sseRestarting = true;
+            log(`[WATCHDOG] SSE is down, attempting restart...`);
+            connectSSE().catch(e => log(`[WATCHDOG] SSE restart failed: ${e.message}`)).finally(() => { sseRestarting = false; });
+          }
         }
       } else if (sseConnectionActive) {
         lastSseHealthWarn = 0;
