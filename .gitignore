@@ -15,6 +15,7 @@ node_modules/
 .wechat-workspaces.json
 .wechat-workspace-current.json
 .wechat-subscribers.json
+.wechat-filter.json
 
 # OS files
 .DS_Store
@@ -35,6 +36,9 @@ __pycache__/
 
 # Logs
 *.log
+
+# Temporary files
+*.tmp
 
 # Subprojects (have their own git)
 pk-opencode-webui/

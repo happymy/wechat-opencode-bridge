@@ -1,7 +1,7 @@
 {
   "type": "module",
   "dependencies": {
-    "@opencode-ai/sdk": "^1.16.2",
+    "@opencode-ai/sdk": "^1.17.7",
     "wechat-acp": "^0.8.0"
   }
 }
