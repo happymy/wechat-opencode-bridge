@@ -2434,7 +2434,6 @@ async function eventToNotification(type, props) {
         }
         if (!responseSent) {
           log(`[IDLE] no text accumulated, deferring to forwardToAIAsync`);
-          idleNotified.add(props.sessionID);
           return null;
         }
         return null;
@@ -2512,9 +2511,7 @@ async function eventToNotification(type, props) {
             }
             return await idleNotification(props);
           }
-          // If no text accumulated and response not sent, defer to forwardToAIAsync
           if (!responseSent) {
-            idleNotified.add(props.sessionID);
             return null;
           }
           // Already sent by forwardToAIAsync, just suppress "完成"
