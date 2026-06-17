@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync, existsSync } from 'node:fs';
 import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -152,10 +152,18 @@ function processStdoutQueue() {
 /* ───────── Logging ───────── */
 
 const logFile = join(WORK_DIR, '.wechat-adapter.log');
+const MAX_LOG_SIZE = 200 * 1024 * 1024;
+const KEEP_LOG_SIZE = 100 * 1024 * 1024;
 function log(...args) {
   const line = `[wechat] ${args.join(' ')}`;
   process.stderr.write(line + '\n');
   try {
+    const stats = statSync(logFile, { throwIfNoEntry: false });
+    if (stats && stats.size > MAX_LOG_SIZE) {
+      const content = readFileSync(logFile);
+      writeFileSync(logFile, content.slice(-KEEP_LOG_SIZE));
+      process.stderr.write(`[wechat] [LOG] rotated ${(stats.size / 1024 / 1024).toFixed(1)}MB -> ${KEEP_LOG_SIZE / 1024 / 1024}MB\n`);
+    }
     writeFileSync(logFile, line + '\n', { flag: 'a' });
   } catch {}
 }
@@ -658,7 +666,9 @@ async function handleQuotaMode(sid, arg, msgId) {
     lines.push('/quota (/q) [策略]  设置策略: truncate/notify/continue, 别名: t/trunc, n/notif, c/cont');
     lines.push('');
     lines.push('由于 iLink API 每次 context_token 仅有约 5 次 sendmessage 调用配额，');
-    lines.push('长回复会自动截断。continue 模式让用户发 /g 继续接收剩余内容。');
+    lines.push('长回复会自动截断。continue 模式将超限文本按 4000 字分块存入队列，');
+    lines.push('发 /g (/get, /cont) 逐条取出，显示进度 (done/total + 剩余条数)；');
+    lines.push('发 /x (/gc) 清除待续发内容。');
     reply(sid, lines.join('\n'));
     flushToWeChat(sid);
     sendResponse(msgId, { stopReason: 'end_turn' });
@@ -1174,12 +1184,14 @@ function showHelp(sid, msgId) {
     '/plan (/pl)              切换到 plan 模式',
     '/build (/bu)             切换到 build 模式',
     '',
-    '── 信息过滤 ──',
+    '── 信息过滤与超长回复 ──',
     `/level (/lvl) [f|p|ph]  查看/设置过滤级别 (当前: ${filterLevel.toUpperCase()})`,
     '/f                       切换到 FULL 模式（全部显示）',
     '/pd                      切换到 PAD 模式（摘要显示）',
     '/ph                      切换到 PHONE 模式（极简显示）',
-    '/quota (/q) [t|n|c]      查看/设置超长回复策略 (t:截断 n:通知 c:续传)',
+    `/quota (/q) [t|n|c]      超长回复策略 (当前: ${quotaModeLabel(quotaMode)})  t:截断 n:通知 c:续传`,
+    '/g (/get, /cont)         续发模式下发 /g 取出下一条（显示进度）',
+    '/x (/gc)                 清除待续发内容',
     '',
     '── 问题回答（通知中直接回复也可）──',
     '/answer (/ans) [编号] <内容>  回答AI提问，默认第1题',
@@ -1201,8 +1213,6 @@ function showHelp(sid, msgId) {
     '/cancel (/c)            取消当前AI执行',
     '',
     '── 通知与系统 ──',
-    '/g (/get, /cont)        继续发送超长回复的剩余内容',
-    '/x (/gc)                清除待续发内容',
     '/mute (/m)              开关主动通知',
     '/notify (/n)            查看通知状态与订阅信息',
     '/autoclean (/ac) [天数] 设置不活跃订阅自动清理天数',
@@ -1213,7 +1223,7 @@ function showHelp(sid, msgId) {
     '💡 未识别的消息将转发给当前选中的 AI 会话',
     '',
     '⚠️ FULL 模式 ( /f ) 实时推送增量，每个 context_token 约 5 次调用上限。',
-    '   超限时自动截断+通知，详见 docs/rate-limiting.md。',
+    '   超限时自动截断，使用 /quota c 启用续发模式 + /g 逐条取出。',
     '   推荐 PAD 模式 ( /pd ) 或 OpenCode Web UI (http://localhost:4096)。',
   ];
   reply(sid, lines.join('\n'));

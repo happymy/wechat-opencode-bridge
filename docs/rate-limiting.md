@@ -39,8 +39,8 @@ FULL 模式流式处理中，在两种情况下 delta 文本被静默丢弃：
 
 | 丢弃点 | 条件 | 代码位置 |
 |--------|------|---------|
-| `realtimeBuffer` 溢出 | `fullQuotaUsed >= 4` **且** `realtimeBuffer.length >= 3000` | `wechat-adapter.js:2578-2581` |
-| `pendingReplyText` 溢出 | `pendingReplyText.length >= 8000` | `wechat-adapter.js:2584-2587`（FULL）/ `:2672-2673`（PAD） |
+| `realtimeBuffer` 溢出 | `fullQuotaUsed >= 4` **且** `realtimeBuffer.length >= 3000` | `wechat-adapter.js:2719-2722` |
+| `pendingReplyText` 溢出 | `pendingReplyText.length >= 100000` | `wechat-adapter.js:2725-2728`（FULL）/ `:2829-2832`（PAD） |
 
 文本被丢弃时 `pendingTruncated = true` 被设置，会话结束时用户会收到截断提示。
 
@@ -61,7 +61,7 @@ fullQuotaUsed  →  flushRealtime() 每次 +1
 | 常量 | 值 | 作用 |
 |------|----|------|
 | `MAX_REALTIME_BUFFER` | 3000 | FULL 模式实时缓冲上限，确保 end-of-turn 最多 1 段 |
-| `MAX_ACCUMULATED_TEXT` | 8000 | PAD/PHONE 模式累积文本上限 |
+| `MAX_ACCUMULATED_TEXT` | 100000 | PAD/PHONE 模式累积文本上限（continue 模式不截断） |
 | `REALTIME_MIN_FLUSH` | 3500 | FULL 模式累积到该值后立即刷出 |
 | `REALTIME_FLUSH_MS` | 3000 | FULL 模式流式刷出间隔（ms） |
 | `MAX_REPLY_LENGTH` | 4000 | `reply()` 单次发送的最大字符数 |
@@ -73,10 +73,22 @@ fullQuotaUsed  →  flushRealtime() 每次 +1
 ```
 truncate (t/trunc)  → 静默截断，直接丢弃超限部分，不通知
 notify   (n/notif)  → 截断并发通知："回复已截断，超出上限"
-continue (c/cont)   → 保存超限文本，用户发 /g 自动续发
+continue (c/cont)   → 保存超限文本到 FIFO 消息队列，用户发 /g 逐条取出
 ```
 
 会话结束时若发生过截断，发送提示：`⚠️ 回复过长已截断，完整内容请在 OpenCode 界面查看`
+
+#### continue 模式消息队列（`/g` `/x`）
+
+启用 `continue` 策略后，超限文本按 4000 字符预分割为多条消息存入 FIFO 队列：
+
+| 命令 | 别名 | 说明 |
+|------|------|------|
+| `/g` | `/get` `/cont` | 取出下一条并发送，显示进度 `done/total` + 剩余条数；最后一条显示 `✅ 续发完毕（共 N 条）` |
+| `/x` | `/gc` | 清除所有待续发内容 |
+
+队列为空时 `/g` 返回 `📭 没有待续发的内容`。
+队列仅保存当前最后一次超限的内容，新超限发生时会覆盖旧队列。
 
 ### 机制四：FULL 模式流式刷新策略
 
