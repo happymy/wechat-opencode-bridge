@@ -15,6 +15,7 @@ node_modules/
 .wechat-workspaces.json
 .wechat-workspace-current.json
 .wechat-subscribers.json
+.wechat-filter.json
 
 # OS files
 .DS_Store

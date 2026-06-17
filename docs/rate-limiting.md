@@ -73,7 +73,7 @@ fullQuotaUsed  →  flushRealtime() 每次 +1
 ```
 truncate (t/trunc)  → 静默截断，直接丢弃超限部分，不通知
 notify   (n/notif)  → 截断并发通知："回复已截断，超出上限"
-continue (c/cont)   → 保存超限文本，用户发任意消息后自动续发
+continue (c/cont)   → 保存超限文本，用户发 /g 自动续发
 ```
 
 会话结束时若发生过截断，发送提示：`⚠️ 回复过长已截断，完整内容请在 OpenCode 界面查看`
