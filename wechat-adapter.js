@@ -1628,10 +1628,30 @@ async function forwardToAIAsync(sid, targetId, text) {
 
     if (promptResult.error) {
       disarmWorkingNotice();
-      responseSent = true;
-      responseForSession = targetId;
-      const errMsg = promptResult.error?.message || promptResult.error?.data?.message || '请求失败';
-      reply(sid, `⚠️ 服务器错误: ${errMsg.slice(0, 100)}`);
+      const errMsg = promptResult.error?.message || promptResult.error?.data?.message || '';
+      if (/abort/i.test(errMsg)) {
+        // SDK wraps AbortError in response.error — treat as timeout
+        if (responseSent) { return; }
+        const accumulated = pendingReplyText.trim();
+        pendingReplyText = '';
+        pendingTruncated = false;
+        processingNotified = false;
+        pendingContinuation = null;
+        responseSent = true;
+        responseForSession = null;
+        lastPromptSessionId = null;
+        lastPromptSid = null;
+        currentTextMessageId = null;
+        realtimeBuffer = '';
+        fullQuotaUsed = 0;
+        if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
+        idleNotified.add(targetId);
+        reply(sid, accumulated ? `🤖 ${accumulated}` : '⏰ 请求超时，请重试');
+      } else {
+        responseSent = true;
+        responseForSession = targetId;
+        reply(sid, `⚠️ 服务器错误: ${errMsg.slice(0, 100)}`);
+      }
       await drainPendingNotifications();
       flushToWeChat();
       return;
@@ -1699,7 +1719,6 @@ async function forwardToAIAsync(sid, targetId, text) {
       if (pendingContinuation) {
         reply(pendingContinuation.sid, '📬 回复过长已保存，发 /g 继续接收');
         flushToWeChat();
-        pendingContinuation = null;
       }
       fullQuotaUsed = 0;
     } else if (accumulated) {
@@ -1717,7 +1736,6 @@ async function forwardToAIAsync(sid, targetId, text) {
       if (pendingContinuation) {
         reply(pendingContinuation.sid, '📬 回复过长已保存，发 /g 继续接收');
         flushToWeChat();
-        pendingContinuation = null;
       }
     } else {
       const formatted = formatReply(data);
@@ -2451,7 +2469,6 @@ async function eventToNotification(type, props) {
           if (pendingContinuation) {
             reply(pendingContinuation.sid, '📬 回复过长已保存，发 /g 继续接收');
             flushToWeChat();
-            pendingContinuation = null;
           }
           return await idleNotification(props, lastPromptSid);
         }
@@ -2477,7 +2494,6 @@ async function eventToNotification(type, props) {
           if (pendingContinuation) {
             reply(pendingContinuation.sid, '📬 回复过长已保存，发 /g 继续接收');
             flushToWeChat();
-            pendingContinuation = null;
           }
           return await idleNotification(props, lastPromptSid);
         }
@@ -2530,7 +2546,6 @@ async function eventToNotification(type, props) {
             if (pendingContinuation) {
               reply(pendingContinuation.sid, '📬 回复过长已保存，发 /g 继续接收');
               flushToWeChat();
-              pendingContinuation = null;
             }
             return await idleNotification(props, lastPromptSid);
           }
@@ -2556,7 +2571,6 @@ async function eventToNotification(type, props) {
             if (pendingContinuation) {
               reply(pendingContinuation.sid, '📬 回复过长已保存，发 /g 继续接收');
               flushToWeChat();
-              pendingContinuation = null;
             }
             return await idleNotification(props, lastPromptSid);
           }
