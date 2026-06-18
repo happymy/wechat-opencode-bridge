@@ -27,6 +27,7 @@ let currentWorkspace = loadDefaultWorkspace();
 let currentAgent = 'build';
 let filterLevel = 'pad';
 let quotaMode = 'truncate'; // truncate | notify | continue
+let showThinking = true; // /thinking toggle: filter reasoning blocks from output
 const FILTER_LEVELS = ['full', 'pad', 'phone'];
 const QUOTA_MODES = ['truncate', 'notify', 'continue'];
 const QUOTA_ALIASES = { t: 'truncate', trunc: 'truncate', n: 'notify', notif: 'notify', c: 'continue', cont: 'continue' };
@@ -73,6 +74,7 @@ const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
 const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
 const REALTIME_FLUSH_MS = 3000; // FULL 模式实时流式刷出间隔 (ms)
 const REALTIME_MIN_FLUSH = 3500; // FULL 模式最小累积字符数后立即刷出（每个 context_token 约 5 次 API 调用上限）
+let modelOverrides = new Map(); // sessionID -> { providerID, modelID }
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 let realtimeBuffer = '';       // FULL 模式实时文本缓冲
 let realtimeFlushTimer = null; // 实时刷出定时器
@@ -334,6 +336,20 @@ async function handleCommand(sid, text, msgId) {
       return handleSyncDir(sid, msgId);
     case '/testnotify':
       return testNotify(sid, msgId);
+    case '/models':
+      return handleModels(sid, msgId);
+    case '/switchmodel': case '/sm':
+      return handleSwitchModel(sid, arg, msgId);
+    case '/rmmodel':
+      return handleRemoveModel(sid, msgId);
+    case '/undo':
+      return handleUndo(sid, msgId);
+    case '/redo':
+      return handleRedo(sid, msgId);
+    case '/compact': case '/summarize':
+      return handleCompact(sid, msgId);
+    case '/thinking':
+      return handleThinking(sid, msgId);
     case '/g': case '/get': case '/cont':
       return handleContinue(sid, msgId);
     case '/x': case '/gc':
@@ -423,7 +439,8 @@ async function listSessions(sid, arg, msgId) {
       const name = s.title || '(未命名)';
       const model = s.model?.id?.split('/').pop() || '';
       const marker = (s.directory && normalizeDir(s.directory) !== normalizeDir(wsDir)) ? ' ⚡' : '';
-      lines.push(`${String(i + 1).padStart(2)} ${active}${busy} ${name}${model ? ' [' + model + ']' : ''}${marker}`);
+      const ovr = modelOverrides.has(s.id) ? ' *' : '';
+      lines.push(`${String(i + 1).padStart(2)} ${active}${busy} ${name}${model ? ' [' + model + ']' : ''}${ovr}${marker}`);
     });
     if (sessions.length > maxShow) lines.push(`...及另外 ${sessions.length - maxShow} 个`);
     if (!currentInList && currentSessionId) {
@@ -1171,60 +1188,218 @@ async function handleClearContinue(sid, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+async function handleModels(sid, msgId) {
+  try {
+    const { data: models } = await sdkClient.v2.model.list({}).catch(() => ({ data: null }));
+    const { data: providers } = await sdkClient.config.providers().catch(() => ({ data: null }));
+    const lines = ['📋 可用模型'];
+    lines.push('─'.repeat(20));
+    if (providers?.providers?.length) {
+      for (const p of providers.providers) {
+        lines.push(`${p.name || p.providerID || p.id || '?'}:`);
+        const modelIds = p.models ? Object.keys(p.models) : [];
+        if (modelIds.length) {
+          modelIds.forEach(m => lines.push(`  • ${m}`));
+        } else {
+          lines.push('  (无模型信息)');
+        }
+      }
+    } else if (models?.length) {
+      models.forEach(m => {
+        const name = m.name || m.id || '?';
+        const prov = m.providerID || m.provider || '';
+        lines.push(`  • ${name}${prov ? ` (${prov})` : ''}`);
+      });
+    } else {
+      reply(sid, '📭 没有可用模型');
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    lines.push('─'.repeat(20));
+    lines.push('/sm <provider>/<model>       切换模型（例: /sm openai/gpt-4o）');
+    reply(sid, lines.join('\n'));
+  } catch (e) {
+    reply(sid, `⚠️ 获取模型列表失败: ${e.message}`);
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleSwitchModel(sid, arg, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  if (!arg) {
+    const current = modelOverrides.get(currentSessionId);
+    if (current) {
+      reply(sid, `📋 当前模型覆盖: ${current.providerID}/${current.modelID}\n/sm <provider/model> 切换模型\n/rmmodel 清除模型覆盖`);
+    } else {
+      try {
+        const { data: session } = await sdkClient.session.get({ sessionID: currentSessionId });
+        const m = session?.model;
+        reply(sid, `📋 当前会话模型: ${m ? `${m.providerID}/${m.id}` : '未知'}\n/sm <provider/model> 切换模型`);
+      } catch (e) {
+        reply(sid, `⚠️ 获取会话信息失败: ${e.message}`);
+      }
+    }
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const parts = arg.split(/[\/\s]+/);
+  let providerID, modelID;
+  if (parts.length >= 2) {
+    providerID = parts[0];
+    modelID = parts[1];
+  } else {
+    reply(sid, '⚠️ 格式: /sm <provider>/<model>\n例: /sm openai/gpt-4o\n先用 /models 查看可用模型');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  modelOverrides.set(currentSessionId, { providerID, modelID });
+  reply(sid, `✅ 会话模型已设为 ${providerID}/${modelID}\n下次发送消息时将使用该模型`);
+  log(`[MODEL] session ${currentSessionId.slice(0, 12)} → ${providerID}/${modelID}`);
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleRemoveModel(sid, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  if (modelOverrides.has(currentSessionId)) {
+    modelOverrides.delete(currentSessionId);
+    reply(sid, '✅ 已清除模型覆盖，恢复会话默认模型');
+    log(`[MODEL] cleared override for session ${currentSessionId.slice(0, 12)}`);
+  } else {
+    reply(sid, '📋 当前会话没有模型覆盖');
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleUndo(sid, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话，请先用 /switch 或 /new');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  try {
+    await sdkClient.session.revert({ sessionID: currentSessionId });
+    reply(sid, '✅ 已撤销上一条消息及其文件改动');
+    log(`[UNDO] reverted last message in session ${currentSessionId.slice(0, 12)}`);
+  } catch (e) {
+    reply(sid, `⚠️ 撤销失败: ${e.message}`);
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleRedo(sid, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  try {
+    await sdkClient.session.unrevert({ sessionID: currentSessionId });
+    reply(sid, '✅ 已恢复撤销的消息');
+    log(`[REDO] restored reverted messages in session ${currentSessionId.slice(0, 12)}`);
+  } catch (e) {
+    reply(sid, `⚠️ 恢复失败: ${e.message}`);
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleCompact(sid, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  reply(sid, '🔄 正在压缩会话...');
+  try {
+    await sdkClient.v2.session.compact({ sessionID: currentSessionId });
+    reply(sid, '✅ 会话压缩完成');
+    log(`[COMPACT] compacted session ${currentSessionId.slice(0, 12)}`);
+  } catch (e) {
+    reply(sid, `⚠️ 压缩失败: ${e.message}`);
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleThinking(sid, msgId) {
+  showThinking = !showThinking;
+  const status = showThinking ? '显示' : '隐藏';
+  reply(sid, `🧠 思维推理内容已${status}`);
+  log(`[THINKING] showThinking=${showThinking}`);
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
 function showHelp(sid, msgId) {
   const lines = [
     '🤖 微信远程编程助手',
     '─'.repeat(20),
     '── 会话管理 ──',
-    '/list (/l, /ls, /sessions)    查看会话列表；/l all [+数字] 返回全部会话前N条',
-    '/switch (/s, /sw) <编号|ID>   切换会话',
-    '/new (/nl, /create) <会话名>  新建会话并切换（当前工作区）',
+    '/list (/l,/ls,/sessions)  查看会话列表；/l all [+N] 查看全部',
+    '/switch (/s,/sw) <N|ID>   切换会话',
+    '/new (/nl,/create) <名称> 新建会话并切换',
+    '/compact (/summarize)     压缩当前会话',
     '',
     '── 模式切换 ──',
-    '/plan (/pl)              切换到 plan 模式',
-    '/build (/bu)             切换到 build 模式',
+    '/plan (/pl)   切换到 plan 模式',
+    '/build (/bu)  切换到 build 模式',
+    '',
+    '── 模型管理 ──',
+    '/models       列出可用模型',
+    '/switchmodel  切换模型 /sm <provider/model>',
+    '/rmmodel      清除模型覆盖',
+    '',
+    '── 撤销与恢复 ──',
+    '/undo  撤销上一条消息（含文件改动）',
+    '/redo  恢复已撤销的消息',
     '',
     '── 信息过滤与超长回复 ──',
-    `/level (/lvl) [f|p|ph]  查看/设置过滤级别 (当前: ${filterLevel.toUpperCase()})`,
-    '/f                       切换到 FULL 模式（全部显示）',
-    '/pd                      切换到 PAD 模式（摘要显示）',
-    '/ph                      切换到 PHONE 模式（极简显示）',
-    `/quota (/q) [t|n|c]      超长回复策略 (当前: ${quotaModeLabel(quotaMode)})  t:截断 n:通知 c:续传`,
-    '/g (/get, /cont)         续发模式下发 /g 取出下一条（显示进度）',
-    '/x (/gc)                 清除待续发内容',
+    `/level (/lvl)  过滤级别 (当前: ${filterLevel.toUpperCase()})`,
+    '/f    FULL 模式（全部显示）',
+    '/pd   PAD 模式（摘要显示，推荐）',
+    '/ph   PHONE 模式（极简显示）',
+    `/quota (/q)  超长策略 (当前: ${quotaModeLabel(quotaMode)})  t截断 n通知 c续传`,
+    '/g (/cont)  续发模式下一条（显示进度）',
+    '/x (/gc)    清除待续发内容',
     '',
     '── 问题回答（通知中直接回复也可）──',
-    '/answer (/ans) [编号] <内容>  回答AI提问，默认第1题',
-    '/skip (/pass, /ps) [编号]     跳过指定问题（默认当前）',
-    '/qlist (/ql, /questions)      查看所有待回答问题',
-    '/qshow (/qc, /qcurrent)       显示当前问题详情',
-    '/qselect (/qs, /qsel) <编号>  选中指定问题为当前',
+    '/answer (/ans) [N] <内容>  回答AI提问，默认第1题',
+    '/skip (/pass,/ps) [N]      跳过指定问题',
+    '/qlist (/ql,/questions)    查看待回答问题',
+    '/qshow (/qc,/qcurrent)     显示当前问题详情',
+    '/qselect (/qs,/qsel) <N>   选中指定问题',
     '',
     '── 权限审批（通知中直接回复也可）──',
-    '/allow (/a) [编号|ID]  批准权限请求（默认最新）',
-    '/deny (/d) [编号|ID]   拒绝权限请求',
-    '/trust (/t) [编号|ID]  信任权限（不再询问）',
-    '/plist (/p, /pending)  查看待审批权限列表',
+    '/allow (/a) [N|ID]   批准权限请求',
+    '/deny (/d) [N|ID]    拒绝权限请求',
+    '/trust (/t) [N|ID]   信任权限',
+    '/plist (/p,/pending) 查看待审批列表',
     '',
     '── 工作区与任务 ──',
-    '/workspace (/ws)        查看/切换/添加/删除工作区',
-    '/sd                     从 DB 同步所有 OpenCode 项目工作区',
-    '/status (/st)           查看任务运行状态',
-    '/cancel (/c)            取消当前AI执行',
+    '/workspace (/ws)  查看/切换/添加/删除工作区',
+    '/sd  从 DB 同步工作区',
+    '/status (/st)  查看运行状态',
+    '/cancel (/c)   取消AI执行',
     '',
     '── 通知与系统 ──',
-    '/mute (/m)              开关主动通知',
-    '/notify (/n)            查看通知状态与订阅信息',
-    '/autoclean (/ac) [天数] 设置不活跃订阅自动清理天数',
-    '/testnotify             发送测试通知（调试用）',
-    '/help (/h)              显示此帮助',
+    '/mute (/m)    开关主动通知',
+    '/notify (/n)  查看通知状态',
+    '/autoclean (/ac) [天数]  设置自动清理天数',
+    '/testnotify   发送测试通知',
+    `/thinking     推理显示 (当前: ${showThinking ? '显示' : '隐藏'})`,
+    '/help (/h)    显示此帮助',
     '',
-    '💡 通知消息中可直接回复答案或权限审批，无需输入命令',
-    '💡 未识别的消息将转发给当前选中的 AI 会话',
+    '💡 通知消息中可直接回复答案或审批，无需命令前缀',
+    '💡 未识别的消息转发给当前 AI 会话',
     '',
-    '⚠️ FULL 模式 ( /f ) 实时推送增量，每个 context_token 约 5 次调用上限。',
-    '   超限时自动截断，使用 /quota c 启用续发模式 + /g 逐条取出。',
-    '   推荐 PAD 模式 ( /pd ) 或 OpenCode Web UI (http://localhost:4096)。',
+    '⚠️ FULL 模式下 context_token 约 5 次 sendmessage 上限',
+    '   超限自动截断，/quota c 启用续传 + /g 逐条取出',
+    '   推荐 PAD 或 OpenCode Web UI (http://localhost:4096)',
   ];
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
@@ -1666,11 +1841,17 @@ async function forwardToAIAsync(sid, targetId, text) {
     const timeout = setTimeout(() => controller.abort(), SESSION_MESSAGE_TIMEOUT);
     let promptResult;
     try {
-      promptResult = await sdkClient.session.prompt({
+      const modelOverride = modelOverrides.get(targetId);
+      const promptOpts = {
         sessionID: targetId,
         parts: [{ type: 'text', text }],
         agent: currentAgent,
-      }, { signal: controller.signal });
+      };
+      if (modelOverride) {
+        promptOpts.model = modelOverride;
+        log(`[PROMPT] using model override: ${modelOverride.providerID}/${modelOverride.modelID}`);
+      }
+      promptResult = await sdkClient.session.prompt(promptOpts, { signal: controller.signal });
     } finally {
       clearTimeout(timeout);
     }
@@ -2748,7 +2929,7 @@ async function eventToNotification(type, props) {
             toolStates.set(partId + '_reason', { startTime: Date.now() });
             if (lastPromptSid) realtimeNotify(lastPromptSid, '🤔 Thinking...');
           }
-          if (delta && lastPromptSid) {
+          if (delta && showThinking && lastPromptSid) {
             if (fullQuotaUsed < FULL_QUOTA_LIMIT || realtimeBuffer.length < MAX_REALTIME_BUFFER) {
               realtimeBuffer += delta;
             }
@@ -2800,9 +2981,16 @@ async function eventToNotification(type, props) {
 
       if (isPhone()) {
         // ── PHONE: text only, one 🤔 on first activity ──
-        if (partType === 'reasoning' && reasonTime.start && !processingNotified) {
-          processingNotified = true;
-          if (lastPromptSid) { reply(lastPromptSid, '🤔', currentTextMessageId); flushToWeChat(); }
+        if (partType === 'reasoning') {
+          if (showThinking && delta) {
+            if (pendingReplyText.length < MAX_ACCUMULATED_TEXT || quotaMode === 'continue') {
+              pendingReplyText += delta;
+            }
+          }
+          if (reasonTime.start && !processingNotified) {
+            processingNotified = true;
+            if (lastPromptSid) { reply(lastPromptSid, '🤔', currentTextMessageId); flushToWeChat(); }
+          }
           return null;
         }
         if (toolName && (toolStatus === 'running' || !toolStatus) && !toolStates.has(partId)) {
@@ -2836,6 +3024,11 @@ async function eventToNotification(type, props) {
       }
 
       if (partType === 'reasoning') {
+        if (showThinking && delta) {
+          if (pendingReplyText.length < MAX_ACCUMULATED_TEXT || quotaMode === 'continue') {
+            pendingReplyText += delta;
+          }
+        }
         if (reasonTime.start && !processingNotified) {
           processingNotified = true;
           if (lastPromptSid) { reply(lastPromptSid, '🤔 AI正在处理...', currentTextMessageId); flushToWeChat(); }
