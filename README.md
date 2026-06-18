@@ -11,28 +11,51 @@
 ### 来源
 本仓库由 [opencode-quickstart-workspace](https://github.com/happymy/opencode-quickstart-workspace/tree/master) 独立出来，专注于 WeChat ↔ OpenCode 桥接功能，移除了与 Web UI 和 mock 相关的文件。
 
+### 上游版本标签
+
+| 标签 | 提交 | 说明 |
+|------|------|------|
+| `v1.2.0` | `9d158f9` | 最新 |
+| `v1.1.0` | `ae90f94` | |
+| `v.1.0.5` | `d84469e` | |
+| `v1.0.4` | `6f7cfd5` | |
+| `v1.0.3` | `5aefb5f` | |
+| `v1.0.2` | `8b5937b` | |
+| `v1.0.1` | | 初版 |
+
+> 当前同步标签：**<!-- UPSTREAM_TAG -->@<!-- /UPSTREAM_TAG -->**（请在同步时更新此处）
+
 ### 同步策略
 从上游同步时，根据文件类型采用不同策略：
 
 | 策略 | 文件 | 操作 |
 |------|------|------|
-| **🔴 手动合并** | `wechat-adapter.js` | 上游可能有改进，需逐行 merge |
-| **🟡 选择性更新** | `wechat-bridge.bat` `restart-wechat.bat` `.tool-versions.json` | 差异较小时可直接覆盖 |
+| **🔴 手动合并** | `wechat-adapter.js` | 本地大量修改，上游改进需逐行 merge |
+| **🟡 选择性更新** | `wechat-bridge.bat` `restart-wechat.bat` `restart-wechat-monitor.bat` `.tool-versions.json` | 差异较小时可直接覆盖 |
+| **🔵 已引入** | `ilink-monitor-hook.js` `test-iLink-rate-limit.js` `del.py` `run_del_nul.bat` | 调试用工具文件，按需同步 |
 | **🟢 直接覆盖** | `docs/*` `LICENSE` `README.md` | 上游更新可安全覆盖后重新适配 |
-| **⚪ 忽略** | `.gitattributes` `plan/` | 仅本仓库存在，不受同步影响 |
-| **⚪ 可选引入** | `del.py` `run_del_nul.bat` `setup.bat` `start-all.bat` `stop-all.bat` `web.bat` `package.json` `package-lock.json` `ilink-monitor-hook.js` `restart-wechat-monitor.bat` `test-iLink-rate-limit.js` | 上游有但我们未使用的文件，按需引入 |
+| **⚪ 忽略** | `.gitattributes` `plan/` `.gitignore` `.wechat-*` | 仅本仓库存在，不受同步影响 |
+| **⚪ 未引入** | `setup.bat` `start-all.bat` `stop-all.bat` `web.bat` `package.json` `package-lock.json` | 上游特有文件，本仓库不使用 |
 
 ### 同步步骤
+
 ```bash
-# 添加上游 remote
+# 添加上游 remote（仅首次）
 git remote add upstream https://github.com/happymy/opencode-quickstart-workspace.git
 
-# 拉取上游
-git fetch upstream
+# 拉取上游指定标签
+git fetch upstream --tags
+git checkout v1.2.0  # 替换为要同步的标签
 
-# 按上述策略选择性合并文件
-git checkout upstream/master -- wechat-bridge.bat restart-wechat.bat
-# 对 wechat-adapter.js 执行手动 merge
+# 按策略选择性合并
+# 🟢 直接覆盖
+git checkout v1.2.0 -- docs/ LICENSE
+# 🟡 选择性更新
+git checkout v1.2.0 -- wechat-bridge.bat restart-wechat.bat .tool-versions.json
+# 🔵 调试工具
+git checkout v1.2.0 -- ilink-monitor-hook.js test-iLink-rate-limit.js del.py run_del_nul.bat restart-wechat-monitor.bat
+# 🔴 手动合并 wechat-adapter.js
+git diff v1.2.0 -- wechat-adapter.js | more
 ```
 
 ---
