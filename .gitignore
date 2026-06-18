@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# OpenCode local config
+.opencode/
+
+# Test artifacts
+.playwright-mcp/
+
+# Databases
+*.db
+
+# WeChat bot state
+.wechat-session.json
+.wechat-workspaces.json
+.wechat-workspace-current.json
+.wechat-subscribers.json
+.wechat-filter.json
+.wechat-settings.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+
+# Python cache
+__pycache__/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+
+# Subprojects (have their own git)
+pk-opencode-webui/
