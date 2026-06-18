@@ -27,6 +27,7 @@ let currentWorkspace = loadDefaultWorkspace();
 let currentAgent = 'build';
 let filterLevel = 'pad';
 let quotaMode = 'truncate'; // truncate | notify | continue
+let showThinking = true; // /thinking toggle: filter reasoning blocks from output
 const FILTER_LEVELS = ['full', 'pad', 'phone'];
 const QUOTA_MODES = ['truncate', 'notify', 'continue'];
 const QUOTA_ALIASES = { t: 'truncate', trunc: 'truncate', n: 'notify', notif: 'notify', c: 'continue', cont: 'continue' };
@@ -73,6 +74,7 @@ const NOTIFICATION_RATE_LIMIT_MS = 3000; // 同一用户连续通知最小间隔
 const SESSION_MESSAGE_TIMEOUT = 300000; // 会话消息 POST 超时（5分钟）
 const REALTIME_FLUSH_MS = 3000; // FULL 模式实时流式刷出间隔 (ms)
 const REALTIME_MIN_FLUSH = 3500; // FULL 模式最小累积字符数后立即刷出（每个 context_token 约 5 次 API 调用上限）
+let modelOverrides = new Map(); // sessionID -> { providerID, modelID }
 let pendingQuestionQueue = []; // queue for question.asked events that arrive while one is pending
 let realtimeBuffer = '';       // FULL 模式实时文本缓冲
 let realtimeFlushTimer = null; // 实时刷出定时器
@@ -334,6 +336,20 @@ async function handleCommand(sid, text, msgId) {
       return handleSyncDir(sid, msgId);
     case '/testnotify':
       return testNotify(sid, msgId);
+    case '/models':
+      return handleModels(sid, msgId);
+    case '/switchmodel': case '/sm':
+      return handleSwitchModel(sid, arg, msgId);
+    case '/rmmodel':
+      return handleRemoveModel(sid, msgId);
+    case '/undo':
+      return handleUndo(sid, msgId);
+    case '/redo':
+      return handleRedo(sid, msgId);
+    case '/compact': case '/summarize':
+      return handleCompact(sid, msgId);
+    case '/thinking':
+      return handleThinking(sid, msgId);
     case '/g': case '/get': case '/cont':
       return handleContinue(sid, msgId);
     case '/x': case '/gc':
@@ -423,7 +439,8 @@ async function listSessions(sid, arg, msgId) {
       const name = s.title || '(未命名)';
       const model = s.model?.id?.split('/').pop() || '';
       const marker = (s.directory && normalizeDir(s.directory) !== normalizeDir(wsDir)) ? ' ⚡' : '';
-      lines.push(`${String(i + 1).padStart(2)} ${active}${busy} ${name}${model ? ' [' + model + ']' : ''}${marker}`);
+      const ovr = modelOverrides.has(s.id) ? ' *' : '';
+      lines.push(`${String(i + 1).padStart(2)} ${active}${busy} ${name}${model ? ' [' + model + ']' : ''}${ovr}${marker}`);
     });
     if (sessions.length > maxShow) lines.push(`...及另外 ${sessions.length - maxShow} 个`);
     if (!currentInList && currentSessionId) {
@@ -1171,6 +1188,153 @@ async function handleClearContinue(sid, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+async function handleModels(sid, msgId) {
+  try {
+    const { data: models } = await sdkClient.v2.model.list({}).catch(() => ({ data: null }));
+    const { data: providers } = await sdkClient.config.providers().catch(() => ({ data: null }));
+    const lines = ['📋 可用模型'];
+    lines.push('─'.repeat(20));
+    if (providers?.providers?.length) {
+      for (const p of providers.providers) {
+        lines.push(`${p.name || p.providerID || p.id || '?'}:`);
+        const modelIds = p.models ? Object.keys(p.models) : [];
+        if (modelIds.length) {
+          modelIds.forEach(m => lines.push(`  • ${m}`));
+        } else {
+          lines.push('  (无模型信息)');
+        }
+      }
+    } else if (models?.length) {
+      models.forEach(m => {
+        const name = m.name || m.id || '?';
+        const prov = m.providerID || m.provider || '';
+        lines.push(`  • ${name}${prov ? ` (${prov})` : ''}`);
+      });
+    } else {
+      reply(sid, '📭 没有可用模型');
+      sendResponse(msgId, { stopReason: 'end_turn' });
+      return;
+    }
+    lines.push('─'.repeat(20));
+    lines.push('/sm <provider>/<model>       切换模型（例: /sm openai/gpt-4o）');
+    reply(sid, lines.join('\n'));
+  } catch (e) {
+    reply(sid, `⚠️ 获取模型列表失败: ${e.message}`);
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleSwitchModel(sid, arg, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  if (!arg) {
+    const current = modelOverrides.get(currentSessionId);
+    if (current) {
+      reply(sid, `📋 当前模型覆盖: ${current.providerID}/${current.modelID}\n/sm <provider/model> 切换模型\n/rmmodel 清除模型覆盖`);
+    } else {
+      try {
+        const { data: session } = await sdkClient.session.get({ sessionID: currentSessionId });
+        const m = session?.model;
+        reply(sid, `📋 当前会话模型: ${m ? `${m.providerID}/${m.id}` : '未知'}\n/sm <provider/model> 切换模型`);
+      } catch (e) {
+        reply(sid, `⚠️ 获取会话信息失败: ${e.message}`);
+      }
+    }
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  const parts = arg.split(/[\/\s]+/);
+  let providerID, modelID;
+  if (parts.length >= 2) {
+    providerID = parts[0];
+    modelID = parts[1];
+  } else {
+    reply(sid, '⚠️ 格式: /sm <provider>/<model>\n例: /sm openai/gpt-4o\n先用 /models 查看可用模型');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  modelOverrides.set(currentSessionId, { providerID, modelID });
+  reply(sid, `✅ 会话模型已设为 ${providerID}/${modelID}\n下次发送消息时将使用该模型`);
+  log(`[MODEL] session ${currentSessionId.slice(0, 12)} → ${providerID}/${modelID}`);
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleRemoveModel(sid, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  if (modelOverrides.has(currentSessionId)) {
+    modelOverrides.delete(currentSessionId);
+    reply(sid, '✅ 已清除模型覆盖，恢复会话默认模型');
+    log(`[MODEL] cleared override for session ${currentSessionId.slice(0, 12)}`);
+  } else {
+    reply(sid, '📋 当前会话没有模型覆盖');
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleUndo(sid, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话，请先用 /switch 或 /new');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  try {
+    await sdkClient.session.revert({ sessionID: currentSessionId });
+    reply(sid, '✅ 已撤销上一条消息及其文件改动');
+    log(`[UNDO] reverted last message in session ${currentSessionId.slice(0, 12)}`);
+  } catch (e) {
+    reply(sid, `⚠️ 撤销失败: ${e.message}`);
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleRedo(sid, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  try {
+    await sdkClient.session.unrevert({ sessionID: currentSessionId });
+    reply(sid, '✅ 已恢复撤销的消息');
+    log(`[REDO] restored reverted messages in session ${currentSessionId.slice(0, 12)}`);
+  } catch (e) {
+    reply(sid, `⚠️ 恢复失败: ${e.message}`);
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleCompact(sid, msgId) {
+  if (!currentSessionId) {
+    reply(sid, '⚠️ 没有选中的会话');
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+  reply(sid, '🔄 正在压缩会话...');
+  try {
+    await sdkClient.v2.session.compact({ sessionID: currentSessionId });
+    reply(sid, '✅ 会话压缩完成');
+    log(`[COMPACT] compacted session ${currentSessionId.slice(0, 12)}`);
+  } catch (e) {
+    reply(sid, `⚠️ 压缩失败: ${e.message}`);
+  }
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+async function handleThinking(sid, msgId) {
+  showThinking = !showThinking;
+  const status = showThinking ? '显示' : '隐藏';
+  reply(sid, `🧠 思维推理内容已${status}`);
+  log(`[THINKING] showThinking=${showThinking}`);
+  sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
 function showHelp(sid, msgId) {
   const lines = [
     '🤖 微信远程编程助手',
@@ -1217,6 +1381,15 @@ function showHelp(sid, msgId) {
     '/notify (/n)            查看通知状态与订阅信息',
     '/autoclean (/ac) [天数] 设置不活跃订阅自动清理天数',
     '/testnotify             发送测试通知（调试用）',
+    '',
+    '── 新增命令 ──',
+    '/models                 列出可用模型',
+    '/switchmodel (/sm)      切换当前会话模型 /sm <provider/model>',
+    '/rmmodel                清除模型覆盖，使用会话默认模型',
+    '/undo                   撤销上一条消息',
+    '/redo                   恢复已撤销的消息',
+    '/compact (/summarize)   压缩当前会话',
+    `/thinking               切换思维推理显示 (当前: ${showThinking ? '显示' : '隐藏'})`,
     '/help (/h)              显示此帮助',
     '',
     '💡 通知消息中可直接回复答案或权限审批，无需输入命令',
@@ -1666,11 +1839,17 @@ async function forwardToAIAsync(sid, targetId, text) {
     const timeout = setTimeout(() => controller.abort(), SESSION_MESSAGE_TIMEOUT);
     let promptResult;
     try {
-      promptResult = await sdkClient.session.prompt({
+      const modelOverride = modelOverrides.get(targetId);
+      const promptOpts = {
         sessionID: targetId,
         parts: [{ type: 'text', text }],
         agent: currentAgent,
-      }, { signal: controller.signal });
+      };
+      if (modelOverride) {
+        promptOpts.model = modelOverride;
+        log(`[PROMPT] using model override: ${modelOverride.providerID}/${modelOverride.modelID}`);
+      }
+      promptResult = await sdkClient.session.prompt(promptOpts, { signal: controller.signal });
     } finally {
       clearTimeout(timeout);
     }
@@ -2748,7 +2927,7 @@ async function eventToNotification(type, props) {
             toolStates.set(partId + '_reason', { startTime: Date.now() });
             if (lastPromptSid) realtimeNotify(lastPromptSid, '🤔 Thinking...');
           }
-          if (delta && lastPromptSid) {
+          if (delta && showThinking && lastPromptSid) {
             if (fullQuotaUsed < FULL_QUOTA_LIMIT || realtimeBuffer.length < MAX_REALTIME_BUFFER) {
               realtimeBuffer += delta;
             }
@@ -2800,9 +2979,16 @@ async function eventToNotification(type, props) {
 
       if (isPhone()) {
         // ── PHONE: text only, one 🤔 on first activity ──
-        if (partType === 'reasoning' && reasonTime.start && !processingNotified) {
-          processingNotified = true;
-          if (lastPromptSid) { reply(lastPromptSid, '🤔', currentTextMessageId); flushToWeChat(); }
+        if (partType === 'reasoning') {
+          if (showThinking && delta) {
+            if (pendingReplyText.length < MAX_ACCUMULATED_TEXT || quotaMode === 'continue') {
+              pendingReplyText += delta;
+            }
+          }
+          if (reasonTime.start && !processingNotified) {
+            processingNotified = true;
+            if (lastPromptSid) { reply(lastPromptSid, '🤔', currentTextMessageId); flushToWeChat(); }
+          }
           return null;
         }
         if (toolName && (toolStatus === 'running' || !toolStatus) && !toolStates.has(partId)) {
@@ -2836,6 +3022,11 @@ async function eventToNotification(type, props) {
       }
 
       if (partType === 'reasoning') {
+        if (showThinking && delta) {
+          if (pendingReplyText.length < MAX_ACCUMULATED_TEXT || quotaMode === 'continue') {
+            pendingReplyText += delta;
+          }
+        }
         if (reasonTime.start && !processingNotified) {
           processingNotified = true;
           if (lastPromptSid) { reply(lastPromptSid, '🤔 AI正在处理...', currentTextMessageId); flushToWeChat(); }
