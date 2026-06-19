@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execSync, exec } from 'node:child_process';
 import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
+import { resolveFilterLevel, resolveQuotaMode, parseWorkspaceArg, getAllQuestions as getAllQuestionsPure, normalizeDir, formatToolInput, formatDuration, FILTER_LEVELS, QUOTA_MODES, levelIcon, levelDesc, levelLabel, quotaModeLabel, summarizeText, makeWsName, splitContinuationMessages, formatReply, formatQuestionBody, MAX_REPLY_LENGTH } from './src/utils.js';
 
 const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
 const AUTH = 'Basic ' + Buffer.from(process.env.OPENCODE_AUTH || 'opencode:opencode').toString('base64');
@@ -28,10 +29,6 @@ let currentAgent = 'build';
 let filterLevel = 'pad';
 let quotaMode = 'truncate'; // truncate | notify | continue
 let showThinking = true; // /thinking toggle: filter reasoning blocks from output
-const FILTER_LEVELS = ['full', 'pad', 'phone'];
-const QUOTA_MODES = ['truncate', 'notify', 'continue'];
-const QUOTA_ALIASES = { t: 'truncate', trunc: 'truncate', n: 'notify', notif: 'notify', c: 'continue', cont: 'continue' };
-const FILTER_ALIASES = { f: 'full', p: 'pad', pd: 'pad', ph: 'phone' };
 const FILTER_FILE = join(WORK_DIR, '.wechat-filter.json');
 function loadFilterLevel() {
   try {
@@ -628,10 +625,9 @@ async function handleFilterLevel(sid, arg, msgId) {
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
-  const level = arg.trim().toLowerCase();
-  const resolved = FILTER_ALIASES[level] || level;
-  if (!FILTER_LEVELS.includes(resolved)) {
-    reply(sid, `⚠️ 无效级别: ${level}，可选: ${FILTER_LEVELS.join(', ')}, 别名: f, p/pd, ph`);
+  const resolved = resolveFilterLevel(arg);
+  if (!resolved) {
+    reply(sid, `⚠️ 无效级别: ${arg.trim()}，可选: ${FILTER_LEVELS.join(', ')}, 别名: f, p/pd, ph`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
@@ -648,27 +644,6 @@ async function setFilterLevel(sid, level, msgId) {
   reply(sid, msg);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
 }
-
-function levelIcon(lv) {
-  return { full: '📡', pad: '📱', phone: '📟' }[lv] || '🔍';
-}
-function levelDesc(lv) {
-  return {
-    full: '实时流式输出 ⚠️ 高频推送触发限流时后半段静默丢失，不推荐日常使用',
-    pad: '处理中显示等待提示，仅发送 AI 文本回复',
-    phone: '极简模式，仅显示 AI 文本回复和 🤔 处理提示',
-  }[lv] || '';
-}
-function levelLabel(lv) {
-  return { full: '📡 FULL 完整模式', pad: '📱 PAD 标准模式', phone: '📟 PHONE 极简模式' }[lv] || lv;
-}
-
-const QUOTA_LABELS = {
-  truncate: '🔇 静默截断 — 超限部分直接丢弃，不通知用户',
-  notify: '🔔 截断通知 — 超限时通知用户回复被截断',
-  continue: '📬 继续模式 — 保存超限文本，发 /g 自动续发',
-};
-function quotaModeLabel(m) { return QUOTA_LABELS[m] || m; }
 
 async function handleQuotaMode(sid, arg, msgId) {
   if (!arg) {
@@ -691,10 +666,9 @@ async function handleQuotaMode(sid, arg, msgId) {
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
-  const mode = arg.trim().toLowerCase();
-  const resolved = QUOTA_ALIASES[mode] || mode;
-  if (!QUOTA_MODES.includes(resolved)) {
-    reply(sid, `⚠️ 无效策略: ${mode}，可选: ${QUOTA_MODES.join(', ')}, 别名: t/trunc, n/notif, c/cont`);
+  const resolved = resolveQuotaMode(arg);
+  if (!resolved) {
+    reply(sid, `⚠️ 无效策略: ${arg.trim()}，可选: ${QUOTA_MODES.join(', ')}, 别名: t/trunc, n/notif, c/cont`);
     flushToWeChat(sid);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
@@ -704,11 +678,6 @@ async function handleQuotaMode(sid, arg, msgId) {
   reply(sid, `✅ 已切换超长回复策略: ${resolved}`);
   flushToWeChat(sid);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
-}
-
-function summarizeText(text, maxLen) {
-  if (!text || text.length <= maxLen) return text;
-  return text.slice(0, maxLen) + `\n…（共${text.length}字符，截断显示）`;
 }
 
 async function listPermissions(sid, msgId) {
@@ -874,10 +843,16 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
-  const addMatch = arg.match(/^add\s+(.+?)(?:\s+(\S+))?$/i);
-  if (addMatch) {
-    let dirPath = addMatch[1].trim();
-    let name = addMatch[2]?.trim() || basename(dirPath);
+  const parsed = parseWorkspaceArg(arg);
+  if (!parsed) {
+    reply(sid, `⚠️ 请输入 1-${list.length} 之间的编号，或使用 /ws add / /ws del`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  if (parsed.action === 'add') {
+    let dirPath = parsed.dirPath;
+    let name = parsed.name || basename(dirPath);
     if (!dirPath || /[\x00-\x1f]/.test(dirPath)) {
       reply(sid, '⚠️ 路径无效（包含非法字符）');
       sendResponse(msgId, { stopReason: 'end_turn' });
@@ -896,11 +871,10 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
-  const delMatch = arg.match(/^del(?:ete)?\s+(\d+)$/i);
-  if (delMatch) {
-    const idx = parseInt(delMatch[1], 10) - 1;
+  if (parsed.action === 'del') {
+    const idx = parsed.index;
     if (idx < 0 || idx >= list.length) {
-      reply(sid, `⚠️ 编号 ${delMatch[1]} 超出范围 (1-${list.length})`);
+      reply(sid, `⚠️ 编号超出范围 (1-${list.length})`);
       sendResponse(msgId, { stopReason: 'end_turn' });
       return;
     }
@@ -915,8 +889,8 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
-  const num = parseInt(arg, 10);
-  if (isNaN(num) || num < 1 || num > list.length) {
+  // switch
+  if (parsed.index < 0 || parsed.index >= list.length) {
     reply(sid, `⚠️ 请输入 1-${list.length} 之间的编号，或使用 /ws add / /ws del`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
@@ -935,7 +909,7 @@ async function handleWorkspace(sid, arg, msgId) {
   fullQuotaUsed = 0;
   pendingContinuation = null;
   if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
-  currentWorkspace = list[num - 1];
+  currentWorkspace = list[parsed.index];
   saveCurrentWorkspace();
   restartSSE();
   reply(sid, `✅ 已切换到工作区「${currentWorkspace.name}」\n${currentWorkspace.path}\n使用 /new <会话名> 在该工作区创建会话`);
@@ -1097,15 +1071,6 @@ async function handleSyncDir(sid, msgId) {
   }
 }
 
-function makeWsName(dirPath, existing) {
-  let name = basename(dirPath);
-  if (existing.some(w => w.name === name)) {
-    const parts = dirPath.replace(/[\\/]+/g, '/').replace(/\/$/, '').split('/');
-    name = parts.length >= 2 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : name;
-  }
-  return name;
-}
-
 async function showTaskStatus(sid, msgId) {
   try {
     const { data: statusMap } = await sdkClient.session.status();
@@ -1163,14 +1128,6 @@ async function handleContinue(sid, msgId) {
     flushToWeChat(sid);
   }
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
-}
-
-function splitContinuationMessages(text, sid) {
-  const messages = [];
-  for (let i = 0; i < text.length; i += MAX_REPLY_LENGTH) {
-    messages.push(text.slice(i, i + MAX_REPLY_LENGTH));
-  }
-  return { sid, messages, total: messages.length };
 }
 
 async function handleClearContinue(sid, msgId) {
@@ -1421,10 +1378,7 @@ async function testNotify(sid, msgId) {
 /* ───────── Question/Answer Handling ───────── */
 
 function getAllQuestions() {
-  const all = [];
-  if (pendingQuestions) all.push(pendingQuestions);
-  for (const q of pendingQuestionQueue) all.push(q);
-  return all;
+  return getAllQuestionsPure(pendingQuestions, pendingQuestionQueue);
 }
 
 async function listQuestions(sid, msgId) {
@@ -1462,33 +1416,6 @@ async function listQuestions(sid, msgId) {
   lines.push('/skip (/pass, /ps) [编号]     跳过指定问题');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
-}
-
-function formatQuestionBody(questions) {
-  if (!questions?.length) return '';
-  const multi = questions.length > 1;
-  let body = '';
-  if (multi) {
-    questions.forEach((qItem, idx) => {
-      const qText = qItem.question || '';
-      body += `\n\n${idx+1}. ${qText}`;
-      if (qItem.options?.length) {
-        body += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
-      }
-    });
-    body += '\n\n多个答案用逗号分隔，如：1, 2';
-  } else {
-    const qi = questions[0];
-    const q = qi.question || '';
-    const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
-    body += `\n${q}`;
-    if (opts) body += `\n${opts}`;
-    if (qi.isSecret) body += '\n🔒 答案将保密发送';
-    body += '\n回复内容，或 /ans (/answer) <内容> 提交';
-    if (opts) body += '，或发送编号选择';
-  }
-  body += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
-  return body;
 }
 
 async function listCurrentQuestion(sid, msgId) {
@@ -1992,9 +1919,9 @@ async function forwardToAIAsync(sid, targetId, text) {
     }
     // Send session completion notification immediately
     if (!idleNotified.has(targetId)) {
+      idleNotified.add(targetId);
       await fetchSessionName(targetId);
       const compName = getSessionName(targetId);
-      idleNotified.add(targetId);
       const sendSid = lastPromptSid || sid;
       if (sendSid) {
         reply(sendSid, `✅ ${compName} · 完成`);
@@ -2054,15 +1981,6 @@ async function forwardToAIAsync(sid, targetId, text) {
     flushToWeChat();
     fullQuotaUsed = 0;
   }
-}
-
-function formatReply(data) {
-  const parts = data?.parts || [];
-  if (!parts.length) return '🤖 （无文本响应）';
-
-  const texts = parts.filter(p => p.type === 'text' && p.text).map(p => p.text);
-  const mainText = texts.join('\n').trim();
-  return mainText ? `🤖 ${mainText}` : '🤖 （完成）';
 }
 
 /* ───────── ACP Handlers ───────── */
@@ -2238,8 +2156,6 @@ async function handleAutoClean(sid, arg, msgId) {
 }
 
 /* ───────── I/O Helpers ───────── */
-
-const MAX_REPLY_LENGTH = 4000;
 
 function reply(sid, text, msgId) {
   if (!sid) { log(`[REPLY] SKIP: null sid`); return; }
@@ -2471,22 +2387,6 @@ function realtimeReply(sid, text) {
   reply(sid, text, currentTextMessageId);
 }
 
-function formatToolInput(input) {
-  if (!input) return '';
-  if (typeof input === 'string') return input.slice(0, 60);
-  if (typeof input === 'object') {
-    const v = Object.values(input).find(v => typeof v === 'string');
-    return v ? v.slice(0, 60) : Object.keys(input)[0] || '';
-  }
-  return '';
-}
-
-function formatDuration(startTime) {
-  if (!startTime) return '';
-  const dur = ((Date.now() - startTime) / 1000).toFixed(1);
-  return `${dur}s`;
-}
-
 function clearToolStates() {
   toolStates.clear();
 }
@@ -2507,12 +2407,12 @@ function getSessionName(id) {
 async function idleNotification(props, sendSid) {
   const sid = props.sessionID;
   if (!sid || idleNotified.has(sid)) return null;
+  idleNotified.add(sid);
   await fetchSessionName(sid);
   const name = getSessionName(sid);
   const text = `✅ ${name} · 完成`;
   const target = sendSid || lastPromptSid;
   if (!target) return null;
-  idleNotified.add(sid);
   log(`[IDLE] immediate completion sid=${sid.slice(0,12)} via target=${target.slice(0,12)}: "${text}"`);
   reply(target, text);
   sendNotification('session/update', {
@@ -2547,11 +2447,16 @@ async function handleSseSideEffect(type, props) {
       }
       return;
     }
+    case 'session.busy':
+    case 'session.status': {
+      const st = props.status || {};
+      if (type === 'session.busy' || st.type === 'busy') {
+        idleNotified.delete(props.sessionID);
+        updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now(), retryCount: 0 });
+      }
+      return;
+    }
   }
-}
-
-function normalizeDir(p) {
-  return p.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
 }
 
 // Map events to short, readable notifications. Return null to skip.
@@ -2865,11 +2770,6 @@ async function eventToNotification(type, props) {
         const sid = props.sessionID;
         const state = updateSessionState(sid, { retryCount: (sessionStates.get(sid)?.retryCount || 0) + 1 });
         if (state.retryCount >= 3) return `🔄 AI重试${state.retryCount}次未恢复`;
-        return null;
-      }
-      if (st.type === 'busy') {
-        idleNotified.delete(props.sessionID);
-        updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now(), retryCount: 0 });
         return null;
       }
       return null;
@@ -3280,7 +3180,8 @@ function startWatchdog() {
       }
       const staleCutoff = now - 30 * 60 * 1000;
       for (const [id, state] of sessionStates.entries()) {
-        if (state.lastActivity && state.lastActivity < staleCutoff) {
+        const lastAct = state.lastActivity || state.busySince || 0;
+        if (lastAct > 0 && lastAct < staleCutoff) {
           sessionStates.delete(id);
           sessionNames.delete(id);
           idleNotified.delete(id);

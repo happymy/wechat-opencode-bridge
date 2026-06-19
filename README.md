@@ -15,7 +15,8 @@
 
 | 标签 | 提交 | 说明 |
 |------|------|------|
-| `v1.2.0` | `9d158f9` | 最新 |
+| `v1.2.1` | `dea3032` | 最新 — 测试体系、纯函数提取 |
+| `v1.2.0` | `e538f76` | OpenCode 1.17.8 |
 | `v1.1.0` | `ae90f94` | |
 | `v.1.0.5` | `d84469e` | |
 | `v1.0.4` | `6f7cfd5` | |
@@ -23,7 +24,7 @@
 | `v1.0.2` | `8b5937b` | |
 | `v1.0.1` | | 初版 |
 
-> 当前同步标签：**<!-- UPSTREAM_TAG -->@<!-- /UPSTREAM_TAG -->**（请在同步时更新此处）
+> 当前同步标签：**v1.2.1**
 
 ### 同步策略
 从上游同步时，根据文件类型采用不同策略：
@@ -34,8 +35,10 @@
 | **🟡 选择性更新** | `wechat-bridge.bat` `restart-wechat.bat` `restart-wechat-monitor.bat` `.tool-versions.json` | 差异较小时可直接覆盖 |
 | **🔵 已引入** | `ilink-monitor-hook.js` `test-iLink-rate-limit.js` `del.py` `run_del_nul.bat` | 调试用工具文件，按需同步 |
 | **🟢 直接覆盖** | `docs/*` `LICENSE` `README.md` | 上游更新可安全覆盖后重新适配 |
+| **🟢 直接覆盖** | `src/utils.js` `tests/` `vitest.config.js` | 测试框架与纯函数工具库 |
+| **🟢 直接覆盖** | `package.json` `package-lock.json` | 依赖管理，含 vitest 测试框架 |
 | **⚪ 忽略** | `.gitattributes` `plan/` `.gitignore` `.wechat-*` | 仅本仓库存在，不受同步影响 |
-| **⚪ 未引入** | `setup.bat` `start-all.bat` `stop-all.bat` `web.bat` `package.json` `package-lock.json` | 上游特有文件，本仓库不使用 |
+| **⚪ 未引入** | `setup.bat` `start-all.bat` `stop-all.bat` `web.bat` | 上游特有文件，本仓库不使用 |
 
 ### 同步步骤
 
@@ -45,17 +48,17 @@ git remote add upstream https://github.com/happymy/opencode-quickstart-workspace
 
 # 拉取上游指定标签
 git fetch upstream --tags
-git checkout v1.2.0  # 替换为要同步的标签
+git checkout v1.2.1  # 替换为要同步的标签
 
 # 按策略选择性合并
 # 🟢 直接覆盖
-git checkout v1.2.0 -- docs/ LICENSE
+git checkout v1.2.1 -- docs/ LICENSE src/utils.js tests/ vitest.config.js package.json
 # 🟡 选择性更新
-git checkout v1.2.0 -- wechat-bridge.bat restart-wechat.bat .tool-versions.json
+git checkout v1.2.1 -- wechat-bridge.bat restart-wechat.bat .tool-versions.json
 # 🔵 调试工具
-git checkout v1.2.0 -- ilink-monitor-hook.js test-iLink-rate-limit.js del.py run_del_nul.bat restart-wechat-monitor.bat
+git checkout v1.2.1 -- ilink-monitor-hook.js test-iLink-rate-limit.js del.py run_del_nul.bat restart-wechat-monitor.bat
 # 🔴 手动合并 wechat-adapter.js
-git diff v1.2.0 -- wechat-adapter.js | more
+git diff v1.2.0 v1.2.1 -- wechat-adapter.js | more
 ```
 
 ---
@@ -201,6 +204,39 @@ SSE 事件实时推送至微信：
 | `.wechat-settings.json` | 全局设置 |
 | `.wechat-filter.json` | 过滤级别持久化 |
 | `.wechat-adapter.log` | 运行时日志 |
+
+---
+
+## 测试
+
+项目采用 [Vitest](https://vitest.dev) 测试框架，覆盖 `src/utils.js` 的纯函数。
+
+```bash
+# 运行全部测试
+npm test
+
+# 监听模式
+npm run test:watch
+
+# 覆盖率报告
+npm run test:coverage
+```
+
+测试目录结构：
+
+```
+tests/
+├── setup.js                    # 全局 mock
+├── unit/utils/
+│   ├── helpers.test.js         # 核心函数测试（resolveFilterLevel, formatReply 等）
+│   ├── edge-cases.test.js      # null/undefined 边界值测试
+│   ├── question.test.js        # formatQuestionBody 测试
+│   └── notification.test.js    # 通知消息格式测试
+└── integration/
+    └── event-format.test.js    # eventToNotification 集成测试
+```
+
+`wechat-adapter.js` 涉及 ACP 协议交互和副作用，采用集成测试方式验证。
 
 ---
 
