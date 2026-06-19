@@ -1990,9 +1990,9 @@ async function forwardToAIAsync(sid, targetId, text) {
     }
     // Send session completion notification immediately
     if (!idleNotified.has(targetId)) {
+      idleNotified.add(targetId);
       await fetchSessionName(targetId);
       const compName = getSessionName(targetId);
-      idleNotified.add(targetId);
       const sendSid = lastPromptSid || sid;
       if (sendSid) {
         reply(sendSid, `✅ ${compName} · 完成`);
@@ -2505,12 +2505,12 @@ function getSessionName(id) {
 async function idleNotification(props, sendSid) {
   const sid = props.sessionID;
   if (!sid || idleNotified.has(sid)) return null;
+  idleNotified.add(sid);
   await fetchSessionName(sid);
   const name = getSessionName(sid);
   const text = `✅ ${name} · 完成`;
   const target = sendSid || lastPromptSid;
   if (!target) return null;
-  idleNotified.add(sid);
   log(`[IDLE] immediate completion sid=${sid.slice(0,12)} via target=${target.slice(0,12)}: "${text}"`);
   reply(target, text);
   sendNotification('session/update', {
