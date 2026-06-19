@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execSync, exec } from 'node:child_process';
 import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
-import { resolveFilterLevel, resolveQuotaMode, parseWorkspaceArg, parseSessionIndex, getAllQuestions as getAllQuestionsPure, FILTER_LEVELS, QUOTA_MODES, QUOTA_ALIASES, FILTER_ALIASES } from './src/utils.js';
+import { resolveFilterLevel, resolveQuotaMode, parseWorkspaceArg, parseSessionIndex, getAllQuestions as getAllQuestionsPure, normalizeDir, formatToolInput, formatDuration, FILTER_LEVELS, QUOTA_MODES, QUOTA_ALIASES, FILTER_ALIASES } from './src/utils.js';
 
 const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
 const AUTH = 'Basic ' + Buffer.from(process.env.OPENCODE_AUTH || 'opencode:opencode').toString('base64');
@@ -2469,22 +2469,6 @@ function realtimeReply(sid, text) {
   reply(sid, text, currentTextMessageId);
 }
 
-function formatToolInput(input) {
-  if (!input) return '';
-  if (typeof input === 'string') return input.slice(0, 60);
-  if (typeof input === 'object') {
-    const v = Object.values(input).find(v => typeof v === 'string');
-    return v ? v.slice(0, 60) : Object.keys(input)[0] || '';
-  }
-  return '';
-}
-
-function formatDuration(startTime) {
-  if (!startTime) return '';
-  const dur = ((Date.now() - startTime) / 1000).toFixed(1);
-  return `${dur}s`;
-}
-
 function clearToolStates() {
   toolStates.clear();
 }
@@ -2545,11 +2529,16 @@ async function handleSseSideEffect(type, props) {
       }
       return;
     }
+    case 'session.busy':
+    case 'session.status': {
+      const st = props.status || {};
+      if (type === 'session.busy' || st.type === 'busy') {
+        idleNotified.delete(props.sessionID);
+        updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now(), retryCount: 0 });
+      }
+      return;
+    }
   }
-}
-
-function normalizeDir(p) {
-  return p.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
 }
 
 // Map events to short, readable notifications. Return null to skip.
@@ -2863,11 +2852,6 @@ async function eventToNotification(type, props) {
         const sid = props.sessionID;
         const state = updateSessionState(sid, { retryCount: (sessionStates.get(sid)?.retryCount || 0) + 1 });
         if (state.retryCount >= 3) return `🔄 AI重试${state.retryCount}次未恢复`;
-        return null;
-      }
-      if (st.type === 'busy') {
-        idleNotified.delete(props.sessionID);
-        updateSessionState(props.sessionID, { busySince: Date.now(), lastActivity: Date.now(), retryCount: 0 });
         return null;
       }
       return null;
@@ -3278,7 +3262,8 @@ function startWatchdog() {
       }
       const staleCutoff = now - 30 * 60 * 1000;
       for (const [id, state] of sessionStates.entries()) {
-        if (state.lastActivity && state.lastActivity < staleCutoff) {
+        const lastAct = state.lastActivity || state.busySince || 0;
+        if (lastAct > 0 && lastAct < staleCutoff) {
           sessionStates.delete(id);
           sessionNames.delete(id);
           idleNotified.delete(id);
