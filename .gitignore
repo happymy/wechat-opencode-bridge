@@ -6,6 +6,7 @@ node_modules/
 
 # Test artifacts
 .playwright-mcp/
+coverage/
 
 # Databases
 *.db
