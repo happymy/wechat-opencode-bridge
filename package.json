@@ -3,5 +3,14 @@
   "dependencies": {
     "@opencode-ai/sdk": "^1.17.8",
     "wechat-acp": "^0.8.0"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.9",
+    "vitest": "^4.1.9"
   }
 }

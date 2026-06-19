@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execSync, exec } from 'node:child_process';
 import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
+import { resolveFilterLevel, resolveQuotaMode, parseWorkspaceArg, parseSessionIndex, getAllQuestions as getAllQuestionsPure, FILTER_LEVELS, QUOTA_MODES, QUOTA_ALIASES, FILTER_ALIASES } from './src/utils.js';
 
 const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
 const AUTH = 'Basic ' + Buffer.from(process.env.OPENCODE_AUTH || 'opencode:opencode').toString('base64');
@@ -28,10 +29,7 @@ let currentAgent = 'build';
 let filterLevel = 'pad';
 let quotaMode = 'truncate'; // truncate | notify | continue
 let showThinking = true; // /thinking toggle: filter reasoning blocks from output
-const FILTER_LEVELS = ['full', 'pad', 'phone'];
-const QUOTA_MODES = ['truncate', 'notify', 'continue'];
-const QUOTA_ALIASES = { t: 'truncate', trunc: 'truncate', n: 'notify', notif: 'notify', c: 'continue', cont: 'continue' };
-const FILTER_ALIASES = { f: 'full', p: 'pad', pd: 'pad', ph: 'phone' };
+
 const FILTER_FILE = join(WORK_DIR, '.wechat-filter.json');
 function loadFilterLevel() {
   try {
@@ -628,10 +626,9 @@ async function handleFilterLevel(sid, arg, msgId) {
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
-  const level = arg.trim().toLowerCase();
-  const resolved = FILTER_ALIASES[level] || level;
-  if (!FILTER_LEVELS.includes(resolved)) {
-    reply(sid, `⚠️ 无效级别: ${level}，可选: ${FILTER_LEVELS.join(', ')}, 别名: f, p/pd, ph`);
+  const resolved = resolveFilterLevel(arg);
+  if (!resolved) {
+    reply(sid, `⚠️ 无效级别: ${arg.trim()}，可选: ${FILTER_LEVELS.join(', ')}, 别名: f, p/pd, ph`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
@@ -691,10 +688,9 @@ async function handleQuotaMode(sid, arg, msgId) {
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
   }
-  const mode = arg.trim().toLowerCase();
-  const resolved = QUOTA_ALIASES[mode] || mode;
-  if (!QUOTA_MODES.includes(resolved)) {
-    reply(sid, `⚠️ 无效策略: ${mode}，可选: ${QUOTA_MODES.join(', ')}, 别名: t/trunc, n/notif, c/cont`);
+  const resolved = resolveQuotaMode(arg);
+  if (!resolved) {
+    reply(sid, `⚠️ 无效策略: ${arg.trim()}，可选: ${QUOTA_MODES.join(', ')}, 别名: t/trunc, n/notif, c/cont`);
     flushToWeChat(sid);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
@@ -874,10 +870,16 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
-  const addMatch = arg.match(/^add\s+(.+?)(?:\s+(\S+))?$/i);
-  if (addMatch) {
-    let dirPath = addMatch[1].trim();
-    let name = addMatch[2]?.trim() || basename(dirPath);
+  const parsed = parseWorkspaceArg(arg);
+  if (!parsed) {
+    reply(sid, `⚠️ 请输入 1-${list.length} 之间的编号，或使用 /ws add / /ws del`);
+    sendResponse(msgId, { stopReason: 'end_turn' });
+    return;
+  }
+
+  if (parsed.action === 'add') {
+    let dirPath = parsed.dirPath;
+    let name = parsed.name || basename(dirPath);
     if (!dirPath || /[\x00-\x1f]/.test(dirPath)) {
       reply(sid, '⚠️ 路径无效（包含非法字符）');
       sendResponse(msgId, { stopReason: 'end_turn' });
@@ -896,11 +898,10 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
-  const delMatch = arg.match(/^del(?:ete)?\s+(\d+)$/i);
-  if (delMatch) {
-    const idx = parseInt(delMatch[1], 10) - 1;
+  if (parsed.action === 'del') {
+    const idx = parsed.index;
     if (idx < 0 || idx >= list.length) {
-      reply(sid, `⚠️ 编号 ${delMatch[1]} 超出范围 (1-${list.length})`);
+      reply(sid, `⚠️ 编号超出范围 (1-${list.length})`);
       sendResponse(msgId, { stopReason: 'end_turn' });
       return;
     }
@@ -915,8 +916,8 @@ async function handleWorkspace(sid, arg, msgId) {
     return;
   }
 
-  const num = parseInt(arg, 10);
-  if (isNaN(num) || num < 1 || num > list.length) {
+  // switch
+  if (parsed.index < 0 || parsed.index >= list.length) {
     reply(sid, `⚠️ 请输入 1-${list.length} 之间的编号，或使用 /ws add / /ws del`);
     sendResponse(msgId, { stopReason: 'end_turn' });
     return;
@@ -935,7 +936,7 @@ async function handleWorkspace(sid, arg, msgId) {
   fullQuotaUsed = 0;
   pendingContinuation = null;
   if (realtimeFlushTimer) { clearTimeout(realtimeFlushTimer); realtimeFlushTimer = null; }
-  currentWorkspace = list[num - 1];
+  currentWorkspace = list[parsed.index];
   saveCurrentWorkspace();
   restartSSE();
   reply(sid, `✅ 已切换到工作区「${currentWorkspace.name}」\n${currentWorkspace.path}\n使用 /new <会话名> 在该工作区创建会话`);
@@ -1421,10 +1422,7 @@ async function testNotify(sid, msgId) {
 /* ───────── Question/Answer Handling ───────── */
 
 function getAllQuestions() {
-  const all = [];
-  if (pendingQuestions) all.push(pendingQuestions);
-  for (const q of pendingQuestionQueue) all.push(q);
-  return all;
+  return getAllQuestionsPure(pendingQuestions, pendingQuestionQueue);
 }
 
 async function listQuestions(sid, msgId) {
