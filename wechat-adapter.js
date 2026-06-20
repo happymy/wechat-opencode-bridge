@@ -85,7 +85,7 @@ let idleHandled = false; // 防止 session.idle 和 session.status.idle 双重�
 const FULL_QUOTA_LIMIT = 4;     // 每 context_token 最多 5 次，预留 1 次给结束 flush
 const MAX_REALTIME_BUFFER = 3000; // FULL 模式实时缓冲上限，确保 end-of-turn 最多 1 段 (TEXT_CHUNK_LIMIT=4000)
 const MIN_CONTINUATION_LENGTH = 10; // 续存文本最小长度，低于此值跳过续存直接截断
-let sseReadTimer = null;       // SSE 读取超时定时器
+
 let sseConnectionActive = false; // SSE 连接活跃标记
 let sseRestarting = false;       // 防止并发重启 SSE
 
@@ -2201,7 +2201,7 @@ let perUserRecent = new Map(); // sid → { text → timestamp }
 let proactiveTimer = null;
 let recentEventIds = new Set(); // event ID → timestamp, dedup within 10s
 let lastNotifyPerSid = new Map(); // sid → timestamp, notification rate limiting
-let sseReader = null;          // current SSE reader (for restart on workspace change)
+let sseStream = null;          // current SSE stream (for restart on workspace change)
 
 const DEDUP_WINDOW = 30000;
 const PER_USER_DEDUP_WINDOW = 30000;
@@ -2973,9 +2973,9 @@ async function fetchSessionName(id) {
 
 function restartSSE() {
   log('[SSE] Restart requested');
-  if (sseReader) {
-    try { sseReader.cancel(); } catch (e) { log(`[SSE] cancel error: ${e.message}`); }
-    sseReader = null;
+  if (sseStream) {
+    try { sseStream.return(); } catch (e) { log(`[SSE] cancel error: ${e.message}`); }
+    sseStream = null;
   }
 }
 
@@ -2994,131 +2994,67 @@ async function connectSSE() {
     try {
       sseRestarting = true;
       log(`[SSE] Connecting... (retryDelay=${retryDelay}ms)`);
-      const eventUrl = `${SERVER}/global/event?directory=${encodeURIComponent(getWorkspaceDir())}`;
-      log(`[SSE] URL: ${eventUrl}`);
-      const abortControl = new AbortController();
-      const connTimer = setTimeout(() => abortControl.abort(), 15000);
-      let response;
+      const dir = getWorkspaceDir();
+      const connController = new AbortController();
+      const connTimer = setTimeout(() => connController.abort(), 15000);
+      let sseResult;
       try {
-        response = await fetch(eventUrl, {
-          headers: { Authorization: AUTH, 'x-opencode-directory': getWorkspaceDir() },
-          signal: abortControl.signal,
-        });
+        sseResult = await sdkClient.event.subscribe({
+          directory: dir,
+        }, { signal: connController.signal });
       } finally {
         clearTimeout(connTimer);
       }
-      if (!response.ok) throw new Error(`SSE ${response.status}`);
-      if (!response.body) throw new Error('SSE body is null');
-      sseReader = null;
+      sseStream = sseResult.stream;
       retryDelay = 1000;
       log('[SSE] Connected successfully');
       syncPendingFromServer().catch(e => log(`[SYNC] reconnect sync error: ${e.message}`));
 
-      const reader = response.body.getReader();
-      sseReader = reader;
-      sseConnectionActive = true;
-      const decoder = new TextDecoder();
-      let buf = '';
-      let currentEvent = '';
-      let currentData = '';
-
-      while (true) {
-        // SSE 读取超时：5 分钟无数据则关闭重连（防止半开连接无限挂起）
-        let sseTimedOut = false;
-        sseReadTimer = setTimeout(() => {
-          sseTimedOut = true;
-          log(`[SSE] Read timeout (5min no data), aborting connection...`);
-          sseConnectionActive = false;
-          reader.cancel().catch(() => {});
-        }, 300000);
-        sseReadTimer.unref?.();
-
-        let readResult;
-        try {
-          readResult = await reader.read();
-        } finally {
-          if (sseReadTimer) { clearTimeout(sseReadTimer); sseReadTimer = null; }
-        }
-        if (sseTimedOut) {
-          log(`[SSE] timeout triggered before read completed, breaking`);
-          sseConnectionActive = false;
-          break;
-        }
-        const { done, value } = readResult;
-        if (done) break;
+      for await (const eventObj of sseStream) {
         sseConnectionActive = true;
 
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split('\n');
-        buf = lines.pop() || '';
+        const eventType = eventObj.type;
+        const eventId = eventObj.id;
+        const props = eventObj.properties || {};
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed === '') {
-            if (currentData) {
-              const rawBrief = currentData.slice(0, 400);
-              log(`[SSE] raw data: ${rawBrief}`);
-              try {
-                const parsed = JSON.parse(currentData);
-                const payload = parsed.payload || parsed;
-                const eventType = payload.type || currentEvent;
-                const eventId = payload.id;
-                const props = payload.properties || {};
+        const dedupKey = eventId ? `${eventType}:${eventId}` : null;
+        if (dedupKey && recentEventIds.has(dedupKey)) {
+          log(`[SSE] EVENT DEDUP skip: ${eventType} id=${eventId.slice(0,24)}`);
+          continue;
+        }
+        if (dedupKey) {
+          recentEventIds.add(dedupKey);
+          setTimeout(() => recentEventIds.delete(dedupKey), 10000).unref?.();
+        }
 
-                // Event-level dedup: combine event type + id to avoid cross-event collisions
-                const dedupKey = eventId ? `${eventType}:${eventId}` : null;
-                if (dedupKey && recentEventIds.has(dedupKey)) {
-                  log(`[SSE] EVENT DEDUP skip: ${eventType} id=${eventId.slice(0,24)}`);
-                  currentEvent = '';
-                  currentData = '';
-                  continue;
-                }
-                if (dedupKey) {
-                  recentEventIds.add(dedupKey);
-                  setTimeout(() => recentEventIds.delete(dedupKey), 10000).unref?.();
-                }
+        if (props.id) props.requestID ??= props.id;
+        if (eventId && !props.requestID) props.requestID ??= eventId;
+        log(`[SSE] parsed: event=${eventType} sessionID=${props.sessionID || '?'} id=${props.id || eventId || '-'}`);
+        if (eventType.startsWith('permission') || eventType.startsWith('question') || eventType === 'session.idle' || eventType === 'session.error' || eventType === 'session.status') {
+          log(`[SSE] ** ${eventType} props keys=[${Object.keys(props).join(',')}]`);
+        }
+        if (eventType === 'permission.asked' || eventType === 'permission.replied') {
+          log(`[SSE]    requestID=${props.requestID || '?'} permission=${props.permission || props.action || '?'}`);
+        }
+        await handleSseSideEffect(eventType, props).catch(e => log(`[SSE] side-effect error: ${e.message}`));
 
-                if (props.id) props.requestID ??= props.id;
-                if (payload.id && !props.requestID) props.requestID ??= payload.id;
-                log(`[SSE] parsed: event=${eventType} sessionID=${props.sessionID || '?'} id=${props.id || payload.id || '-'}`);
-                if (eventType.startsWith('permission') || eventType.startsWith('question') || eventType === 'session.idle' || eventType === 'session.error' || eventType === 'session.status') {
-                  log(`[SSE] ** ${eventType} props keys=[${Object.keys(props).join(',')}]`);
-                }
-                if (eventType === 'permission.asked' || eventType === 'permission.replied') {
-                  log(`[SSE]    requestID=${props.requestID || '?'} permission=${props.permission || props.action || '?'}`);
-                }
-                // Handle session tracking side-effects before notification
-                await handleSseSideEffect(eventType, props).catch(e => log(`[SSE] side-effect error: ${e.message}`));
-
-                try {
-                  const text = await eventToNotification(eventType, props);
-                  if (text) {
-                    log(`[SSE] notification generated: ${text.slice(0, 80).replace(/\n/g,'\\n')}`);
-                    broadcastNotification(text);
-                  } else {
-                    log(`[SSE] eventToNotification returned null (suppressed)`);
-                  }
-                } catch (e) {
-                  log(`[SSE] eventToNotification error: ${e.message}`);
-                }
-              } catch (e) {
-                log(`[SSE] Parse error: ${e.message}`);
-              }
-            }
-            currentEvent = '';
-            currentData = '';
-          } else if (trimmed.startsWith('event:')) {
-            currentEvent = trimmed.slice(6).trim();
-          } else if (trimmed.startsWith('data:')) {
-            currentData += trimmed.slice(5).replace(/^ /, '') + '\n';
+        try {
+          const text = await eventToNotification(eventType, props);
+          if (text) {
+            log(`[SSE] notification generated: ${text.slice(0, 80).replace(/\n/g,'\\n')}`);
+            broadcastNotification(text);
+          } else {
+            log(`[SSE] eventToNotification returned null (suppressed)`);
           }
+        } catch (e) {
+          log(`[SSE] eventToNotification error: ${e.message}`);
         }
       }
       log('[SSE] Stream ended, reconnecting...');
     } catch (err) {
       log(`[SSE] Error: ${err.message}, retry in ${retryDelay}ms`);
     } finally {
-      sseReader = null;
+      sseStream = null;
       sseConnectionActive = false;
       sseRestarting = false;
     }
@@ -3144,7 +3080,7 @@ function startWatchdog() {
       const now = Date.now();
 
       // SSE 连接健康检查 + 自动重连
-      if (!sseConnectionActive && sseReader === null) {
+      if (!sseConnectionActive && !sseStream) {
         if (now - lastSseHealthWarn > 60000) {
           lastSseHealthWarn = now;
           if (!sseRestarting) {
