@@ -15,7 +15,9 @@
 
 | 标签 | 提交 | 说明 |
 |------|------|------|
-| `v1.2.3` | `cf81ec0` | 最新 — SSE 改用 SDK event.subscribe |
+| `v1.2.5` | `4becd33` | 最新 — Docker 部署支持 |
+| `v1.2.4` | `95847db` | CI/CD badge 和工作流说明 |
+| `v1.2.3` | `cf81ec0` | SSE 改用 SDK event.subscribe |
 | `v1.2.2` | `64a06e5` | SSE 改用 SDK event.subscribe |
 | `v1.2.1` | `dea3032` | 测试体系、纯函数提取 |
 | `v1.2.0` | `e538f76` | OpenCode 1.17.8 |
@@ -26,7 +28,7 @@
 | `v1.0.2` | `8b5937b` | |
 | `v1.0.1` | | 初版 |
 
-> 当前同步标签：**v1.2.3**
+> 当前同步标签：**v1.2.5**
 
 ### 同步策略
 从上游同步时，根据文件类型采用不同策略：
@@ -239,6 +241,19 @@ tests/
 ```
 
 `wechat-adapter.js` 涉及 ACP 协议交互和副作用，采用集成测试方式验证。
+
+---
+
+## Docker 部署（上游镜像）
+
+使用上游仓库的 Docker 镜像快速部署：
+
+```bash
+docker pull ghcr.io/happymy/opencode-quickstart-workspace/wechat-bot:latest
+docker compose up -d
+```
+
+镜像包含了 wechat-acp + wechat-adapter.js，opencode-server 使用官方镜像 `ghcr.io/anomalyco/opencode`。详细用法见[上游仓库](https://github.com/happymy/opencode-quickstart-workspace)。
 
 ---
 
