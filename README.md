@@ -2,6 +2,8 @@
 
 OpenCode + wechat-acp + WeChat 机器人集成工作区。
 
+[![Build Docker Images](https://github.com/happymy/opencode-quickstart-workspace/actions/workflows/docker-build.yml/badge.svg)](https://github.com/happymy/opencode-quickstart-workspace/actions/workflows/docker-build.yml)
+
 ## 结构
 
 ```
@@ -27,6 +29,7 @@ work/
 ├── Dockerfile               # Docker 镜像构建（wechat-bot）
 ├── docker-compose.yml       # Docker 编排（三服务）
 ├── .dockerignore            # Docker 构建忽略规则
+├── .github/workflows/       # GitHub Actions CI/CD 工作流
 ├── package.json             # Node.js 依赖
 ├── vitest.config.js         # Vitest 测试配置
 ├── tests/
@@ -105,6 +108,30 @@ docker compose logs -f            # 查看实时日志
 | `wechat-acp-config` | `/home/appuser/.wechat-acp` | wechat-bot | WeChat 登录凭据（扫码一次后持久有效） |
 
 > 更新 `wechat-adapter.js` 后需重建镜像并重启：`docker compose build wechat-bot && docker compose up -d`
+
+### CI/CD 自动构建
+
+打 `v*` tag 推送后，GitHub Actions 自动执行：
+
+1. 构建 `wechat-bot` 和 `webui` 镜像并推送到 `ghcr.io`
+2. 导出 `.tar.gz` 离线包
+3. 创建 Release 并上传附件
+
+```bash
+# 手动触发（不创建 Release）
+# 在 GitHub → Actions → Build Docker Images → Run workflow
+
+# 打 tag 触发完整流程
+git tag v1.2.4
+git push origin v1.2.4
+```
+
+拉取已构建的镜像：
+
+```bash
+docker pull ghcr.io/happymy/opencode-quickstart-workspace/wechat-bot:v1.2.4
+docker pull ghcr.io/happymy/opencode-quickstart-workspace/webui:v1.2.4
+```
 
 ### 首次扫码登录
 
