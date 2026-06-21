@@ -24,6 +24,9 @@ work/
 ├── .wechat-workspaces.json  # 工作区预设列表
 ├── .wechat-workspace-current.json # 当前选中的工作区
 ├── .wechat-adapter.log      # 运行时日志（超 200MB 自动截断至 100MB）
+├── Dockerfile               # Docker 镜像构建（wechat-bot）
+├── docker-compose.yml       # Docker 编排（三服务）
+├── .dockerignore            # Docker 构建忽略规则
 ├── package.json             # Node.js 依赖
 ├── vitest.config.js         # Vitest 测试配置
 ├── tests/
@@ -70,6 +73,65 @@ setup.bat
 ```
 
 脚本自动读取 `.tool-versions.json` 中的版本锁，检查/安装：Node.js、Bun、opencode CLI（锁定版本）、npm 依赖，自动 clone 并锁定 pk-opencode-webui 至指定 commit，刷新 wechat-acp（锁定版本）。
+
+## Docker 部署
+
+替代本地环境安装，使用 Docker 容器化运行（推荐用于生产环境）：
+
+```bash
+docker compose build wechat-bot   # 构建 wechat-bot 镜像
+docker compose up -d              # 启动所有服务
+docker compose down               # 停止服务
+docker compose logs -f            # 查看实时日志
+```
+
+### 服务架构
+
+| 服务 | 镜像 | 大小 | 端口 | 说明 |
+|------|------|------|------|------|
+| `opencode-server` | `ghcr.io/anomalyco/opencode`（官方） | 247 MB | 4096 | OpenCode Web 服务器 |
+| `wechat-bot` | 本地构建 | 487 MB | — | wechat-acp + wechat-adapter.js |
+| `webui` | 本地构建 | 429 MB | 2048 | 第三方 OpenCode Web UI |
+
+### 数据持久化
+
+使用命名卷保留运行时数据，重启/重建不丢失：
+
+| 卷 | 挂载点 | 服务 | 说明 |
+|----|--------|------|------|
+| `opencode-config` | `/root/.config/opencode` | opencode-server | 配置、provider 凭据 |
+| `opencode-data` | `/root/.local/share/opencode` | opencode-server | **opencode.db**（会话/对话历史）、日志、仓库 |
+| `project-data` | `/app` | wechat-bot | 项目文件、状态文件（`.wechat-session.json` 等） |
+| `wechat-acp-config` | `/home/appuser/.wechat-acp` | wechat-bot | WeChat 登录凭据（扫码一次后持久有效） |
+
+> 更新 `wechat-adapter.js` 后需重建镜像并重启：`docker compose build wechat-bot && docker compose up -d`
+
+### 首次扫码登录
+
+wechat-acp 首次运行或登录过期时，会在终端打印彩色二维码，需要用微信扫码登录。Docker 中操作如下：
+
+```bash
+# 1. 启动所有服务
+docker compose up -d
+
+# 2. 查看 wechat-bot 容器名（通常是 work-wechat-bot-1）
+docker compose ps
+
+# 3. 附加到容器终端查看二维码
+docker attach work-wechat-bot-1
+
+# 此时终端会显示 wechat-acp 的彩色二维码（██████ 块状图案）
+# 打开手机微信扫一扫，扫码登录
+# 登录成功后按 Ctrl+P 然后 Ctrl+Q 安全脱离（容器继续运行）
+```
+
+登录状态保存在 `wechat-acp-config` 卷中，后续重启无需重新扫码。如需强制重新登录：
+
+```bash
+docker compose exec wechat-bot wechat-acp --login
+```
+
+> 不要用 `docker compose logs` 查看二维码——logs 会丢失 ANSI 颜色码，二维码不可读。
 
 ## 启动
 
