@@ -10,10 +10,10 @@
 services:
   # ========================================================================
   # OpenCode Web Server — 官方镜像
-  # 镜像: ghcr.io/anomalyco/opencode:latest (247MB)
+  # 镜像: ghcr.io/anomalyco/opencode:v1.17.8 (247MB)
   # ========================================================================
   opencode-server:
-    image: ghcr.io/anomalyco/opencode:latest
+    image: ghcr.io/anomalyco/opencode:v1.17.8
     ports:
       - "4096:4096"
     volumes:

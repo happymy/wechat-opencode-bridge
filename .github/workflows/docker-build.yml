@@ -8,6 +8,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  OPENCODE_VERSION: 1.17.8
+  WEBUI_COMMIT: 50f437409da461f047fc53bee22113ef9d3839a4
 
 jobs:
   build:
@@ -18,6 +20,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout pk-opencode-webui (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: prokube/pk-opencode-webui
+          path: pk-opencode-webui
+          ref: ${{ env.WEBUI_COMMIT }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -45,6 +54,8 @@ jobs:
         with:
           context: ./pk-opencode-webui
           file: pk-opencode-webui/docker/Dockerfile
+          build-args: |
+            OPENCODE_VERSION=${{ env.OPENCODE_VERSION }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/webui:${{ github.ref_name }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/webui:latest
@@ -69,7 +80,7 @@ jobs:
           | wechat-bot | ${{ github.ref_name }} | `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/wechat-bot:${{ github.ref_name }}` |
           | webui | ${{ github.ref_name }} | `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/webui:${{ github.ref_name }}` |
 
-          `opencode-server` 使用官方镜像 `ghcr.io/anomalyco/opencode:latest`，无需构建。
+          `opencode-server` 使用官方镜像 `ghcr.io/anomalyco/opencode:v${{ env.OPENCODE_VERSION }}`，无需构建。
 
           ### 部署
 
