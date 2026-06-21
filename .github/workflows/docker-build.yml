@@ -1,0 +1,103 @@
+name: Build Docker Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  OPENCODE_VERSION: 1.17.8
+  WEBUI_COMMIT: 50f437409da461f047fc53bee22113ef9d3839a4
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout pk-opencode-webui (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: prokube/pk-opencode-webui
+          path: pk-opencode-webui
+          ref: ${{ env.WEBUI_COMMIT }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push wechat-bot
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: wechat-bot
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/wechat-bot:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/wechat-bot:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push webui
+        uses: docker/build-push-action@v5
+        with:
+          context: ./pk-opencode-webui
+          file: pk-opencode-webui/docker/Dockerfile
+          push: true
+          build-args: |
+            OPENCODE_VERSION=${{ env.OPENCODE_VERSION }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/webui:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/webui:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export images to tar.gz
+        run: |
+          mkdir -p artifacts
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/wechat-bot:${{ github.ref_name }}
+          docker save ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/wechat-bot:${{ github.ref_name }} | gzip > artifacts/wechat-bot-${{ github.ref_name }}.tar.gz
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/webui:${{ github.ref_name }}
+          docker save ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/webui:${{ github.ref_name }} | gzip > artifacts/webui-${{ github.ref_name }}.tar.gz
+
+      - name: Generate release info
+        run: |
+          cat > artifacts/RELEASE_NOTES.md <<'EOF'
+          ### Docker 镜像
+
+          | 镜像 | 版本 | 拉取命令 |
+          |------|------|---------|
+          | wechat-bot | ${{ github.ref_name }} | `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/wechat-bot:${{ github.ref_name }}` |
+          | webui | ${{ github.ref_name }} | `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/webui:${{ github.ref_name }}` |
+
+          `opencode-server` 使用官方镜像 `ghcr.io/anomalyco/opencode:v${{ env.OPENCODE_VERSION }}`，无需构建。
+
+          ### 部署
+
+          ```bash
+          # 加载离线包（或直接 docker pull）
+          docker load < wechat-bot-${{ github.ref_name }}.tar.gz
+          docker load < webui-${{ github.ref_name }}.tar.gz
+
+          docker compose up -d
+          ```
+          EOF
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body_path: artifacts/RELEASE_NOTES.md

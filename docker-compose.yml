@@ -1,0 +1,83 @@
+# =============================================================================
+# Work Project — Docker Compose
+# =============================================================================
+# 服务:
+#   opencode-server  — OpenCode Web 服务器 (官方镜像)
+#   wechat-bot       — 微信机器人桥接 + AI 适配器
+#   webui            — pk-opencode-webui (第三方 Web UI)
+# =============================================================================
+
+services:
+  # ========================================================================
+  # OpenCode Web Server — 官方镜像
+  # 镜像: ghcr.io/anomalyco/opencode:v1.17.8 (247MB)
+  # ========================================================================
+  opencode-server:
+    image: ghcr.io/anomalyco/opencode:v1.17.8
+    ports:
+      - "4096:4096"
+    volumes:
+      - opencode-config:/root/.config/opencode
+      - opencode-data:/root/.local/share/opencode
+    environment:
+      - OPENCODE_SERVER_PASSWORD=opencode
+    working_dir: /app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "--header", "Authorization: Basic b3BlbmNvZGU6b3BlbmNvZGU=", "http://127.0.0.1:4096"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
+
+  # ========================================================================
+  # 微信机器人桥接 (wechat-acp + wechat-adapter.js)
+  # ========================================================================
+  wechat-bot:
+    build:
+      context: .
+      target: wechat-bot
+    depends_on:
+      opencode-server:
+        condition: service_healthy
+    volumes:
+      - project-data:/app
+      - wechat-acp-config:/home/appuser/.wechat-acp
+    environment:
+      - OPENCODE_SERVER=http://opencode-server:4096
+      - OPENCODE_AUTH=opencode:opencode
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    command:
+      - wechat-acp
+      - --agent
+      - node /app/wechat-adapter.js
+      - --cwd
+      - /app
+
+  # ========================================================================
+  # pk-opencode-webui (第三方 Web UI)
+  # ========================================================================
+  webui:
+    build:
+      context: ./pk-opencode-webui
+      dockerfile: docker/Dockerfile
+      args:
+        OPENCODE_VERSION: 1.17.8
+    ports:
+      - "2048:8080"
+    depends_on:
+      opencode-server:
+        condition: service_healthy
+    environment:
+      - API_URL=http://opencode-server:4096
+      - PORT=8080
+    restart: unless-stopped
+
+volumes:
+  project-data:
+  wechat-acp-config:
+  opencode-config:
+  opencode-data:
