@@ -9,7 +9,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  OPENCODE_VERSION: 1.17.8
+  OPENCODE_VERSION: 1.17.9
   WEBUI_COMMIT: 50f437409da461f047fc53bee22113ef9d3839a4
 
 jobs:
