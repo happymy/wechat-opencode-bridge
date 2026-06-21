@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -43,6 +44,7 @@ jobs:
         with:
           context: .
           target: wechat-bot
+          push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/wechat-bot:${{ github.ref_name }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/wechat-bot:latest
@@ -54,6 +56,7 @@ jobs:
         with:
           context: ./pk-opencode-webui
           file: pk-opencode-webui/docker/Dockerfile
+          push: true
           build-args: |
             OPENCODE_VERSION=${{ env.OPENCODE_VERSION }}
           tags: |
