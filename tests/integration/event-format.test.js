@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { formatReply } from '../../src/utils.js';
 
 describe('eventToNotification message formatting', () => {
