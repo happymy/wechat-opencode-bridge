@@ -15,8 +15,8 @@
     "git": "2.54.0"
   },
   "opencode": {
-    "cli": "1.17.9",
-    "sdk": "^1.17.9",
+    "cli": "1.17.11",
+    "sdk": "^1.17.11",
     "server": "http://localhost:4096",
     "server_auth": "opencode:opencode (Basic)"
   },

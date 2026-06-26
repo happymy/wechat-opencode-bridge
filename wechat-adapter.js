@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execSync, exec } from 'node:child_process';
 import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
-import { resolveFilterLevel, resolveQuotaMode, parseWorkspaceArg, getAllQuestions as getAllQuestionsPure, normalizeDir, formatToolInput, formatDuration, FILTER_LEVELS, QUOTA_MODES, levelIcon, levelDesc, levelLabel, quotaModeLabel, summarizeText, makeWsName, splitContinuationMessages, formatReply, formatQuestionBody, MAX_REPLY_LENGTH } from './src/utils.js';
+import { resolveFilterLevel, resolveQuotaMode, parseWorkspaceArg, parseSessionIndex, getAllQuestions as getAllQuestionsPure, normalizeDir, formatToolInput, formatDuration, FILTER_LEVELS, QUOTA_MODES, QUOTA_ALIASES, FILTER_ALIASES } from './src/utils.js';
 
 const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
 const AUTH = 'Basic ' + Buffer.from(process.env.OPENCODE_AUTH || 'opencode:opencode').toString('base64');
@@ -645,6 +645,20 @@ async function setFilterLevel(sid, level, msgId) {
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+function levelIcon(lv) {
+  return { full: '📡', pad: '📱', phone: '📟' }[lv] || '🔍';
+}
+function levelDesc(lv) {
+  return {
+    full: '实时流式输出 ⚠️ 高频推送触发限流时后半段静默丢失，不推荐日常使用',
+    pad: '处理中显示等待提示，仅发送 AI 文本回复',
+    phone: '极简模式，仅显示 AI 文本回复和 🤔 处理提示',
+  }[lv] || '';
+}
+function levelLabel(lv) {
+  return { full: '📡 FULL 完整模式', pad: '📱 PAD 标准模式', phone: '📟 PHONE 极简模式' }[lv] || lv;
+}
+
 async function handleQuotaMode(sid, arg, msgId) {
   if (!arg) {
     const lines = ['🔢 超长回复策略'];
@@ -678,6 +692,18 @@ async function handleQuotaMode(sid, arg, msgId) {
   reply(sid, `✅ 已切换超长回复策略: ${resolved}`);
   flushToWeChat(sid);
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+const QUOTA_LABELS = {
+  truncate: '🔇 静默截断 — 超限部分直接丢弃，不通知用户',
+  notify: '🔔 截断通知 — 超限时通知用户回复被截断',
+  continue: '📬 继续模式 — 保存超限文本，发 /g 自动续发',
+};
+function quotaModeLabel(m) { return QUOTA_LABELS[m] || m; }
+
+function summarizeText(text, maxLen) {
+  if (!text || text.length <= maxLen) return text;
+  return text.slice(0, maxLen) + `\n…（共${text.length}字符，截断显示）`;
 }
 
 async function listPermissions(sid, msgId) {
@@ -1093,6 +1119,15 @@ async function showTaskStatus(sid, msgId) {
   sendResponse(msgId, { stopReason: 'end_turn' });
 }
 
+function makeWsName(dirPath, existing) {
+  let name = basename(dirPath);
+  if (existing.some(w => w.name === name)) {
+    const parts = dirPath.replace(/[\\/]+/g, '/').replace(/\/$/, '').split('/');
+    name = parts.length >= 2 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : name;
+  }
+  return name;
+}
+
 async function handleContinue(sid, msgId) {
   if (!pendingContinuation || !pendingContinuation.messages?.length) {
     reply(sid, '📭 没有待续发的内容');
@@ -1128,6 +1163,14 @@ async function handleContinue(sid, msgId) {
     flushToWeChat(sid);
   }
   if (msgId != null) sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+function splitContinuationMessages(text, sid) {
+  const messages = [];
+  for (let i = 0; i < text.length; i += MAX_REPLY_LENGTH) {
+    messages.push(text.slice(i, i + MAX_REPLY_LENGTH));
+  }
+  return { sid, messages, total: messages.length };
 }
 
 async function handleClearContinue(sid, msgId) {
@@ -1416,6 +1459,33 @@ async function listQuestions(sid, msgId) {
   lines.push('/skip (/pass, /ps) [编号]     跳过指定问题');
   reply(sid, lines.join('\n'));
   sendResponse(msgId, { stopReason: 'end_turn' });
+}
+
+function formatQuestionBody(questions) {
+  if (!questions?.length) return '';
+  const multi = questions.length > 1;
+  let body = '';
+  if (multi) {
+    questions.forEach((qItem, idx) => {
+      const qText = qItem.question || '';
+      body += `\n\n${idx+1}. ${qText}`;
+      if (qItem.options?.length) {
+        body += '\n' + qItem.options.slice(0, 6).map((o, j) => `   ${j+1}. ${o.label}`).join('\n');
+      }
+    });
+    body += '\n\n多个答案用逗号分隔，如：1, 2';
+  } else {
+    const qi = questions[0];
+    const q = qi.question || '';
+    const opts = qi.options?.slice(0, 6).map((o, i) => `${i+1}. ${o.label}`).join('\n') || '';
+    body += `\n${q}`;
+    if (opts) body += `\n${opts}`;
+    if (qi.isSecret) body += '\n🔒 答案将保密发送';
+    body += '\n回复内容，或 /ans (/answer) <内容> 提交';
+    if (opts) body += '，或发送编号选择';
+  }
+  body += '\n/skip (/pass, /ps) 跳过，/qlist (/ql, /questions) 查看全部，/qshow (/qc, /qcurrent) 查看详情，/qselect (/qs, /qsel) <编号> 切换';
+  return body;
 }
 
 async function listCurrentQuestion(sid, msgId) {
@@ -1983,6 +2053,15 @@ async function forwardToAIAsync(sid, targetId, text) {
   }
 }
 
+function formatReply(data) {
+  const parts = data?.parts || [];
+  if (!parts.length) return '🤖 （无文本响应）';
+
+  const texts = parts.filter(p => p.type === 'text' && p.text).map(p => p.text);
+  const mainText = texts.join('\n').trim();
+  return mainText ? `🤖 ${mainText}` : '🤖 （完成）';
+}
+
 /* ───────── ACP Handlers ───────── */
 
 async function handleNewSession(msg) {
@@ -2156,6 +2235,8 @@ async function handleAutoClean(sid, arg, msgId) {
 }
 
 /* ───────── I/O Helpers ───────── */
+
+const MAX_REPLY_LENGTH = 4000;
 
 function reply(sid, text, msgId) {
   if (!sid) { log(`[REPLY] SKIP: null sid`); return; }

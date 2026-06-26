@@ -15,7 +15,9 @@
 
 | 标签 | 提交 | 说明 |
 |------|------|------|
-| `v1.2.6` | `d0ac878` | 最新 — OpenCode 1.17.9 |
+| `v1.2.8` | `729963c` | **最新** — OpenCode 1.17.11，适配 SDK v2 |
+| `v1.2.7` | `98a02f2` | Docker CI/CD，优化 start/stop 脚本 |
+| `v1.2.6` | `d0ac878` | OpenCode 1.17.9 |
 | `v1.2.5` | `4becd33` | Docker 部署支持 |
 | `v1.2.4` | `95847db` | CI/CD badge 和工作流说明 |
 | `v1.2.3` | `cf81ec0` | SSE 改用 SDK event.subscribe |
@@ -29,7 +31,7 @@
 | `v1.0.2` | `8b5937b` | |
 | `v1.0.1` | | 初版 |
 
-> 当前同步标签：**v1.2.6**
+> 当前同步标签：**v1.2.8**
 
 ### 同步策略
 从上游同步时，根据文件类型采用不同策略：
@@ -124,9 +126,10 @@ wechat-bridge.bat
 
 | 命令 | 别名 | 说明 |
 |------|------|------|
-| `/list` | `/l` `/ls` `/sessions` | 查看当前工作区会话列表 |
+| `/list` | `/l` `/ls` `/sessions` | 查看当前工作区会话列表；`/l all [+数字]` 查看全部会话前N条 |
 | `/switch` | `/s` `/sw` | 切换会话 |
 | `/new` | `/nl` `/create` | 新建会话 |
+| `/compact` | `/summarize` | 压缩当前会话，节省上下文 tokens |
 | `/cancel` | `/c` | 取消当前任务 |
 
 ### 模式切换
@@ -136,14 +139,33 @@ wechat-bridge.bat
 | `/plan` | `/pl` | plan 模式 |
 | `/build` | `/bu` | build 模式 |
 
-### 信息过滤
+### 模型管理
 
 | 命令 | 别名 | 说明 |
 |------|------|------|
-| `/level [f\|p\|ph]` | `/lvl` | 查看/设置过滤级别 |
-| `/f` | — | FULL 模式（实时流式传输） |
-| `/pd` | — | PAD 模式（折叠摘要，默认） |
+| `/models` | — | 列出所有可用模型（按 provider 分组） |
+| `/switchmodel` | `/sm` | 切换当前会话模型；不加参数查看当前模型 |
+| `/rmmodel` | — | 清除模型覆盖，恢复会话默认模型 |
+
+### 撤销与恢复
+
+| 命令 | 别名 | 说明 |
+|------|------|------|
+| `/undo` | — | 撤销上一条消息及其所有文件改动 |
+| `/redo` | — | 恢复已撤销的消息 |
+
+### 信息过滤与超长回复
+
+| 命令 | 别名 | 说明 |
+|------|------|------|
+| `/level [f\|p\|ph]` | `/lvl` | 查看/设置过滤级别，别名 f/full, p/pad, ph/phone |
+| `/f` | — | FULL 模式（实时流式传输）⚠️ 限流风险 |
+| `/pd` | — | PAD 模式（折叠摘要，默认，推荐） |
 | `/ph` | — | PHONE 模式（极简，仅文字） |
+| `/thinking` | — | 切换思维推理过程显示/隐藏 |
+| `/quota [t\|n\|c]` | `/q` | 查看/设置超长回复策略 (t:截断 n:通知 c:续传) |
+| `/continue` | `/g` `/get` `/cont` | 续发模式：从消息队列取出下一条 |
+| `/clear-continue` | `/x` `/gc` | 清除待续发内容 |
 
 ### 三级信息过滤渲染差异
 
@@ -166,6 +188,8 @@ wechat-bridge.bat
 | `/deny [编号\|ID]` | `/d` | 拒绝权限 |
 | `/trust [编号\|ID]` | `/t` | 信任权限 |
 | `/plist` | `/p` `/pending` | 待审批权限列表 |
+| `/autoclean [天数]` | `/ac` | 查看/设置不活跃订阅自动清理天数 |
+| `/testnotify` | — | 发送测试通知（调试用） |
 
 ### 工作区与系统
 
@@ -242,6 +266,18 @@ tests/
 ```
 
 `wechat-adapter.js` 涉及 ACP 协议交互和副作用，采用集成测试方式验证。
+
+**测试覆盖：**
+
+| 文件 | 类型 | 覆盖功能 | 用例 |
+|------|------|---------|------|
+| `tests/unit/utils/helpers.test.js` | 单元 | `levelIcon`/`levelDesc`/`levelLabel`/`quotaModeLabel`/`summarizeText`/`resolveFilterLevel`/`resolveQuotaMode`/`getAllQuestions`/`parseWorkspaceArg`/`parseSessionIndex`/`formatDuration`/`normalizeDir`/`wsPathEqual`/`makeWsName`/`formatReply`/`formatToolInput`/`splitContinuationMessages` | 81 |
+| `tests/unit/utils/edge-cases.test.js` | 单元 | 上述函数的 null/undefined/空串/边界值/特殊路径极限输入 | 47 |
+| `tests/unit/utils/question.test.js` | 单元 | `formatQuestionBody`（问答提示拼接） | 11 |
+| `tests/unit/utils/notification.test.js` | 单元 | `formatReply` 对 OpenAI/Claude 输出格式的处理 | 7 |
+| `tests/integration/event-format.test.js` | 集成 | `eventToNotification` 实际调用（8 种 SSE 事件 → 中文通知） | 4 |
+
+当前 **150 测试 / 0 失败 / 100% 覆盖率**。
 
 ---
 
