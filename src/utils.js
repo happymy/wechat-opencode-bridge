@@ -1,5 +1,7 @@
 export const MAX_REPLY_LENGTH = 4000;
 
+import { resolve } from 'node:path';
+
 export const FILTER_LEVELS = ['full', 'pad', 'phone'];
 export const QUOTA_MODES = ['truncate', 'notify', 'continue'];
 export const QUOTA_ALIASES = { t: 'truncate', trunc: 'truncate', n: 'notify', notif: 'notify', c: 'continue', cont: 'continue' };
@@ -43,8 +45,10 @@ export const QUOTA_LABELS = {
 export function quotaModeLabel(m) { return QUOTA_LABELS[m] || m; }
 
 export function summarizeText(text, maxLen) {
-  if (text == null || text.length <= maxLen) return text;
-  return text.slice(0, maxLen) + `\n…（共${text.length}字符，截断显示）`;
+  if (text == null) return text;
+  const len = maxLen < 0 ? 0 : maxLen;
+  if (text.length <= len) return text;
+  return text.slice(0, len) + `\n…（共${text.length}字符，截断显示）`;
 }
 
 function basename(p) {
@@ -95,7 +99,8 @@ export function formatDuration(startTime) {
 }
 
 export function wsPathEqual(a, b) {
-  return normalizeDir(a) === normalizeDir(b);
+  if (!a || !b) return a === b;
+  try { return resolve(a).toLowerCase() === resolve(b).toLowerCase(); } catch { return a.toLowerCase() === b.toLowerCase(); }
 }
 
 export function normalizeDir(p) {
