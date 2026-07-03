@@ -100,7 +100,7 @@ export function formatDuration(startTime) {
 
 export function wsPathEqual(a, b) {
   if (!a || !b) return a === b;
-  try { return resolve(a).toLowerCase() === resolve(b).toLowerCase(); } catch { return a.toLowerCase() === b.toLowerCase(); }
+  return resolve(a).toLowerCase() === resolve(b).toLowerCase();
 }
 
 export function normalizeDir(p) {
