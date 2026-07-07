@@ -10,10 +10,10 @@
 services:
   # ========================================================================
   # OpenCode Web Server — 官方镜像
-  # 镜像: ghcr.io/anomalyco/opencode:v1.17.13 (247MB)
+  # 镜像: ghcr.io/anomalyco/opencode:v1.17.14 (247MB)
   # ========================================================================
   opencode-server:
-    image: ghcr.io/anomalyco/opencode:v1.17.13
+    image: ghcr.io/anomalyco/opencode:v1.17.14
     ports:
       - "4096:4096"
     volumes:
@@ -65,7 +65,7 @@ services:
       context: ./pk-opencode-webui
       dockerfile: docker/Dockerfile
       args:
-        OPENCODE_VERSION: 1.17.13
+        OPENCODE_VERSION: 1.17.14
     ports:
       - "2048:8080"
     depends_on:
