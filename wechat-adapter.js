@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, statSync, existsSync } from 'node:fs';
 import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { execSync, exec } from 'node:child_process';
+import { exec } from 'node:child_process';
 import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
 import { resolveFilterLevel, resolveQuotaMode, parseWorkspaceArg, parseSessionIndex, getAllQuestions as getAllQuestionsPure, normalizeDir, formatToolInput, formatDuration, FILTER_LEVELS, QUOTA_MODES, QUOTA_ALIASES, FILTER_ALIASES, levelIcon, levelDesc, levelLabel, quotaModeLabel, makeWsName, formatQuestionBody, formatReply, MAX_REPLY_LENGTH, summarizeText, wsPathEqual } from './src/utils.js';
 
@@ -916,37 +916,6 @@ async function handleWorkspace(sid, arg, msgId) {
   restartSSE();
   reply(sid, `✅ 已切换到工作区「${currentWorkspace.name}」\n${currentWorkspace.path}\n使用 /new <会话名> 在该工作区创建会话`);
   sendResponse(msgId, { stopReason: 'end_turn' });
-}
-
-function discoverWorkspacesViaDb() {
-  try {
-    const out = execSync(
-      'opencode db "SELECT id, worktree, sandboxes FROM project WHERE id != \'global\'" --format json',
-      { encoding: 'utf8', timeout: 15000 }
-    );
-    const projects = JSON.parse(out.trim());
-    if (!Array.isArray(projects)) return [];
-    const dirs = new Set();
-    for (const p of projects) {
-      if (p.worktree && p.worktree !== '/') {
-        dirs.add(p.worktree.replace(/\//g, '\\'));
-      }
-      if (p.sandboxes) {
-        try {
-          const boxes = JSON.parse(p.sandboxes);
-          if (Array.isArray(boxes)) {
-            for (const s of boxes) {
-              if (s) dirs.add(s.replace(/\//g, '\\'));
-            }
-          }
-        } catch (e) { log(`[SD] parse sandboxes JSON failed: ${e.message}`); }
-      }
-    }
-    return [...dirs];
-  } catch (err) {
-    log(`[SD] db query failed: ${err.message}`);
-    return [];
-  }
 }
 
 async function discoverWorkspacesViaDbAsync() {
