@@ -41,6 +41,3 @@ __pycache__/
 
 # Temporary files
 *.tmp
-
-# Subprojects (have their own git)
-pk-opencode-webui/
