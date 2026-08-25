@@ -9,10 +9,10 @@
 services:
   # ========================================================================
   # OpenCode Server — 官方镜像 (headless API, 仅 serve 模式)
-  # 镜像: ghcr.io/anomalyco/opencode:v1.18.18 (247MB)
+  # 镜像: ghcr.io/anomalyco/opencode:v1.18.22 (247MB)
   # ========================================================================
   opencode-server:
-    image: ghcr.io/anomalyco/opencode:v1.18.18
+    image: ghcr.io/anomalyco/opencode:v1.18.22
     ports:
       - "4096:4096"
     volumes:
