@@ -4,7 +4,7 @@ import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { exec } from 'node:child_process';
-import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
+import { createOpencodeClient } from './src/opencode-compat.js';
 import { resolveFilterLevel, resolveQuotaMode, parseWorkspaceArg, parseSessionIndex, getAllQuestions as getAllQuestionsPure, normalizeDir, formatToolInput, formatDuration, FILTER_LEVELS, QUOTA_MODES, QUOTA_ALIASES, FILTER_ALIASES, levelIcon, levelDesc, levelLabel, quotaModeLabel, makeWsName, formatQuestionBody, formatReply, MAX_REPLY_LENGTH, summarizeText, wsPathEqual } from './src/utils.js';
 
 const SERVER = process.env.OPENCODE_SERVER || 'http://localhost:4096';
