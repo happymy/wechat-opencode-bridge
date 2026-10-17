@@ -15,7 +15,8 @@
 
 | 标签 | 提交 | 说明 |
 |------|------|------|
-| `v2.1.2` | `a5df426` | **最新** — OpenCode 1.18.35（跳过 v2.1.1）|
+| `v2.4.0` | `0c919b9` | **最新** — OpenCode 2.0.32（SDK 迁移 + v2 兼容垫片；跳过 v2.2.0/v2.3.0）|
+| `v2.1.2` | `a5df426` | OpenCode 1.18.35（跳过 v2.1.1）|
 | `v1.6.9` | `4fb2f4f` | OpenCode 1.18.30 |
 | `v1.5.8` | `2c90b14` | OpenCode 1.18.18 |
 | `v1.5.7` | `cead61e` | OpenCode 1.18.17 |
@@ -57,7 +58,7 @@
 | `v1.0.2` | `8b5937b` | |
 | `v1.0.1` | | 初版 |
 
-> 当前同步标签：**v2.1.2**
+> 当前同步标签：**v2.4.0**
 
 ### 同步策略
 从上游同步时，根据文件类型采用不同策略：
@@ -68,7 +69,7 @@
 | **🟡 选择性更新** | `wechat-bridge.bat` `restart-wechat.bat` `restart-wechat-monitor.bat` `.tool-versions.json` | 差异较小时可直接覆盖 |
 | **🔵 已引入** | `ilink-monitor-hook.js` `test-iLink-rate-limit.js` `del.py` `run_del_nul.bat` | 调试用工具文件，按需同步 |
 | **🟢 直接覆盖** | `docs/*` `LICENSE` `README.md` | 上游更新可安全覆盖后重新适配 |
-| **🟢 直接覆盖** | `src/utils.js` `tests/` `vitest.config.js` | 测试框架与纯函数工具库 |
+| **🟢 直接覆盖** | `src/utils.js` `src/opencode-compat.js` `tests/` `vitest.config.js` | 测试框架、纯函数工具库与 SDK 兼容垫片 |
 | **🟢 直接覆盖** | `package.json` `package-lock.json` | 依赖管理，含 vitest 测试框架 |
 | **⚪ 忽略** | `.gitattributes` `plan/` `.gitignore` `.wechat-*` | 仅本仓库存在，不受同步影响 |
 | **⚪ 未引入** | `setup.bat` `start-all.bat` `stop-all.bat` `web.bat` | 上游特有文件，本仓库不使用 |
@@ -108,6 +109,7 @@ git diff v1.2.0 v1.2.1 -- wechat-adapter.js | more
 
 - **wechat-acp**：通过标准输入/输出与 wechat-adapter.js 通信，转发微信消息和推送通知
 - **wechat-adapter.js**：ACP Agent 实现，将微信消息转为 OpenCode HTTP API 调用，同时订阅 SSE 事件推送通知
+- **src/opencode-compat.js**：`@opencode/client` v2 → v1-preview 兼容垫片，把 opencode 2.0 的 `form.*`/事件信封/请求头等语义翻译回适配器依赖的旧形状
 - **OpenCode Server**：AI 会话引擎，提供 HTTP API 和 SSE 事件流
 
 ---
@@ -282,6 +284,7 @@ npm run test:coverage
 ```
 tests/
 ├── setup.js                    # 全局 mock
+├── opencode-compat.test.js     # SDK 兼容垫片测试（映射 + 事件翻译）
 ├── unit/utils/
 │   ├── helpers.test.js         # 核心函数测试（resolveFilterLevel, formatReply 等）
 │   ├── edge-cases.test.js      # null/undefined 边界值测试
@@ -301,9 +304,10 @@ tests/
 | `tests/unit/utils/edge-cases.test.js` | 单元 | 上述函数的 null/undefined/空串/边界值/特殊路径极限输入 | 47 |
 | `tests/unit/utils/question.test.js` | 单元 | `formatQuestionBody`（问答提示拼接） | 11 |
 | `tests/unit/utils/notification.test.js` | 单元 | `formatReply` 对 OpenAI/Claude 输出格式的处理 | 7 |
+| `tests/opencode-compat.test.js` | 单元 | SDK 兼容垫片：client 形状、session/event/form/permission 映射与事件翻译 | 14 |
 | `tests/integration/event-format.test.js` | 集成 | `eventToNotification` 实际调用（8 种 SSE 事件 → 中文通知） | 4 |
 
-当前 **164 测试 / 0 失败 / 100% 覆盖率**。
+当前 **178 测试 / 0 失败 / 100% 覆盖率**。
 
 ---
 
