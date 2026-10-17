@@ -54,9 +54,10 @@ const mockClient = {
   question: { list: mockQuestionList, reply: mockQuestionReply, reject: mockQuestionReject },
   event: { subscribe: mockEventSubscribe },
   project: { list: mockProjectList, directories: mockProjectDirectories },
+  client: { setConfig: vi.fn(), getConfig: vi.fn(() => ({ headers: {} })) },
 };
 
-vi.mock('@opencode-ai/sdk/v2/client', () => ({
+vi.mock('../src/opencode-compat.js', () => ({
   createOpencodeClient: vi.fn(() => mockClient),
 }));
 
