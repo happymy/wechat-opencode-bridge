@@ -1,3 +1,8 @@
+/**
+ * iLink API 被动嗅探模块
+ * 用法: node --import ./ilink-monitor-hook.js <wechat-acp桥接命令>
+ * 拦截所有 iLink API 调用，记录请求/响应到日志文件
+ */
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -27,6 +32,7 @@ globalThis.fetch = async function interceptedFetch(url, options) {
   const endpoint = urlStr.split('ilink/')[1] || urlStr;
   const startTime = Date.now();
 
+  // 记录请求体 (截断敏感信息)
   let reqBodyBrief = '';
   if (options?.body && endpoint.includes('sendmessage')) {
     try {
