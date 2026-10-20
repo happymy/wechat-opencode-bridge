@@ -29,6 +29,5 @@ COPY --from=deps /app/node_modules ./node_modules
 RUN npm install -g wechat-acp@0.8.0 && npm cache clean --force
 COPY . .
 RUN mkdir -p /home/appuser/.wechat-acp && \
-    chown -R appuser:appgroup /home/appuser/.wechat-acp && \
-    chown appuser:appgroup /app
+    chown -R appuser:appgroup /home/appuser /app
 USER appuser
