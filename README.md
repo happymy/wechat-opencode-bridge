@@ -15,7 +15,8 @@
 
 | 标签 | 提交 | 说明 |
 |------|------|------|
-| `v2.4.0` | `0c919b9` | **最新** — OpenCode 2.0.32（SDK 迁移 + v2 兼容垫片；跳过 v2.2.0/v2.3.0）|
+| `v2.5.0` | `e5b78f5` | **最新** — OpenCode 2.1.0（SDK 保持 ^2.0.32；跳过 openchamber 2.5.0）|
+| `v2.4.0` | `0c919b9` | OpenCode 2.0.32（SDK 迁移 + v2 兼容垫片；跳过 v2.2.0/v2.3.0）|
 | `v2.1.2` | `a5df426` | OpenCode 1.18.35（跳过 v2.1.1）|
 | `v1.6.9` | `4fb2f4f` | OpenCode 1.18.30 |
 | `v1.5.8` | `2c90b14` | OpenCode 1.18.18 |
@@ -58,7 +59,7 @@
 | `v1.0.2` | `8b5937b` | |
 | `v1.0.1` | | 初版 |
 
-> 当前同步标签：**v2.4.0**
+> 当前同步标签：**v2.5.0**
 
 ### 同步策略
 从上游同步时，根据文件类型采用不同策略：
@@ -73,6 +74,14 @@
 | **🟢 直接覆盖** | `package.json` `package-lock.json` | 依赖管理，含 vitest 测试框架 |
 | **⚪ 忽略** | `.gitattributes` `plan/` `.gitignore` `.wechat-*` | 仅本仓库存在，不受同步影响 |
 | **⚪ 未引入** | `setup.bat` `start-all.bat` `stop-all.bat` `web.bat` | 上游特有文件，本仓库不使用 |
+
+**已知不可照搬的上游改动：**
+
+- **`Dockerfile` 的 `HEALTHCHECK ... :4096/health`**（v2.5.0 起）— 该检查加在 `wechat-bot` 镜像上，但 wechat-bot 是 stdio ACP 桥接，从不监听 4096，照搬会使容器永久 unhealthy。只取同批的 `chown` 修复。
+- **`.gitignore` 移除 `.wechat-settings.json`**（v2.5.0 起）— 会把本地运行时配置纳入版本控制，跳过。
+- **openchamber 版本条目** — 本仓库无 openchamber 组件，`.tool-versions.json` 的 `openchamber` 段不引入。
+- **`package-lock.json` 的 `name` 字段** — 上游为 `work`，本仓库为 `wechat-opencode-bridge`，覆盖时保留本地名。
+- **`@opencode/client` 版本独立于 CLI** — 上游 SDK 版本可能滞后于 CLI（见 `.tool-versions.json` 的 `sdk_note`），以实际上线的 npm 版本为准。
 
 ### 同步步骤
 
