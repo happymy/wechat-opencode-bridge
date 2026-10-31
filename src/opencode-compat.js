@@ -2,7 +2,7 @@
  * @opencode/client v2 → v1-preview compatibility shim.
  *
  * wechat-adapter.js was written against `@opencode-ai/sdk/v2/client` (the
- * `/api` preview of opencode 1.18/1.19). opencode 2.0 keeps the `/api`
+ * `/api` preview of opencode 1.18/1.19). opencode 2.x keeps the `/api`
  * surface but renames routes and changes the wire protocol:
  *
  *   - questions      → forms (`permission.*` stays, `question.*` becomes `form.*`)

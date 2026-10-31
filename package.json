@@ -1,7 +1,7 @@
 {
   "type": "module",
   "dependencies": {
-    "@opencode/client": "^2.0.32",
+    "@opencode/client": "^2.2.5",
     "wechat-acp": "^0.8.0"
   },
   "scripts": {

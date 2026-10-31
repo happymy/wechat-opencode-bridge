@@ -14,9 +14,8 @@
     "git": "2.54.0"
   },
   "opencode": {
-    "cli": "2.1.0",
-    "sdk": "^2.0.32",
-    "sdk_note": "@opencode/client 发布线独立于 CLI，2.1.0 未发布，最新为 2.0.32",
+    "cli": "2.2.5",
+    "sdk": "^2.2.5",
     "server": "http://localhost:4096",
     "server_auth": "opencode:opencode (Basic)"
   },
